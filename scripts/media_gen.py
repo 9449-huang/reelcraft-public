@@ -508,7 +508,152 @@ def image_to_url_or_path(path: str) -> str:
     b64 = base64.b64encode(p.read_bytes()).decode()
     return f"data:{mime};base64,{b64}"
 
+# ─── 视频超时协议：落盘 / 续等 / 收割 ─────────────────────
+def _save_pending_task(pool: str, task_id: str, out: str, base: str) -> None:
+    s = _load_state()
+    s.setdefault("pending_tasks", {})[str(task_id)] = {
+        "pool": pool, "out": out, "base": base, "submitted_at": time.time(),
+    }
+    _save_state(s)
+
+def _pop_pending_task(task_id: str) -> dict | None:
+    s = _load_state()
+    rec = s.get("pending_tasks", {}).pop(str(task_id), None)
+    if rec:
+        _save_state(s)
+    return rec
+
+def _extract_video_url(st: dict) -> str | None:
+    """从轮询响应提取视频 URL（兼容智谱/Agnes/网关等字段风格）。"""
+    if not isinstance(st, dict):
+        return None
+    vr = st.get("video_result")
+    if isinstance(vr, list) and vr and isinstance(vr[0], dict):
+        u = vr[0].get("url")
+        if isinstance(u, str) and u.startswith("http"):
+            return u
+    for k_ in ("video_url", "url"):
+        if isinstance(st.get(k_), str) and st[k_].startswith("http"):
+            return st[k_]
+    data = st.get("data")
+    if isinstance(data, dict):
+        for k_ in ("video_url", "url"):
+            if isinstance(data.get(k_), str) and data[k_].startswith("http"):
+                return data[k_]
+    return None
+
+def _print_timeout_menu(exclude: str) -> None:
+    """超时备选菜单：从用户实际接入动态生成，零硬编码池名。"""
+    print("[media_gen] 备选视频池（按当前实际接入动态生成；agent 按 plan 的 video_pool_order 呈现给用户）：", file=sys.stderr)
+    found = False
+    for pool, pinfo in PROVIDERS.items():
+        if pool == exclude or "video" not in pinfo.get("models", {}):
+            continue
+        try:
+            ks = list_keys(pool, required=False)
+        except Exception:
+            ks = []
+        if not ks:
+            continue
+        m = pinfo["models"]["video"]
+        print(f"  - {pool}  [{pinfo.get('label', pool)}] free_kind={pinfo.get('free_kind', '?')}  {(m.get('note') or '')[:70]}", file=sys.stderr)
+        found = True
+    if not found:
+        print("  （无其它可用视频池 → 选项：--wait-task 续等 / 放弃该镜）", file=sys.stderr)
+
+def _poll_video_task(pool: str, info: dict, k: dict, video_id: str, out: str, args) -> None:
+    """对已受理任务轮询到出片。超时：落盘 pending + 动态备池菜单 + exit 4（询问协议，agent 层向用户提问）。"""
+    poll_url_base = k["poll"]
+    pt = args.poll_timeout or (1800 if getattr(args, "provider", "") else 1200)
+    deadline = time.time() + pt
+    while time.time() < deadline:
+        time.sleep(args.wait)
+        if info.get("poll_style") == "path":
+            poll_url = f"{poll_url_base}{info['poll_path']}/{video_id}"
+        else:
+            poll_url = f"{poll_url_base}{info['poll_path']}?{info['poll_param']}={video_id}"
+        try:
+            req = urllib.request.Request(poll_url)
+            req.add_header("Authorization", f"Bearer {k['key']}")
+            with urllib.request.urlopen(req, timeout=60) as r:
+                st = json.loads(r.read().decode("utf-8", "ignore"))
+        except Exception as e:
+            print(f"[media_gen] 轮询异常: {e}", file=sys.stderr)
+            continue
+        url = _extract_video_url(st)
+        if url:
+            os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
+            urllib.request.urlretrieve(url, out)
+            print(f"[media_gen] video OK via {pool} -> {out}")
+            return
+        status = str(st.get("task_status") or st.get("status") or "").upper()
+        if status in ("FAIL", "FAILED", "ERROR"):
+            die(f"视频任务失败: {json.dumps(st, ensure_ascii=False)[:300]}")
+    print(f"[media_gen] 轮询超时 {pt // 60} 分钟", file=sys.stderr)
+    _save_pending_task(pool, video_id, out, k.get("base", ""))
+    print(f"[media_gen] task {video_id} 已落盘（提交即扣，出片不浪费）：harvest 收割 / --wait-task {video_id} 零扣分续等", file=sys.stderr)
+    _print_timeout_menu(pool)
+    sys.exit(4)
+
+def _wait_existing_task(args) -> None:
+    rec = _load_state().get("pending_tasks", {}).get(str(args.wait_task))
+    if not rec:
+        die(f"落盘无记录: {args.wait_task}（可跑 harvest 查看待收列表）", 2)
+    pool = rec["pool"]
+    info = PROVIDERS[pool]["models"]["video"]
+    keys = list_keys(pool, required=False)
+    if not keys:
+        die(f"池 {pool} 现无可用 key，无法续等", 2)
+    out = rec.get("out") or args.out
+    print(f"[media_gen] 续等 {pool} 任务 {args.wait_task}（零扣分，不重新提交）", file=sys.stderr)
+    _poll_video_task(pool, info, keys[0], str(args.wait_task), out, args)
+
+def cmd_harvest(args) -> None:
+    """收割已完成的落盘任务（提交即扣模式下，慢任务出片自动变现）。"""
+    pt = _load_state().get("pending_tasks", {})
+    if not pt:
+        print("[media_gen] harvest: 无落盘的未收任务")
+        return
+    for tid, rec in list(pt.items()):
+        pool = rec.get("pool", "")
+        info = PROVIDERS.get(pool, {}).get("models", {}).get("video")
+        if not info:
+            print(f"[harvest] {tid}: 池 {pool} 不在当前配置，跳过")
+            continue
+        keys = list_keys(pool, required=False)
+        if not keys:
+            print(f"[harvest] {tid}: 池 {pool} 无可用 key，跳过")
+            continue
+        k = keys[0]
+        if info.get("poll_style") == "path":
+            url = f"{k['poll']}{info['poll_path']}/{tid}"
+        else:
+            url = f"{k['poll']}{info['poll_path']}?{info['poll_param']}={tid}"
+        try:
+            req = urllib.request.Request(url)
+            req.add_header("Authorization", f"Bearer {k['key']}")
+            with urllib.request.urlopen(req, timeout=30) as r:
+                st = json.loads(r.read().decode("utf-8", "ignore"))
+        except Exception as e:
+            print(f"[harvest] {tid}: 查询失败 {e}")
+            continue
+        got = _extract_video_url(st)
+        status = str(st.get("task_status") or st.get("status") or "").upper()
+        if got:
+            out = rec.get("out") or f"harvest_{tid}.mp4"
+            os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
+            urllib.request.urlretrieve(got, out)
+            _pop_pending_task(tid)
+            print(f"[harvest] {tid}: 已收割 -> {out}")
+        elif status in ("FAIL", "FAILED", "ERROR"):
+            _pop_pending_task(tid)
+            print(f"[harvest] {tid}: 任务已失败，从落盘移除")
+        else:
+            print(f"[harvest] {tid}: 仍在生成（status={status or '?'}），保留落盘")
+
 def cmd_video(args) -> None:
+    if args.wait_task:
+        return _wait_existing_task(args)
     pools = [args.provider] if args.provider else pools_for_role("video")
     for p in pools:
         if p not in PROVIDERS:
@@ -612,50 +757,8 @@ def cmd_video(args) -> None:
         return
     if not video_id:
         die(f"无 video_id: {json.dumps(resp)[:300]}")
-
-    # 轮询
-    deadline = time.time() + 600
-    poll_url_base = used_key["poll"]
-    while time.time() < deadline:
-        time.sleep(args.wait)
-        # path 式（智谱 /async-result/{id}）vs 查询参数式（Agnes ?video_id=）
-        if info.get("poll_style") == "path":
-            poll_url = f"{poll_url_base}{info['poll_path']}/{video_id}"
-        else:
-            poll_url = f"{poll_url_base}{info['poll_path']}?{info['poll_param']}={video_id}"
-        try:
-            req = urllib.request.Request(poll_url)
-            req.add_header("Authorization", f"Bearer {used_key['key']}")
-            with urllib.request.urlopen(req, timeout=60) as r:
-                st = json.loads(r.read().decode("utf-8", "ignore"))
-        except Exception as e:
-            print(f"[media_gen] 轮询异常: {e}", file=sys.stderr)
-            continue
-        url = None
-        if isinstance(st, dict):
-            status = str(st.get("task_status") or st.get("status") or "").upper()
-            # 智谱: video_result[0].url；Agnes: video_url/url/data.video_url
-            vr = st.get("video_result")
-            if isinstance(vr, list) and vr and isinstance(vr[0], dict):
-                u = vr[0].get("url")
-                if isinstance(u, str) and u.startswith("http"):
-                    url = u
-            for k_ in ("video_url", "url"):
-                if isinstance(st.get(k_), str) and st[k_].startswith("http"):
-                    url = st[k_]
-            data = st.get("data")
-            if isinstance(data, dict):
-                for k_ in ("video_url", "url"):
-                    if isinstance(data.get(k_), str) and data[k_].startswith("http"):
-                        url = data[k_]
-            if status in ("FAIL", "FAILED", "ERROR") and not url:
-                die(f"视频任务失败: {json.dumps(st, ensure_ascii=False)[:300]}")
-        if url:
-            os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
-            urllib.request.urlretrieve(url, out)
-            print(f"[media_gen] video OK via {provider} key#{used_key['n']} -> {out}")
-            return
-    die("轮询超时 10 分钟")
+    print(f"[media_gen] task_id={video_id}（受理成功，轮询中…）", file=sys.stderr)
+    _poll_video_task(provider, info, used_key, str(video_id), out, args)
 
 # ─── 图编辑（魔塔 Qwen-Image-Edit）──────────────────────
 def cmd_edit(args) -> None:
@@ -1039,6 +1142,12 @@ def main() -> None:
     v.add_argument("--video-size", default="1920x1080", help="智谱专用：输出分辨率（默认 1920x1080）")
     v.add_argument("--duration", type=int, default=5, help="智谱专用：时长秒（5 或 10）")
     v.add_argument("--pin-key", type=int, default=0, help="锁定第 N 把 key（0=轮转；双 worker 并行时各锁一把）")
+    v.add_argument("--poll-timeout", type=int, default=0,
+                   help="轮询上限秒（0=自动：显式池 30 分钟 / 自动路由 20 分钟；超时落盘 task_id 并 exit 4）")
+    v.add_argument("--wait-task", default="",
+                   help="不重新提交，续等已落盘任务（零扣分）。值=task_id")
+
+    h = sub.add_parser("harvest", help="收割已完成的落盘任务（提交即扣模式下，慢任务出片自动变现）")
 
     ed = sub.add_parser("edit")
     ed.add_argument("--image", required=True, help="待编辑的图（如 shots/shot_01.png）")
@@ -1082,6 +1191,8 @@ def main() -> None:
         cmd_image(args)
     elif args.cmd == "video":
         cmd_video(args)
+    elif args.cmd == "harvest":
+        cmd_harvest(args)
     elif args.cmd == "edit":
         cmd_edit(args)
     elif args.cmd == "batch":

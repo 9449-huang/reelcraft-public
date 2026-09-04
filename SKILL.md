@@ -92,8 +92,12 @@ python scripts/media_gen.py image --provider zhipu --prompt "probe" --size 1024x
 - **stills 全缓推**：没有视频 key 时的保底，全镜 kenburns（0 视频调用，纯本地），规格照样达标
 - 模式落 plan.json；**绝不自动降级**——探测到有视频能力就默认 full，降级永远先问
 
-确认后写入 `shots/plan.json`（`{"role_assign": "one-stop|split", "workers": N, "watermark": {"<池>": "clean|corner-delogo|fatal"}, "mode": "full|hybrid|stills", "hero_shots": [1,5,8]}`），后续步骤照办，不再重复问。
+**问⑤ 视频池顺序**（接入 ≥2 个视频池时，只接一个则跳过）：跑 `status` 看实际可用的视频池，向用户呈现清单（池名+属性，全部来自其真实配置，零硬编码），问清**主用哪个、备选顺序**，记入 plan.json `video_pool_order`。
+
+确认后写入 `shots/plan.json`（`{"role_assign": "one-stop|split", "workers": N, "watermark": {"<池>": "clean|corner-delogo|fatal"}, "mode": "full|hybrid|stills", "hero_shots": [1,5,8], "video_pool_order": ["<主池>", "<备池>", "..."]}`），后续步骤照办，不再重复问。
 单命令 `image/video` 的 `--provider` 留空时按 `MEDIA_PRIORITY` 自动选池；某池全部 key 失败自动跨池兜底。
+
+**视频超时询问协议**（video 命令退出码 4）：轮询超时会自动把 task_id 落盘（提交即扣，出片不浪费）并打印**实际可用**的备池菜单（从用户接入动态生成）。agent 拿到退出码 4 后**必须问用户三选**：①切下一池（按 plan.json 的 `video_pool_order` 顺序）②继续等（`video --wait-task <id>`，零扣分续等）③放弃该镜。决策记入 plan.json。被切走的任务**不取消**——之后任何时点跑 `media_gen.py harvest` 可收割已完成出片（自动下载到原定路径）。
 
 ## Step 2 — 分镜拆解
 
