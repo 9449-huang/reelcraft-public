@@ -1,0 +1,18 @@
+{
+  "_readme": "水印档案：delogo_watermark.py --provider <池名> 自动读取。box 为 base_res 分辨率下的 [x,y,w,h]，其他分辨率按比例缩放。kind: corner-delogo=右下角小静态标(可抹) / clean=无水印 / unknown=未验证(先 probe) / fatal=大面积或动态水印(不抹,换渠道)。新渠道探测方法见 SKILL.md Step 1 问③。",
+  "agnes": {
+    "kind": "clean",
+    "probed_at": "2026-09-04",
+    "note": "图像已验证无水印；视频侧未见水印报告，首用正式片前可顺手复核"
+  },
+  "zhipu": {
+    "kind": "unknown",
+    "probed_at": "2026-09-04",
+    "note": "图像免费档右下角带'AI生成'标（已验证）；视频侧（CogVideoX）水印未系统验证，首用先 probe"
+  },
+  "modelscope": {
+    "kind": "unknown",
+    "probed_at": "2026-09-04",
+    "note": "仅图像编辑用途，视频侧无记录"
+  }
+}
