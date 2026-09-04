@@ -134,6 +134,7 @@ PROVIDERS: dict[str, dict[str, Any]] = {
             "image": {
                 "default": "",                 # 必填 MEDIA_CUSTOM_n_IMAGE_MODEL
                 "task_path": "/images/generations",          # OpenAI 标准风格
+                "task_poll_path": "/tasks",    # 异步任务式渠道（如魔搭）的轮询路径
                 "rpm": 20,
                 # sizes 留空 = 不校验（custom 渠道能力未知，warn 不 die）；
                 # 可用 MEDIA_CUSTOM_n_IMAGE_SIZES="1024x1024,1344x768" 自填白名单
@@ -383,6 +384,40 @@ def _download_image(resp: dict, out: str) -> None:
     else:
         die(f"响应无 url/b64: {json.dumps(resp)[:300]}")
 
+def _resolve_async_task(used_key: dict, resp: dict, poll_path: str = "/tasks") -> dict:
+    """异步任务式渠道兜底：响应无 url/b64 但有 task_id 时，轮询取最终结果。
+    兼容魔搭风格（GET {base}/tasks/{id} → task_status/output_images）；
+    非 task 式响应原样返回，同步渠道不受影响。"""
+    d = (resp.get("data") or [{}])[0]
+    if resp.get("url") or d.get("url") or d.get("b64_json"):
+        return resp
+    tid = resp.get("task_id")
+    if not tid:
+        return resp
+    poll_url = f"{used_key['base']}{poll_path}/{tid}"
+    headers = {"Authorization": f"Bearer {used_key['key']}",
+               "X-ModelScope-Task-Type": "image_generation"}
+    print(f"[media_gen] 异步任务式响应，轮询 {poll_url} …", file=sys.stderr)
+    deadline = time.time() + 300
+    while time.time() < deadline:
+        time.sleep(3)
+        try:
+            req = urllib.request.Request(poll_url, headers=headers)
+            with urllib.request.urlopen(req, timeout=60) as r:
+                st = json.loads(r.read().decode("utf-8", "ignore"))
+        except Exception as e:
+            print(f"[media_gen] 轮询异常: {e}", file=sys.stderr)
+            continue
+        status = str(st.get("task_status") or "").upper()
+        imgs = st.get("output_images") or []
+        if imgs:
+            return {"data": [{"url": imgs[0]}]}
+        if status in ("FAILED", "FAIL", "ERROR"):
+            die(f"生图任务失败: {json.dumps(st, ensure_ascii=False)[:300]}")
+        if status == "SUCCEED" and not imgs:
+            die(f"任务成功但无图: {json.dumps(st, ensure_ascii=False)[:300]}")
+    die("轮询超时 5 分钟")
+
 def cmd_image(args) -> None:
     size = args.size
     pools = [args.provider] if args.provider else pools_for_role("image")
@@ -410,6 +445,8 @@ def cmd_image(args) -> None:
             print(f"[media_gen] 出图节流，等待 {wait:.0f}s（第 {i+1}/{count} 张）", file=sys.stderr)
             time.sleep(wait)
         resp, used_key = _gen_image_once(pools, args, size, errs)
+        _pinfo = PROVIDERS[used_key["pool"]]["models"].get("image") or {}
+        resp = _resolve_async_task(used_key, resp, _pinfo.get("task_poll_path", "/tasks"))
         _download_image(resp, out)
         print(f"[media_gen] image OK via {used_key['pool']} key#{used_key['n']} ({key_mask(used_key['key'])}) -> {out}")
         outs.append(out)
