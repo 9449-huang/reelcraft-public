@@ -19,5 +19,15 @@
     "kind": "clean",
     "probed_at": "2026-09-05",
     "note": "ltx 本地网关(127.0.0.1:8000)首中尾三帧目检无水印；输出动画webp需webp2mp4转换后目检"
+  },
+  "agnes_video": {
+    "kind": "clean",
+    "probed_at": "2026-09-05",
+    "note": "agnes-video i2v 三帧目检无水印；1088x832 / 5.04s / 自带 AAC 音轨"
+  },
+  "custom_qwen_image": {
+    "kind": "clean",
+    "probed_at": "2026-09-05",
+    "note": "Qwen/Qwen-Image 异步任务产物目检无水印；中文文字渲染强项"
   }
 }

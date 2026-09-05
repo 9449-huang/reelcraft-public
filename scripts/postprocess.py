@@ -19,6 +19,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -379,6 +380,79 @@ def die(msg: str, code: int = 1) -> None:
     print(f"[postprocess] ERROR: {msg}", file=sys.stderr)
     sys.exit(code)
 
+# ─── webp2mp4（LTX .webp 产物转码，Exif 损坏容错）────────────
+def _webp_frames(path: Path):
+    """Pillow 解帧绕过 LTX webp 的损坏 Exif（ffmpeg 直转报 invalid TIFF header）。"""
+    from PIL import Image, ImageSequence
+    im = Image.open(path)
+    frames = [f.copy().convert("RGB") for f in ImageSequence.Iterator(im)]
+    durs = []
+    im.seek(0)
+    try:
+        while True:
+            durs.append(im.info.get("duration", 40))
+            im.seek(im.tell() + 1)
+    except EOFError:
+        pass
+    fps = 1000.0 / (sum(durs) / len(durs)) if durs else 24.0
+    return frames, fps
+
+
+def cmd_webp2mp4(args) -> None:
+    import tempfile
+    src = Path(args.src)
+    is_dir = src.is_dir()
+    targets = sorted(src.glob("*.webp")) if is_dir else [src]
+    if not targets:
+        die(f"没有可转的 .webp：{src}")
+    for w in targets:
+        if is_dir:
+            dst = (Path(args.outdir) if args.outdir else w.parent) / (w.stem + ".mp4")
+        else:
+            dst = Path(args.dst) if args.dst else w.with_suffix(".mp4")
+        frames, native_fps = _webp_frames(w)
+        fps = args.fps or round(native_fps, 2)
+        tmp = Path(tempfile.mkdtemp(prefix="webp2mp4_"))
+        for i, f in enumerate(frames):
+            f.save(tmp / f"f{i:04d}.png")
+        print(f"[webp2mp4] {w.name} -> {dst.name} ({len(frames)}帧 @{fps}fps)")
+        run([_ffmpeg(), "-y", "-loglevel", "error", "-framerate", str(fps),
+             "-i", str(tmp / "f%04d.png"),
+             "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "18",
+             "-movflags", "+faststart", str(dst)])
+        shutil.rmtree(tmp, ignore_errors=True)   # 清理失败不影响产物
+
+
+# ─── stylegrid（混编画风质检：N 镜首帧并排拼图）──────────────
+def cmd_stylegrid(args) -> None:
+    """N 镜首帧并排拼一张大图——混编多模型时画风跳变一眼可见（纯 Pillow，0 API）。"""
+    from PIL import Image, ImageDraw
+    frames = sorted(Path(args.frames).glob("*.png"))[:args.max]
+    if not frames:
+        die(f"没有 *.png：{args.frames}")
+    cell_w, label_h, pad = args.cell, 22, 4
+    cells = []
+    for p in frames:
+        im = Image.open(p).convert("RGB")
+        h = max(1, round(im.height * cell_w / im.width))
+        cells.append((p.stem, im.resize((cell_w, h))))
+    cell_h = max(c[1].height for c in cells) + label_h
+    cols = min(args.cols, len(cells))
+    rows = (len(cells) + cols - 1) // cols
+    canvas = Image.new("RGB", (cols * (cell_w + pad) + pad,
+                               rows * (cell_h + pad) + pad), (245, 245, 242))
+    draw = ImageDraw.Draw(canvas)
+    for idx, (name, im) in enumerate(cells):
+        x = pad + (idx % cols) * (cell_w + pad)
+        y = pad + (idx // cols) * (cell_h + pad)
+        draw.text((x + 2, y + 2), name, fill=(40, 40, 40))
+        canvas.paste(im, (x, y + label_h))
+    out = Path(args.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    canvas.save(out)
+    print(f"[stylegrid] {len(cells)} 镜 -> {out}（{rows}行×{cols}列，画风跳变一眼可见）")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -431,6 +505,19 @@ def main() -> None:
                      help="每镜秒数；逗号列表循环取（如 5,4,6 → 1/4/7 镜 5s，2/5/8 镜 4s…）")
     kba.add_argument("--zoom", default="0.0008")
 
+    p2m = sub.add_parser("webp2mp4", help="动画 webp → mp4（Pillow 解帧，绕过 LTX 损坏 Exif）")
+    p2m.add_argument("src", help=".webp 文件或含 *.webp 的目录")
+    p2m.add_argument("dst", nargs="?", help="输出 mp4（单文件模式；目录模式用 --outdir）")
+    p2m.add_argument("--outdir", help="目录模式输出目录（默认原地同名 .mp4）")
+    p2m.add_argument("--fps", type=float, default=None, help="强制帧率（默认读 webp 原生帧时长）")
+
+    sg = sub.add_parser("stylegrid", help="N 镜首帧并排拼图（混编画风跳变一眼可见，0 API）")
+    sg.add_argument("frames", help="frames 目录（*.png，文件名排序即镜序）")
+    sg.add_argument("--out", default="style_grid.png")
+    sg.add_argument("--cols", type=int, default=5)
+    sg.add_argument("--cell", type=int, default=320, help="单格宽 px")
+    sg.add_argument("--max", type=int, default=20, help="最多取前 N 张")
+
     args = ap.parse_args()
     if args.cmd == "concat":
         cmd_concat(args)
@@ -442,6 +529,10 @@ def main() -> None:
         cmd_kenburns(args)
     elif args.cmd == "kenburns-all":
         cmd_kenburns_all(args)
+    elif args.cmd == "webp2mp4":
+        cmd_webp2mp4(args)
+    elif args.cmd == "stylegrid":
+        cmd_stylegrid(args)
 
 if __name__ == "__main__":
     main()

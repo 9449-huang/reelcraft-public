@@ -14,6 +14,24 @@ description: 一句话需求 → 多 provider 生图/视频流水线（主力池
 - 静态海报/单图 → 用 `ppt-master` 或图片工具
 - 单帧修图（去水印、风格化） → 用 `buddy-image-processing`
 
+### 新用户导览（30 秒看懂流程与问项）
+
+**流程**：Step 0 赛事规格 → **Step 1 体检 + 六问**（下面）→ Step 2 分镜 → Step 3 提示词（按口味卡）→ Step 4 关键帧出图 → Step 5 图生视频 → Step 6 后期+声音 → Step 7 交付。
+
+**六问**（一次问完落 plan.json，之后不再重复问；全部大白话，对用户只说"模型"）：
+
+| 问 | 内容 | 何时跳过 |
+|---|---|---|
+| ① 谁出图、谁出视频 | 角色搭配，落 env `_ROLES` | 不跳过 |
+| ② 开几发并行 | 先清点后发问，报真实家底（"能出图的模型有 5 个，最多 5 发"）；可混用不同模型 | 某阶段只有 1 个模型 |
+| ③ 视频有水印吗 | 只查实际接入的模型；档案已记 clean 的快过 | 全部已知 clean |
+| ④ 成片模式 | 全真视频 / 按镜混用 / 全缓推；绝不自动降级 | 不跳过 |
+| ⑤ 视频模型顺序 | 主用 + 超时候补 | 能出视频的模型仅 1 个 |
+| ⑥ 模型算哪一档 | 用户自选 ultra/high/mid/low（见口味卡卡三话术） | 只问 custom 池 |
+
+**例外交互**：仅当视频生成超时（exit 4）时再问一次三选——切换模型 / 续等（`--wait-task`）/ 放弃；任务自动落盘，`harvest` 随时收割。
+**新用户前置**：把各家 key 写进 `media_keys.env`（模板见"扩容指南"→ `references/provider-setup.md`）。
+
 ### 核心设计变更（v2.5）
 0. **Key 方案确认 + 角色路由**（v2.5 新增）：开工前先问用户两件事——key 怎么搭配（**一条龙**一把 key 包办生图+视频，还是**分工**生图/视频用不同家）、开几发并行；每把 key 用 `_ROLES` 声明承担的角色，`MEDIA_PRIORITY` 决定主力池与跨池兜底顺序，`_IMAGE_MODEL/_VIDEO_MODEL` 填模型名即换更强模型（零改码）
 1. **prompt（英文生图/视频提示词）由对话模型直接撰写**——当初弃用 agnes-2.5-flash 是因为它写不好技术性 prompt
@@ -34,6 +52,10 @@ description: 一句话需求 → 多 provider 生图/视频流水线（主力池
 14. **水印探测-抹除旁线**（v2.6 新增）：档案 `scripts/watermark_profiles.json` 记各渠道水印状态（clean / corner-delogo / unknown / fatal）——命中档案免测直抹；首遇新渠道跑**固定镜头纯色画面** probe 片，抽帧目检定位（agent 自带视觉，0 API）后 `delogo_watermark.py --provider` 抹除并回写档案。只管小而静态的角标水印；动态/大面积记 fatal 换渠道
 15. **通用池 + 能力探测 + 三档模式**（v2.7 新增）：任意 OpenAI 兼容渠道填 4 行 env 即接入（`MEDIA_CUSTOM_1_*`，零改码）；`status` 自动 GET /models 启发式猜能力（标注“猜的未验证”，实跑才算数）；成片三档 **full 全真视频 / hybrid 按镜混用（重点镜 i2v + 过场镜 kenburns） / stills 全缓推（0 视频调用）**——探测结果报给用户选，绝不自动降级
 16. **prompt 口味卡**（v2.7 新增）：`references/prompt_styles.md` 三张"怎么喂"小卡——轻量卡（agnes/zhipu/qwen-edit 共用，按文生图/图编辑/视频三种活对号）／高规格卡（sora/kling 级大模型逐字段写全）／custom 两档（按模型实力选，判断不了问用户）——通用骨架保证"想得对"，口味卡保证"喂得对"；custom 池踩坑回写沉淀，越用越准
+
+**回归测试**：`python -m unittest discover tests -v`（纯逻辑零网络；改 media_gen.py 后必跑）。
+**image 超时协议**：异步图任务轮询超时 exit 4 + task_id 落盘（提交即扣不浪费），`harvest` 收割 video/image 两类 pending。
+**第二场补全**（v2.8）：①LTX .webp 产物转码进 skill：`postprocess.py webp2mp4 <src> [dst|--outdir]`（Pillow 解帧绕过损坏 Exif）；②失败镜一键补跑：`batch --retry-failed`（读 batch_run.json 只重跑 FAIL/PENDING，PENDING 先 harvest、仍在生成的不重提交防重复扣费）；③混编画风质检：`postprocess.py stylegrid frames/ --cols 5`（N 镜首帧并排拼图，跳变一眼可见）；④`plan-check <plan.json>`（未知字段/枚举值校验，防拼错静默失效）。
 
 ---
 
@@ -130,8 +152,6 @@ python scripts/media_gen.py image --provider zhipu --prompt "probe" --size 1024x
 保证"同一张好图能再出一次"。**禁止**把 B 轨 15 字段全塞进 i2v prompt（会与首帧打架致运动糊掉）。
 
 写完过一遍 framework §9 自查清单（11 项）。
-
-**降级路径（已弃用）**：`scripts/agnes_gen.py` 仅保留旧 `enhance` 命令供历史回溯，**新流程请用 `media_gen.py`**，本脚本不再维护。
 
 ## Step 4 — 关键帧出图（多 provider 路由 + 批量选优）
 
@@ -409,34 +429,9 @@ python scripts/media_gen.py batch shots60/ --phase videos --workers 2 --qc
 
 ---
 
-## 失败处理（v2.1）
+## 失败处理
 
-| 失败 | 处理 |
-|---|---|
-| 401/403 | key 永久黑名单 24h，自动换下一个 |
-| 429 | key 冷却 60s 自动换；同池全部 key 冷却/失败 → 单命令按 `MEDIA_PRIORITY` 自动跨池兜底（batch 中该 worker 连续失败 ≥3 自动退场，FAIL 镜可用单命令跨池兜底补跑） |
-| 5xx / 超时 | 指数退避重试 3 次 |
-| 内容审核拒绝（ProviderFatal） | **不换 key、不降级**——换家也一样拒，应改 prompt |
-| 视频轮询超时 10min | 提示手动用 video_id 查 |
-| Agnes 视频整体不可用 | 切智谱 CogVideoX-Flash（`--provider zhipu`，原生 1080p）；再不行 Ken Burns |
-| 智谱/魔塔返回带水印 | 不入正片，作概念图；正片用 Agnes 出图（魔塔 edit 输出无水印，可直接用） |
-| TTS 报“未配置” | 按指引补 `MEDIA_TTS_1_KEY/_BASE/_MODEL`（见声音设计节）；或改用用户自录 |
-| 成片无声 | 检查 concat 是否走了 xfade 分支且各 clip 自带音轨；`-map` 必须同时映射视频+音频 |
-| 成片只有音轨没画面 | 字幕步骤漏了 `-map 0:v`（显式 map 一旦出现，未列出的流全部丢弃） |
-
-### 按症状诊断（fail 诊断杠杆，源自 seedance-2.0）
-
-生成"成功"但画面烂时，按症状对症下药；**每次只改一个变量**（单变量重拍，framework §8）：
-
-| 症状 | 第一杠杆 | 第二杠杆 |
-|---|---|---|
-| 手/脸崩坏 | 降运动幅度（"slowly"加码）；手别当画面焦点 | negative 已有 warped hands；换景别避开手部特写 |
-| 画面抖动/闪烁 | i2v prompt 删掉 camera 移动（locked camera） | 降事件数到 1 |
-| 主体变形/漂移 | i2v prompt 补 "the camera holds still, the subject stays sharp in place" | 重出首帧（构图更稳的） |
-| 运动幅度过大（瞬移） | 加 "very slowly, gradually, unhurried" | num_frames 降档（121→65） |
-| 运动幅度过小（几乎不动） | i2v 动词换强动词（grind/lift/bloom） | 检查首帧是否本身太"满"（构图密=没空间动） |
-| 风格跨镜漂移 | 核对 ledger.immutable 是否每镜逐词重复 | 该镜重出首帧 |
-| 审核拒绝 | 改 prompt（移除疑似敏感词），**不换 provider** | — |
+完整失败处理表与**按症状诊断**（画面烂→对症单变量重拍）已外置 → `references/troubleshooting.md`。
 
 ## 成本与时间预期
 
@@ -460,29 +455,6 @@ python scripts/media_gen.py batch shots60/ --phase videos --workers 2 --qc
 - ffmpeg 由 `scripts/ffmpeg_probe.py` 跨平台自动探测（环境变量 FFMPEG > PATH > imageio_ffmpeg > 托管路径），无需硬编码绝对路径
 - 密钥模板见仓库 `media_keys.env.example`，复制改名后填真实 key（切勿提交真实 key）
 
-## 扩容指南（多 key / 新 provider 接口）
+## 扩容指南（多 key / 新 provider 接入）
 
-**① 加同 provider 的更多 key**（如第 4、5 把 Agnes key）——只改 `~/.workbuddy/media_keys.env`，脚本零改动：
-
-```bash
-export MEDIA_AGNES_4_KEY="sk-..."
-export MEDIA_AGNES_4_BASE="https://apihub.agnes-ai.com/v1"   # 每把 key 独立 _BASE/_POLL，可混用不同域名
-export MEDIA_AGNES_4_POLL="https://apihub.agnes-ai.com"
-export MEDIA_AGNES_4_ROLES="image,video"   # 可选：缺省一条龙；分工示例 "image"
-export MEDIA_AGNES_4_IMAGE_MODEL="..."     # 可选：该 key 单独换模型（零改码）
-```
-
-- 之后 `batch --workers 4` 即四发并行（worker 数超过可用 (池,key) 对数时自动截断并提醒）
-- key 池按 `_1_ _2_ _3_...` **序号连续枚举，遇缺号即停**——序号必须连续，不能跳号
-- 改完跑 `python scripts/media_gen.py status` 验证全部加载（非默认的角色/模型覆盖会显示在行尾）
-
-**② 接入新的生图/生视频 provider**——**首选通用池（零改码）**：
-
-1. env 里加 `MEDIA_CUSTOM_1_KEY` / `_BASE`（OpenAI 兼容 base，`/v1` 结尾）+ **必填** `MEDIA_CUSTOM_1_IMAGE_MODEL` / `MEDIA_CUSTOM_1_VIDEO_MODEL`（接哪个能力填哪个，`_ROLES` 同步声明）
-2. 可选：`MEDIA_CUSTOM_1_IMAGE_SIZES="1024x1024,..."` 自填白名单（超出仅警告）；视频默认按异步任务轮询风（`/videos/generations` + path 轮询），Sora 风渠道用 `_TASK_PATH=/_videos` 改
-3. 跑 `status`（自动 /models 探测能力）→ probe 一张图/一段视频目检 → 按 `references/prompt_styles.md` custom 卡沉淀口味
-4. 多把 custom key：`MEDIA_CUSTOM_2_...` 递增即可，轮转/熔断/节流/批量全套自动继承
-
-> 想把某渠道做成一等公民（带实测 size 白名单/专用 payload）：再在 `media_gen.py` 顶部 `PROVIDERS` 表加条目——**照抄 agnes 条目改参数**，多 key 轮转 / 熔断 / per-key 节流 / 跨池兜底 / QC / 断点续跑全套自动继承；并把它加进 `MEDIA_PRIORITY`（不加入则 `--provider <pool>` 显式使用）。定制条目 = 沉淀实测参数，通用池 = 快速试接，两者不冲突
-
-**③ 验证**：`status` 看加载；单 key 冒烟测试用 `--pin-key N`（如 `image --pin-key 3`），不扰动其它 key 的冷却计时。
+完整模板与步骤已外置 → `references/provider-setup.md`（加 key、通用池零改码接入、一等公民沉淀路径、序号连续规则）。
