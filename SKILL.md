@@ -77,12 +77,12 @@ python scripts/media_gen.py image --provider zhipu --prompt "probe" --size 1024x
 - **B. 分工**：生图/视频用不同的 key——env 给每把 key 填 `_ROLES`（如 `MEDIA_A_1_ROLES=image`、`MEDIA_B_1_ROLES=video`；custom 池内多把 key 各管一摊同理：custom_1 只出图、custom_2 只出视频）
 - 用户选完由 agent 落 env（持久配置，问一次即可）；执行时 media_gen 按 `_ROLES` 自动路由，零改码
 
-**问② 开几发并行？**（先清点后发问，禁止按某个固定池预设选项；某阶段只有 1 把 key 则该阶段直接跳过此问，不浪费用户时间）
-- 跑 `status` 分两列清点：**生图**可用几把 key（哪些池哪几把，`_ROLES` 过滤后）、**生视频**可用几把——家底报给用户（池名带一句"是什么"）
-- 某阶段 ≥2 把才问：选项上限 = 该阶段可用 key 数，且**明说可以混用不同模型**（`batch` 支持跨池混编：每个 worker 绑一个 (池,key)，不同模型同场开工），同时带一句大白话提醒："不同模型画风会不一样，介意的话可以指定只用某一个"
-- 图/视频家底不同时分两行问清，落 plan.json `workers_image` / `workers_video`（替代旧的单值 workers）
+**问② 开几发并行？**（先清点后发问，禁止预设数字；某阶段只有 1 个模型则该阶段直接跳过此问）
+- 跑 `status` 分两列清点：**能出图**的模型有几个、**能出视频**的模型有几个——把真实家底报给用户（如"能出图的模型有 5 个，最多同时 5 发"）；上限永远随接入数增长，不设固定数字，举例必须用真实清点数字
+- 某阶段 ≥2 个模型才问：明说**可以混用不同模型**（`batch` 支持跨池混编：每个 worker 绑一个模型，不同模型同场开工），同时带一句大白话提醒："不同模型画风会不一样，介意的话可以指定只用某一个"
+- 图/视频家底不同时分两行问清，落 plan.json `workers_image` / `workers_video`
 
-**问③ 视频源带水印吗？**（只对用户**实际接入**的池做：先查档案 `scripts/watermark_profiles.json`，档案举例仅限用户真接了的池，没接的池不提）
+**问③ 视频源带水印吗？**（只对用户**实际接入的模型**做：先查档案 `scripts/watermark_profiles.json`；措辞说"你接入的模型出的视频带水印吗"，不说"渠道/池"；档案举例仅限用户真接了的模型，没接的不提）
 - 档案 `unknown`/缺条目 → 跑 5s **probe 视频**：prompt 故意用**固定镜头+纯色背景**（蓝天/白墙，水印无所遁形），`qc` 抽首/中/尾 3 帧目检
 - 有水印 → `delogo_watermark.py --provider <池> --dry-run` 目检框位 → 正式抹除，框坐标**回写档案**，同渠道永久免测
 - 会动的/大面积/居中的水印 → 档案记 `fatal`，换渠道（勿硬抹）
@@ -93,14 +93,14 @@ python scripts/media_gen.py image --provider zhipu --prompt "probe" --size 1024x
 - **stills 全缓推**：没有视频 key 时的保底，全镜 kenburns（0 视频调用，纯本地），规格照样达标
 - 模式落 plan.json；**绝不自动降级**——探测到有视频能力就默认 full，降级永远先问
 
-**问⑤ 视频池顺序**（接入 ≥2 个视频池时，只接一个则跳过）：跑 `status` 看实际可用的视频池，向用户呈现清单（池名+属性，全部来自其真实配置，零硬编码），问清**主用哪个、备选顺序**，记入 plan.json `video_pool_order`。
+**问⑤ 视频模型顺序**（能出视频的模型 ≥2 个时才问，只接一个则跳过）：跑 `status` 看实际可用的视频模型，向用户呈现清单（模型名 + 一句"是什么"，全部来自其真实配置，零硬编码），问清**主用哪个、备选顺序**，记入 plan.json `video_pool_order`。
 
 **问⑥ custom 池的模型算哪一档？**（只问 custom 池；agnes/zhipu/modelscope 有内置口味卡，不问）
 - 话术必须大白话（完整选项见 `references/prompt_styles.md` 卡三"问档话术"）：**顶级 / 主流 / 开源中等 / 入门受限**，每档附熟悉例子；用户拿不准可点"帮我判断"，agent 才评估（探测+模型知识+必要时试跑）
 - 答案落 env `MEDIA_CUSTOM_n_TIER=ultra|high|mid|low`（**挂 key 不挂池**，同池 key 能力可能差几档），之后不再问
 - plan.json 可选加 `"tier_map": {"custom_key1": "high", "custom_key2": "low"}` 便于回溯
 
-**面向用户的话术原则（所有问项通用）**：给用户看的选项一律大白话 + 熟悉例子；池名报出来要带一句"是什么"（如 "custom 池 = 你自己接入的任意模型"）；术语（_ROLES/_TIER/CFG 这类）只写进 env/plan，不说给用户听。
+**面向用户的话术原则（所有问项通用）**：①给用户看的选项一律大白话 + 熟悉例子；②**对用户只说"模型"**——"池/key/渠道"是内部概念，用户心智里只有"我接了几个模型"，术语（_ROLES/_TIER/CFG 这类）只写进 env/plan，不说给用户听；③并行度永远报真实清点数字（"你的家底最多 N 发"），不举可能误导的例子。
 
 确认后写入 `shots/plan.json`（`{"role_assign": "one-stop|split", "workers_image": N, "workers_video": N, "watermark": {"<池>": "clean|corner-delogo|fatal"}, "mode": "full|hybrid|stills", "hero_shots": [1,5,8], "video_pool_order": ["<主池>", "<备池>", "..."], "tier_map": {"<池>_key<N>": "ultra|high|mid|low"}}`），后续步骤照办，不再重复问。
 单命令 `image/video` 的 `--provider` 留空时按 `MEDIA_PRIORITY` 自动选池；某池全部 key 失败自动跨池兜底。
