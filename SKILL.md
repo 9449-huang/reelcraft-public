@@ -72,9 +72,10 @@ python scripts/media_gen.py image --provider zhipu --prompt "probe" --size 1024x
 
 `status` 已报出各池 key 家底，向用户确认三件事（**只问一次**，答案落 `shots/plan.json`）：
 
-**问① key 怎么搭配？**
+**问① key 怎么搭配（谁出图、谁出视频）？**（问法要大白话："生图交给哪个模型、视频交给哪个模型"）
 - **A. 一条龙**（默认）：一把 key 包办生图+视频——env 里不填 `_ROLES` 即是（缺省 `image,video`）
-- **B. 分工**：生图/视频用不同家的 key——env 给每把 key 填 `_ROLES`（如 `MEDIA_A_1_ROLES=image`、`MEDIA_B_1_ROLES=video`）
+- **B. 分工**：生图/视频用不同的 key——env 给每把 key 填 `_ROLES`（如 `MEDIA_A_1_ROLES=image`、`MEDIA_B_1_ROLES=video`；custom 池内多把 key 各管一摊同理：custom_1 只出图、custom_2 只出视频）
+- 用户选完由 agent 落 env（持久配置，问一次即可）；执行时 media_gen 按 `_ROLES` 自动路由，零改码
 
 **问② 开几发并行？**
 - 1 发 = 串行（约 2 分钟/镜）；N 发 = 吞吐 ×N（`batch --workers N`，N ≤ 承担该阶段角色的 key 数）
@@ -94,7 +95,14 @@ python scripts/media_gen.py image --provider zhipu --prompt "probe" --size 1024x
 
 **问⑤ 视频池顺序**（接入 ≥2 个视频池时，只接一个则跳过）：跑 `status` 看实际可用的视频池，向用户呈现清单（池名+属性，全部来自其真实配置，零硬编码），问清**主用哪个、备选顺序**，记入 plan.json `video_pool_order`。
 
-确认后写入 `shots/plan.json`（`{"role_assign": "one-stop|split", "workers": N, "watermark": {"<池>": "clean|corner-delogo|fatal"}, "mode": "full|hybrid|stills", "hero_shots": [1,5,8], "video_pool_order": ["<主池>", "<备池>", "..."]}`），后续步骤照办，不再重复问。
+**问⑥ custom 池的模型算哪一档？**（只问 custom 池；agnes/zhipu/modelscope 有内置口味卡，不问）
+- 话术必须大白话（完整选项见 `references/prompt_styles.md` 卡三"问档话术"）：**顶级 / 主流 / 开源中等 / 入门受限**，每档附熟悉例子；用户拿不准可点"帮我判断"，agent 才评估（探测+模型知识+必要时试跑）
+- 答案落 env `MEDIA_CUSTOM_n_TIER=ultra|high|mid|low`（**挂 key 不挂池**，同池 key 能力可能差几档），之后不再问
+- plan.json 可选加 `"tier_map": {"custom_key1": "high", "custom_key2": "low"}` 便于回溯
+
+**面向用户的话术原则（所有问项通用）**：给用户看的选项一律大白话 + 熟悉例子；池名报出来要带一句"是什么"（如 "custom 池 = 你自己接入的任意模型"）；术语（_ROLES/_TIER/CFG 这类）只写进 env/plan，不说给用户听。
+
+确认后写入 `shots/plan.json`（`{"role_assign": "one-stop|split", "workers": N, "watermark": {"<池>": "clean|corner-delogo|fatal"}, "mode": "full|hybrid|stills", "hero_shots": [1,5,8], "video_pool_order": ["<主池>", "<备池>", "..."], "tier_map": {"<池>_key<N>": "ultra|high|mid|low"}}`），后续步骤照办，不再重复问。
 单命令 `image/video` 的 `--provider` 留空时按 `MEDIA_PRIORITY` 自动选池；某池全部 key 失败自动跨池兜底。
 
 **视频超时询问协议**（video 命令退出码 4）：轮询超时会自动把 task_id 落盘（提交即扣，出片不浪费）并打印**实际可用**的备池菜单（从用户接入动态生成）。agent 拿到退出码 4 后**必须问用户三选**：①切下一池（按 plan.json 的 `video_pool_order` 顺序）②继续等（`video --wait-task <id>`，零扣分续等）③放弃该镜。决策记入 plan.json。被切走的任务**不取消**——之后任何时点跑 `media_gen.py harvest` 可收割已完成出片（自动下载到原定路径）。

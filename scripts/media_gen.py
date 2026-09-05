@@ -174,7 +174,7 @@ def _load_env_file(path: Path) -> None:
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
-        m = re.match(r'export\s+([A-Za-z_][A-Za-z0-9_]*)="(.*)"$', line)
+        m = re.match(r'export\s+([A-Za-z_][A-Za-z0-9_]*)="([^"]*)"', line)  # 取首个引号内值，容忍行内注释
         if m and not os.environ.get(m.group(1)):
             os.environ[m.group(1)] = m.group(2)
 
@@ -219,7 +219,14 @@ def list_keys(provider: str, pin: int = 0, required: bool = True, role: str = ""
                  "image_model": os.environ.get(f"{prefix}{n}_IMAGE_MODEL", ""),
                  "video_model": os.environ.get(f"{prefix}{n}_VIDEO_MODEL", ""),
                  "image_sizes": [s.strip() for s in
-                                 os.environ.get(f"{prefix}{n}_IMAGE_SIZES", "").split(",") if s.strip()]}
+                                 os.environ.get(f"{prefix}{n}_IMAGE_SIZES", "").split(",") if s.strip()],
+                 # 路径/字段名可配（覆盖 PROVIDERS 模板）：风格族不对时零改码适配
+                 "task_path": os.environ.get(f"{prefix}{n}_TASK_PATH", ""),
+                 "image_task_path": os.environ.get(f"{prefix}{n}_IMAGE_TASK_PATH", ""),
+                 "video_task_path": os.environ.get(f"{prefix}{n}_VIDEO_TASK_PATH", ""),
+                 "video_prompt_field": os.environ.get(f"{prefix}{n}_VIDEO_PROMPT_FIELD", ""),
+                 # 口味档位（卡三四档：ultra/high/mid/low，由用户自选后落 env）
+                 "tier": os.environ.get(f"{prefix}{n}_TIER", "").strip().lower()}
         if not role or role in roles:
             keys.append(entry)
         n += 1
@@ -317,7 +324,7 @@ def call_with_failover(
        ProviderFatal → 抛出（不换 key）
        PermissionError/429 → 换 key；同 provider 全冷却则抛 AllKeysExhausted
     """
-    keys = list_keys(provider, pin_key)
+    keys = list_keys(provider, pin_key, role=kind)   # 按 _ROLES 过滤（如 custom 池图/视频分 key）
     state = _load_state() or {}
     cooldown = (state.get("cooldown") or {}).get(provider) or {}
     last_err = None
@@ -371,12 +378,38 @@ def _insert_suffix(path: str, suffix: str) -> str:
     p = Path(path)
     return str(p.with_name(f"{p.stem}{suffix}{p.suffix}"))
 
-def _download_image(resp: dict, out: str) -> None:
+def _abs_url(url: str, base: str) -> str:
+    """相对路径（如 /files/x.webp，本地桥接常见）按 base 的 origin 补全；绝对 URL 原样返回。"""
+    if not url or not isinstance(url, str) or url.startswith(("http://", "https://")):
+        return url
+    try:
+        p = urllib.parse.urlparse(base)
+    except Exception:
+        return url
+    if not p.scheme:
+        return url
+    return f"{p.scheme}://{p.netloc}" + (url if url.startswith("/") else "/" + url)
+
+def _final_out(out: str, url: str) -> str:
+    """产物后缀与 --out 不符时按实际后缀存（避免 mp4 名装 webp 数据导致后续 ffmpeg 误判）。"""
+    try:
+        ue = os.path.splitext(urllib.parse.urlparse(url).path)[1].lower()
+    except Exception:
+        ue = ""
+    oe = os.path.splitext(out)[1].lower()
+    if ue and oe and ue != oe:
+        new = os.path.splitext(out)[0] + ue
+        print(f"[media_gen] 产物为 {ue}，已存为 {os.path.basename(new)}（用 ffmpeg 转码后再拼接）", file=sys.stderr)
+        return new
+    return out
+
+def _download_image(resp: dict, out: str, base: str = "") -> None:
     d = (resp.get("data") or [{}])[0]
-    url = d.get("url")
+    url = _abs_url(d.get("url"), base)
     b64 = d.get("b64_json")
     os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
     if url:
+        out = _final_out(out, url)
         urllib.request.urlretrieve(url, out)
     elif b64:
         with open(out, "wb") as f:
@@ -447,7 +480,7 @@ def cmd_image(args) -> None:
         resp, used_key = _gen_image_once(pools, args, size, errs)
         _pinfo = PROVIDERS[used_key["pool"]]["models"].get("image") or {}
         resp = _resolve_async_task(used_key, resp, _pinfo.get("task_poll_path", "/tasks"))
-        _download_image(resp, out)
+        _download_image(resp, out, used_key.get("base", ""))
         print(f"[media_gen] image OK via {used_key['pool']} key#{used_key['n']} ({key_mask(used_key['key'])}) -> {out}")
         outs.append(out)
     if count > 1:
@@ -482,7 +515,8 @@ def _gen_image_once(pools: list[str], args, size: str, errs: list[str]) -> tuple
                 print(f"[media_gen] [warn] _IMAGE_SIZES 自填白名单不含 size={size}，仅警告不拦截（渠道真实能力以实跑为准）", file=sys.stderr)
             headers = {"Authorization": f"Bearer {k['key']}", "Content-Type": "application/json"}
             body = {"model": model, "prompt": args.prompt, "size": size, "n": 1}
-            return http_call("POST", f"{k['base']}{_info.get('task_path', '/images/generations')}", headers, body, timeout=600)
+            ipath = k.get("image_task_path") or k.get("task_path") or _info.get("task_path", "/images/generations")
+            return http_call("POST", f"{k['base']}{ipath}", headers, body, timeout=600)
 
         try:
             resp, used = call_with_failover(pool, call_fn, kind="image", pin_key=args.pin_key)
@@ -580,9 +614,10 @@ def _poll_video_task(pool: str, info: dict, k: dict, video_id: str, out: str, ar
         except Exception as e:
             print(f"[media_gen] 轮询异常: {e}", file=sys.stderr)
             continue
-        url = _extract_video_url(st)
+        url = _abs_url(_extract_video_url(st), k.get("base", ""))
         if url:
             os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
+            out = _final_out(out, url)
             urllib.request.urlretrieve(url, out)
             print(f"[media_gen] video OK via {pool} -> {out}")
             return
@@ -720,7 +755,8 @@ def cmd_video(args) -> None:
                 model = k.get("video_model") or _info["default"]
                 if not model:
                     die(f"该池未配置模型名（模板无默认值）。请在 env 加 {_prefix}{k['n']}_VIDEO_MODEL=模型名", 2)
-                payload = {"model": model, "prompt": args.prompt}
+                pfield = k.get("video_prompt_field") or "prompt"
+                payload = {"model": model, pfield: args.prompt}
                 if _info.get("default_duration"):
                     payload["duration"] = _info["default_duration"]
                 if args.image:
@@ -732,7 +768,8 @@ def cmd_video(args) -> None:
                     payload["num_frames"] = nf2
                 if args.negative and _info.get("supports_negative"):
                     payload["negative_prompt"] = args.negative
-            return http_call("POST", f"{k['base']}{_info['task_path']}", headers, payload, timeout=300)
+            vpath = k.get("video_task_path") or k.get("task_path") or _info["task_path"]
+            return http_call("POST", f"{k['base']}{vpath}", headers, payload, timeout=300)
 
         try:
             resp, used_key = call_with_failover(pool, call_fn, kind="video", pin_key=args.pin_key)
@@ -750,9 +787,11 @@ def cmd_video(args) -> None:
     info = PROVIDERS[provider]["models"]["video"]
     video_id = resp.get("video_id") or resp.get("id") or resp.get("task_id")
     direct_url = resp.get("video_url") or resp.get("url")
-    if isinstance(direct_url, str) and direct_url.startswith("http"):
+    du = _abs_url(direct_url, used_key.get("base", ""))
+    if isinstance(du, str) and du.startswith("http"):
         os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
-        urllib.request.urlretrieve(direct_url, out)
+        out = _final_out(out, du)
+        urllib.request.urlretrieve(du, out)
         print(f"[media_gen] video OK via {provider} key#{used_key['n']} -> {out}")
         return
     if not video_id:
@@ -1089,6 +1128,8 @@ def cmd_status(args) -> None:
             extra = []
             if k["roles"] != {"image", "video"}:
                 extra.append("roles=" + ",".join(sorted(k["roles"])))
+            if k.get("tier"):
+                extra.append("tier=" + k["tier"])
             if k["image_model"]:
                 extra.append(f"img={k['image_model']}")
             if k["video_model"]:

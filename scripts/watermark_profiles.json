@@ -14,5 +14,10 @@
     "kind": "unknown",
     "probed_at": "2026-09-04",
     "note": "仅图像编辑用途，视频侧无记录"
+  },
+  "custom_ltx": {
+    "kind": "clean",
+    "probed_at": "2026-09-05",
+    "note": "ltx 本地网关(127.0.0.1:8000)首中尾三帧目检无水印；输出动画webp需webp2mp4转换后目检"
   }
 }
