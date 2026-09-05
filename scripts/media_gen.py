@@ -872,10 +872,11 @@ def cmd_last_frame(args) -> None:
 # ─── 批量并行（N key 各取动态队列，吞吐×N）────────────────
 def cmd_batch(args) -> None:
     """读 shots 目录下 S*.json / shot_*.json，images/videos 两阶段可并行多 worker。
-    workers=N 时：N 个 worker 各锁一把 key（按 _ROLES 过滤后：worker w → 承担该阶段
-    角色的第 w 把 key），从共享队列动态取镜，两路独立 1RPM，吞吐随 key 数线性提升。
-    断点续跑：已有产物跳过。仅单池（--provider 必填）；跨池兜底见 image/video 单命令。
-    每镜失败自动重试 --retries 次，仍失败记 FAIL。--dry-run 仅打印计划不执行。
+    workers=N 时：N 个 worker 跨池混编（每个绑定一个 (池, key) 对，按 _ROLES 过滤），
+    从共享队列动态取镜；不同池不同模型可同场开工。
+    --provider 留空 = 全部承担该角色的池混编；传单池 = 只跑该池；逗号分隔 = 指定混编。
+    断点续跑：已有产物跳过。每镜失败自动重试 --retries 次；某 worker 连续失败 ≥3
+    则退场（不拖垮全队，该镜记 FAIL，可用单命令跨池兜底补跑）。
     成功镜写入 batch_run.json（含所用 provider/key，便于追溯与混合 provider 拼接告警）。
     """
     import queue
@@ -888,16 +889,33 @@ def cmd_batch(args) -> None:
     if not jsons:
         die(f"未找到分镜 JSON: {shots_dir}/S*.json", 2)
 
-    provider = args.provider
-    if not provider:
-        die("batch 只跑单池，请显式 --provider（跨池自动兜底仅单命令 image/video 支持）", 2)
     role = "image" if args.phase == "images" else "video"
-    keys = list_keys(provider, required=False, role=role)
-    if not keys:
-        die(f"{provider} 没有承担 {role} 角色的 key"
-            f"（检查 MEDIA_{provider.upper()}_*_ROLES，缺省 image,video）", 2)
-    if args.workers > len(keys):
-        die(f"workers={args.workers} 超过 {provider} 承担 {role} 角色的 key 数 {len(keys)}", 2)
+    raw = (args.provider or "").strip()
+    pool_names = ([p.strip().lower() for p in raw.split(",") if p.strip()]
+                  if raw else pools_for_role(role))
+    for p in pool_names:
+        if p not in PROVIDERS:
+            die(f"不支持 provider: {p}", 2)
+    # 收集 (池, key) 候选并按池轮流交错 → 混编时模型分布均匀
+    spec: list[tuple[str, dict]] = []
+    for p in pool_names:
+        for k in list_keys(p, required=False, role=role):
+            spec.append((p, k))
+    if not spec:
+        die(f"没有承担 {role} 角色的可用 key（检查 MEDIA_*_1_KEY/_BASE/_ROLES，缺省 image,video）", 2)
+    by_pool: dict[str, list[tuple[str, dict]]] = {}
+    for item in spec:
+        by_pool.setdefault(item[0], []).append(item)
+    interleaved: list[tuple[str, dict]] = []
+    while any(by_pool.values()):
+        for p in pool_names:
+            if by_pool.get(p):
+                interleaved.append(by_pool[p].pop(0))
+    if args.workers > len(interleaved):
+        print(f"[batch] [warn] workers={args.workers} 超过可用 (池,key) 对数 "
+              f"{len(interleaved)}，已截断", file=sys.stderr)
+        args.workers = len(interleaved)
+    assigned = interleaved[:args.workers]
 
     frames_dir = shots_dir / "frames"
     clips_dir = shots_dir / "clips"
@@ -905,7 +923,7 @@ def cmd_batch(args) -> None:
     clips_dir.mkdir(exist_ok=True)
     qc_dir = clips_dir / "qc"
 
-    def make_cmd(j: Path, sid: str, pin: int) -> tuple[list[str], Path, str]:
+    def make_cmd(j: Path, sid: str, pool: str, pin: int) -> tuple[list[str], Path, str]:
         """构造单镜命令；返回 (cmd, out_path, skip_reason)。skip_reason 非空=跳过。"""
         d = json.loads(j.read_text(encoding="utf-8"))
         if args.phase == "images":
@@ -913,7 +931,7 @@ def cmd_batch(args) -> None:
             if out.exists() and out.stat().st_size > 0:
                 return [], out, "skip (exists)"
             cmd = [sys.executable, str(Path(__file__).resolve()), "image",
-                   "--provider", provider, "--prompt", d["t2i_prompt"],
+                   "--provider", pool, "--prompt", d["t2i_prompt"],
                    "--size", d.get("size", "1344x768"), "--out", str(out),
                    "--pin-key", str(pin)]
             return cmd, out, ""
@@ -924,7 +942,7 @@ def cmd_batch(args) -> None:
         if not frame.exists():
             return [], out, "MISS (no frame)"
         cmd = [sys.executable, str(Path(__file__).resolve()), "video",
-               "--provider", provider, "--prompt", d.get("i2v_prompt", ""),
+               "--provider", pool, "--prompt", d.get("i2v_prompt", ""),
                "--image", str(frame), "--out", str(out),
                "--num-frames", str(d.get("num_frames", 121)),
                "--negative", args.negative, "--pin-key", str(pin)]
@@ -939,9 +957,14 @@ def cmd_batch(args) -> None:
     # dry-run：仅打印计划
     if args.dry_run:
         print(f"[batch] DRY-RUN phase={args.phase} workers={args.workers} "
-              f"shots={len(plan)} retries={args.retries} provider={provider}")
+              f"shots={len(plan)} retries={args.retries} "
+              f"pools={','.join(p for p, _ in assigned)}")
+        for w, (p, k) in enumerate(assigned):
+            print(f"  W{w+1} -> {p} key#{k['n']}"
+                  + (f" tier={k['tier']}" if k.get("tier") else ""))
+        print("  (各镜由哪个 worker 执行由动态队列决定，下方命令以 W1 的池为例)")
         for j, sid in plan:
-            cmd, out, skip = make_cmd(j, sid, 1)
+            cmd, out, skip = make_cmd(j, sid, assigned[0][0], assigned[0][1]["n"])
             if skip:
                 print(f"  {sid} -> {out}  [{skip}]")
             else:
@@ -956,25 +979,36 @@ def cmd_batch(args) -> None:
     provider_map: dict[str, str] = {}
     rl = _t.Lock()
 
-    pinned_ns = [k["n"] for k in keys]    # 角色过滤后的实际 key 序号（可能不连续）
-
     def run_worker(w: int) -> None:
-        pin = pinned_ns[w]                # worker w → 承担该角色的第 w 把 key
+        pool, k = assigned[w]
+        pin = k["n"]
+        consecutive_fail = 0
         while True:
+            if consecutive_fail >= 3:
+                print(f"[batch W{w+1}] {pool} key#{pin} 连续失败 {consecutive_fail} 次，"
+                      f"worker 退场（其余 worker 继续；FAIL 镜可用单命令跨池兑底补跑）",
+                      file=sys.stderr)
+                return
             try:
                 j, sid = task_q.get_nowait()
             except queue.Empty:
-                break
-            cmd, out, skip = make_cmd(j, sid, pin)
+                return
+            cmd, out, skip = make_cmd(j, sid, pool, pin)
             if skip:
                 with rl:
                     results.append(f"skip {sid}")
+                consecutive_fail = 0
                 continue
             last_rc = 1
             for attempt in range(1, args.retries + 1):
                 rc = subprocess.call(cmd)
                 last_rc = rc
                 if rc == 0:
+                    break
+                if rc == 4:
+                    # 超时协议：任务已受理落盘（提交即扣），重试=重复扣费，严禁重试
+                    print(f"[batch W{w+1}] {sid} 轮询超时(rc=4)：任务已落盘，跑 harvest 收割",
+                          file=sys.stderr)
                     break
                 print(f"[batch W{w+1}] {sid} 失败(rc={rc})，重试 {attempt}/{args.retries}",
                       file=sys.stderr)
@@ -983,27 +1017,35 @@ def cmd_batch(args) -> None:
                 last_rc = 0
             with rl:
                 if last_rc == 0:
-                    results.append(f"OK {sid}")
-                    provider_map[sid] = f"{provider} key#{pin}"
+                    consecutive_fail = 0
+                    results.append(f"OK {sid} ({pool} key#{pin})")
+                    provider_map[sid] = f"{pool} key#{pin}"
                     if args.qc and args.phase == "videos":
                         qc_dir.mkdir(exist_ok=True)
                         subprocess.call([sys.executable, str(Path(__file__).resolve()),
                                          "qc", str(out), str(qc_dir)])
+                elif last_rc == 4:
+                    # 超时在途不算失败（不进 consecutive_fail，慢池 worker 不误退场）
+                    results.append(f"PENDING {sid} (任务已落盘，跑 harvest 收割)")
+                    provider_map[sid] = f"{pool} key#{pin} (timeout-pending)"
                 else:
-                    results.append(f"FAIL(rc={last_rc}) {sid}")
-                    provider_map[sid] = f"{provider} key#{pin} (failed)"
+                    consecutive_fail += 1
+                    results.append(f"FAIL(rc={last_rc}) {sid} [{pool} key#{pin}]")
+                    provider_map[sid] = f"{pool} key#{pin} (failed)"
 
     threads: list[_t.Thread] = []
     for w in range(args.workers):
-        th = _t.Thread(target=run_worker, daemon=True)
+        th = _t.Thread(target=run_worker, args=(w,), daemon=True)
         th.start()
         threads.append(th)
     for th in threads:
         th.join()
 
     # 每镜所用 provider/key 落盘，便于追溯与混合 provider 拼接告警
-    run_info = {"provider": provider, "phase": args.phase, "workers": args.workers,
-                "retries": args.retries, "shots": provider_map}
+    run_info = {"providers": sorted({p for p, _ in assigned}), "phase": args.phase,
+                "workers": args.workers, "retries": args.retries,
+                "assignment": [f"{p} key#{k['n']}" for p, k in assigned],
+                "shots": provider_map}
     (shots_dir / "batch_run.json").write_text(
         json.dumps(run_info, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -1197,11 +1239,11 @@ def main() -> None:
     ed.add_argument("--model", default="", help="覆盖默认 Qwen/Qwen-Image-Edit-2509")
     ed.add_argument("--wait", type=int, default=5, help="轮询间隔秒")
 
-    bt = sub.add_parser("batch", help="批量并行（N key 各跑动态队列，吞吐×N；仅单池）")
+    bt = sub.add_parser("batch", help="批量并行（跨池混编：N worker 各绑一个 (池,key)，吞吐×N）")
     bt.add_argument("shots", help="分镜 JSON 目录（含 S*.json / shot_*.json）")
     bt.add_argument("--phase", required=True, choices=["images", "videos"])
     bt.add_argument("--provider", default="",
-                    help="必填单池名（如 agnes）；跨池自动兜底不适用于 batch")
+                    help="留空=全部承担该角色的池混编；单池名=只跑该池；逗号分隔=指定几池混编")
     bt.add_argument("--workers", type=int, default=1, help="并行 worker 数（=使用的 key 数，≤ key 总数）")
     bt.add_argument("--retries", type=int, default=2, help="每镜失败重试次数（默认 2）")
     bt.add_argument("--dry-run", action="store_true", help="仅打印执行计划不实际生成")

@@ -25,7 +25,7 @@ description: 一句话需求 → 多 provider 生图/视频流水线（主力池
 7. **一镜多图选优**（v2.1 新增）：`image --count N` 批量出 N 张候选，人工挑最好的一张进 i2v
 8. **视频兜底**（v2.1 新增）：智谱 CogVideoX-Flash（免费，原生 1920×1080，无 Agnes 的 4:3 问题）
 9. **首帧小改**（v2.1 新增）：魔塔 `edit` 子命令，移物/调光不用整图重 roll
-10. **N key 并行**（v2.2 双 key → v2.4 任意 N）：`batch --workers N` 轮流把镜分给 N 把 key，per-key 节流，吞吐 ×N（有几把 key 就开几发）
+10. **N key 并行 + 跨池混编**（v2.2 双 key → v2.4 任意 N → v2.8 跨池）：`batch --workers N` 轮流把镜分给 N 个 (池,key)，per-key 节流，吞吐 ×N；`--provider` 留空=全部池混编，传单池/逗号分隔=指定范围
 11. **声音设计**（v2.2 新增）：VO 稿 → `tts` 子命令 → `--subtitles` 多段字幕 → `--voice/--bgm/--ambient-db` 混音
 12. **QC 闭环**（v2.2 新增）：`qc`/`batch --qc` 每段抽首中尾 3 帧验收，不合格按诊断表单变量重拍
 13. **文案批量出稿**（v2.3 新增）：`copy.py --brief --count` AI 撒网出候选 → 人工筛选改写。
@@ -77,13 +77,13 @@ python scripts/media_gen.py image --provider zhipu --prompt "probe" --size 1024x
 - **B. 分工**：生图/视频用不同的 key——env 给每把 key 填 `_ROLES`（如 `MEDIA_A_1_ROLES=image`、`MEDIA_B_1_ROLES=video`；custom 池内多把 key 各管一摊同理：custom_1 只出图、custom_2 只出视频）
 - 用户选完由 agent 落 env（持久配置，问一次即可）；执行时 media_gen 按 `_ROLES` 自动路由，零改码
 
-**问② 开几发并行？**
-- 1 发 = 串行（约 2 分钟/镜）；N 发 = 吞吐 ×N（`batch --workers N`，N ≤ 承担该阶段角色的 key 数）
-- `status` 显示有几把可用 key，用户答几就开几发
+**问② 开几发并行？**（先清点后发问，禁止按某个固定池预设选项；某阶段只有 1 把 key 则该阶段直接跳过此问，不浪费用户时间）
+- 跑 `status` 分两列清点：**生图**可用几把 key（哪些池哪几把，`_ROLES` 过滤后）、**生视频**可用几把——家底报给用户（池名带一句"是什么"）
+- 某阶段 ≥2 把才问：选项上限 = 该阶段可用 key 数，且**明说可以混用不同模型**（`batch` 支持跨池混编：每个 worker 绑一个 (池,key)，不同模型同场开工），同时带一句大白话提醒："不同模型画风会不一样，介意的话可以指定只用某一个"
+- 图/视频家底不同时分两行问清，落 plan.json `workers_image` / `workers_video`（替代旧的单值 workers）
 
-**问③ 视频源带水印吗？**
-- 先查档案 `scripts/watermark_profiles.json`（命中渠道=实测框可抹 / agnes=clean / zhipu=视频未验证）
-- 用户说不上来且档案 `unknown`/缺条目 → 跑 5s **probe 视频**：prompt 故意用**固定镜头+纯色背景**（蓝天/白墙，水印无所遁形），`qc` 抽首/中/尾 3 帧目检
+**问③ 视频源带水印吗？**（只对用户**实际接入**的池做：先查档案 `scripts/watermark_profiles.json`，档案举例仅限用户真接了的池，没接的池不提）
+- 档案 `unknown`/缺条目 → 跑 5s **probe 视频**：prompt 故意用**固定镜头+纯色背景**（蓝天/白墙，水印无所遁形），`qc` 抽首/中/尾 3 帧目检
 - 有水印 → `delogo_watermark.py --provider <池> --dry-run` 目检框位 → 正式抹除，框坐标**回写档案**，同渠道永久免测
 - 会动的/大面积/居中的水印 → 档案记 `fatal`，换渠道（勿硬抹）
 
@@ -102,7 +102,7 @@ python scripts/media_gen.py image --provider zhipu --prompt "probe" --size 1024x
 
 **面向用户的话术原则（所有问项通用）**：给用户看的选项一律大白话 + 熟悉例子；池名报出来要带一句"是什么"（如 "custom 池 = 你自己接入的任意模型"）；术语（_ROLES/_TIER/CFG 这类）只写进 env/plan，不说给用户听。
 
-确认后写入 `shots/plan.json`（`{"role_assign": "one-stop|split", "workers": N, "watermark": {"<池>": "clean|corner-delogo|fatal"}, "mode": "full|hybrid|stills", "hero_shots": [1,5,8], "video_pool_order": ["<主池>", "<备池>", "..."], "tier_map": {"<池>_key<N>": "ultra|high|mid|low"}}`），后续步骤照办，不再重复问。
+确认后写入 `shots/plan.json`（`{"role_assign": "one-stop|split", "workers_image": N, "workers_video": N, "watermark": {"<池>": "clean|corner-delogo|fatal"}, "mode": "full|hybrid|stills", "hero_shots": [1,5,8], "video_pool_order": ["<主池>", "<备池>", "..."], "tier_map": {"<池>_key<N>": "ultra|high|mid|low"}}`），后续步骤照办，不再重复问。
 单命令 `image/video` 的 `--provider` 留空时按 `MEDIA_PRIORITY` 自动选池；某池全部 key 失败自动跨池兜底。
 
 **视频超时询问协议**（video 命令退出码 4）：轮询超时会自动把 task_id 落盘（提交即扣，出片不浪费）并打印**实际可用**的备池菜单（从用户接入动态生成）。agent 拿到退出码 4 后**必须问用户三选**：①切下一池（按 plan.json 的 `video_pool_order` 顺序）②继续等（`video --wait-task <id>`，零扣分续等）③放弃该镜。决策记入 plan.json。被切走的任务**不取消**——之后任何时点跑 `media_gen.py harvest` 可收割已完成出片（自动下载到原定路径）。
@@ -199,12 +199,13 @@ python scripts/media_gen.py video --provider zhipu --prompt "<i2v shotN>" \
 - **N key 并行**（批量生成提速，推荐）：N 把 key = N 路独立 1RPM，吞吐 ×N。
   用 `batch` 子命令自动分队列，worker 按 `_ROLES` 过滤后轮流分镜，**不会重复生成同一镜**：
   ```bash
-  # 关键帧（可 --count 选优时不用并行，出图快）；batch 只跑单池，--provider 必填
+  # 关键帧（可 --count 选优时不用并行，出图快）；--provider 留空=全部池混编，也可指定单池或逗号分隔多池
   python scripts/media_gen.py batch shots60/ --phase images --provider agnes --workers 3
+  python scripts/media_gen.py batch shots60/ --phase images --provider "agnes,custom" --workers 4   # 双池混编
   # 视频：worker1→key#1、worker2→key#2、worker3→key#3，各跑各的 1RPM
   python scripts/media_gen.py batch shots60/ --phase videos --provider agnes --workers 3 --qc
   ```
-  - `--workers N` 不得超过**承担该阶段角色的 key 数**（_ROLES 过滤后，超过直接报错）；有几把 key 就开几发
+  - `--workers N` 上限 = 可用 (池,key) 对数（`_ROLES` 过滤后），超过自动截断并提醒；视频阶段遇轮询超时（rc=4）worker 不重试（防重复扣费），镜记 PENDING，跑 `harvest` 收割
   - 节流为 **per-key 计时**（`tag = provider_keyN`），各路互不等待；state 文件加了线程锁
   - `--qc`：每段生成后自动抽首/中/尾 3 帧到 `clips/qc/`，供视觉验收（见"QC 闭环"）
   - `--retries N`：每镜失败自动重试 N 次（默认 2），仍失败记 FAIL
@@ -413,7 +414,7 @@ python scripts/media_gen.py batch shots60/ --phase videos --workers 2 --qc
 | 失败 | 处理 |
 |---|---|
 | 401/403 | key 永久黑名单 24h，自动换下一个 |
-| 429 | key 冷却 60s 自动换；同池全部 key 冷却/失败 → 单命令按 `MEDIA_PRIORITY` 自动跨池兜底（batch 仅单池，会记 FAIL） |
+| 429 | key 冷却 60s 自动换；同池全部 key 冷却/失败 → 单命令按 `MEDIA_PRIORITY` 自动跨池兜底（batch 中该 worker 连续失败 ≥3 自动退场，FAIL 镜可用单命令跨池兜底补跑） |
 | 5xx / 超时 | 指数退避重试 3 次 |
 | 内容审核拒绝（ProviderFatal） | **不换 key、不降级**——换家也一样拒，应改 prompt |
 | 视频轮询超时 10min | 提示手动用 video_id 查 |
@@ -471,7 +472,7 @@ export MEDIA_AGNES_4_ROLES="image,video"   # 可选：缺省一条龙；分工�
 export MEDIA_AGNES_4_IMAGE_MODEL="..."     # 可选：该 key 单独换模型（零改码）
 ```
 
-- 之后 `batch --workers 4` 即四发并行（workers ≤ 承担该阶段角色的 key 数，超了直接报错）
+- 之后 `batch --workers 4` 即四发并行（worker 数超过可用 (池,key) 对数时自动截断并提醒）
 - key 池按 `_1_ _2_ _3_...` **序号连续枚举，遇缺号即停**——序号必须连续，不能跳号
 - 改完跑 `python scripts/media_gen.py status` 验证全部加载（非默认的角色/模型覆盖会显示在行尾）
 
