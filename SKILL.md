@@ -3,7 +3,7 @@ name: reelcraft
 description: 一句话需求 → 多 provider 生图/视频流水线（主力池可配 + 智谱/魔塔兜底，图批量选优 + 首帧图编辑 + 视频双链兜底）→ 声音设计（VO/TTS/字幕/BGM 混音）→ 比赛片规格后期 → 自检。Use when user asks to 做个视频/出片/AIGC广告/多 provider 兜底 or 提供赛事规格要求生成参赛视频；强调多 key 轮转与**多 key 并行**、熔断、一镜多图选优、xfade/末帧链衔接、抽帧 QC 闭环、断点续跑。When NOT to use: 静态海报用 ppt-master 或 image-master，单帧修图用 buddy-image-processing。
 ---
 
-# ReelCraft — 多 provider 视频流水线（v2.7）
+# ReelCraft — 多 provider 视频流水线（v2.9）
 
 ### 何时使用
 - 用户给出主题 + 时长 + 风格，要求生成一段比赛用/演示用 AIGC 视频
@@ -32,30 +32,33 @@ description: 一句话需求 → 多 provider 生图/视频流水线（主力池
 **例外交互**：仅当视频生成超时（exit 4）时再问一次三选——切换模型 / 续等（`--wait-task`）/ 放弃；任务自动落盘，`harvest` 随时收割。
 **新用户前置**：把各家 key 写进 `media_keys.env`（模板见"扩容指南"→ `references/provider-setup.md`）。
 
-### 核心设计变更（v2.5）
-0. **Key 方案确认 + 角色路由**（v2.5 新增）：开工前先问用户两件事——key 怎么搭配（**一条龙**一把 key 包办生图+视频，还是**分工**生图/视频用不同家）、开几发并行；每把 key 用 `_ROLES` 声明承担的角色，`MEDIA_PRIORITY` 决定主力池与跨池兜底顺序，`_IMAGE_MODEL/_VIDEO_MODEL` 填模型名即换更强模型（零改码）
-1. **prompt（英文生图/视频提示词）由对话模型直接撰写**——当初弃用 agnes-2.5-flash 是因为它写不好技术性 prompt
+### 核心设计
+
+> 版本演进史见 `references/CHANGELOG.md`；本节只列当前有效的能力与设计。
+
+0. **Key 方案确认 + 角色路由**：开工前先问用户两件事——key 怎么搭配（**一条龙**一把 key 包办生图+视频，还是**分工**生图/视频用不同家）、开几发并行；每把 key 用 `_ROLES` 声明承担的角色，`MEDIA_PRIORITY` 决定主力池与跨池兜底顺序，`_IMAGE_MODEL/_VIDEO_MODEL` 填模型名即换更强模型（零改码）
+1. **prompt（英文生图/视频提示词）由对话模型直接撰写**（演进原因见 CHANGELOG）
 2. **多 provider 路由**：Agnes 主力（无限量）→ 智谱（一级兜底）→ 魔塔（图编辑），单 provider 内多 key 轮转
 3. **熔断**：401→换 key；429→冷却换 key；5xx→退避重试；**审核拒绝不换 key（改 prompt）**
 4. **末帧链一致性**（有适用条件，见 Step 5）：同场景连续镜头用末帧链，跨物体切换用 xfade
 5. **断点续跑**：已完成 clip 跳过，state 持久化跨会话
 6. **比赛片规格后期**：统一 1280×720 / H.264 / yuv420p / +faststart，ffmpeg 自检
-7. **一镜多图选优**（v2.1 新增）：`image --count N` 批量出 N 张候选，人工挑最好的一张进 i2v
-8. **视频兜底**（v2.1 新增）：智谱 CogVideoX-Flash（免费，原生 1920×1080，无 Agnes 的 4:3 问题）
-9. **首帧小改**（v2.1 新增）：魔塔 `edit` 子命令，移物/调光不用整图重 roll
-10. **N key 并行 + 跨池混编**（v2.2 双 key → v2.4 任意 N → v2.8 跨池）：`batch --workers N` 轮流把镜分给 N 个 (池,key)，per-key 节流，吞吐 ×N；`--provider` 留空=全部池混编，传单池/逗号分隔=指定范围
-11. **声音设计**（v2.2 新增）：VO 稿 → `tts` 子命令 → `--subtitles` 多段字幕 → `--voice/--bgm/--ambient-db` 混音
-12. **QC 闭环**（v2.2 新增）：`qc`/`batch --qc` 每段抽首中尾 3 帧验收，不合格按诊断表单变量重拍
-13. **文案批量出稿**（v2.3 新增）：`copy.py --brief --count` AI 撒网出候选 → 人工筛选改写。
+7. **一镜多图选优**：`image --count N` 批量出 N 张候选，人工挑最好的一张进 i2v
+8. **视频兜底**：智谱 CogVideoX-Flash（免费，原生 1920×1080，无 Agnes 的 4:3 问题）
+9. **首帧小改**：魔塔 `edit` 子命令，移物/调光不用整图重 roll
+10. **N key 并行 + 跨池混编**：`batch --workers N` 轮流把镜分给 N 个 (池,key)，per-key 节流，吞吐 ×N；`--provider` 留空=全部池混编，传单池/逗号分隔=指定范围
+11. **声音设计**：VO 稿 → `tts` 子命令 → `--subtitles` 多段字幕 → `--voice/--bgm/--ambient-db` 混音
+12. **QC 闭环**：`qc`/`batch --qc` 每段抽首中尾 3 帧验收，不合格按诊断表单变量重拍
+13. **文案批量出稿**：`copy.py --brief --count` AI 撒网出候选 → 人工筛选改写。
     ⚠️ 注意与第 1 条区分：**prompt 归对话模型写（机器看的技术描述），文案走 AI 批量（人看的创意）**——
     实测证明约束到位时 agnes-2.5-flash 写中文文案质量很高，前提是给它硬约束
-14. **水印探测-抹除旁线**（v2.6 新增）：档案 `scripts/watermark_profiles.json` 记各渠道水印状态（clean / corner-delogo / unknown / fatal）——命中档案免测直抹；首遇新渠道跑**固定镜头纯色画面** probe 片，抽帧目检定位（agent 自带视觉，0 API）后 `delogo_watermark.py --provider` 抹除并回写档案。只管小而静态的角标水印；动态/大面积记 fatal 换渠道
-15. **通用池 + 能力探测 + 三档模式**（v2.7 新增）：任意 OpenAI 兼容渠道填 4 行 env 即接入（`MEDIA_CUSTOM_1_*`，零改码）；`status` 自动 GET /models 启发式猜能力（标注“猜的未验证”，实跑才算数）；成片三档 **full 全真视频 / hybrid 按镜混用（重点镜 i2v + 过场镜 kenburns） / stills 全缓推（0 视频调用）**——探测结果报给用户选，绝不自动降级
-16. **prompt 口味卡**（v2.7 新增）：`references/prompt_styles.md` 三张"怎么喂"小卡——轻量卡（agnes/zhipu/qwen-edit 共用，按文生图/图编辑/视频三种活对号）／高规格卡（sora/kling 级大模型逐字段写全）／custom 两档（按模型实力选，判断不了问用户）——通用骨架保证"想得对"，口味卡保证"喂得对"；custom 池踩坑回写沉淀，越用越准
+14. **水印探测-抹除旁线**：档案 `scripts/watermark_profiles.json` 记各渠道水印状态（clean / corner-delogo / unknown / fatal）——命中档案免测直抹；首遇新渠道跑**固定镜头纯色画面** probe 片，抽帧目检定位（agent 自带视觉，0 API）后 `delogo_watermark.py --provider` 抹除并回写档案。只管小而静态的角标水印；动态/大面积记 fatal 换渠道
+15. **通用池 + 能力探测 + 三档模式**：任意 OpenAI 兼容渠道填 4 行 env 即接入（`MEDIA_CUSTOM_1_*`，零改码）；`status` 自动 GET /models 启发式猜能力（标注“猜的未验证”，实跑才算数）；成片三档 **full 全真视频 / hybrid 按镜混用（重点镜 i2v + 过场镜 kenburns） / stills 全缓推（0 视频调用）**——探测结果报给用户选，绝不自动降级
+16. **prompt 口味卡**：`references/prompt-styles.md` 三张"怎么喂"小卡——轻量卡（agnes/zhipu/qwen-edit 共用，按文生图/图编辑/视频三种活对号）／高规格卡（sora/kling 级大模型逐字段写全）／custom 两档（按模型实力选，判断不了问用户）——通用骨架保证"想得对"，口味卡保证"喂得对"；custom 池踩坑回写沉淀，越用越准
 
 **回归测试**：`python -m unittest discover tests -v`（纯逻辑零网络；改 media_gen.py 后必跑）。
 **image 超时协议**：异步图任务轮询超时 exit 4 + task_id 落盘（提交即扣不浪费），`harvest` 收割 video/image 两类 pending。
-**第二场补全**（v2.8）：①LTX .webp 产物转码进 skill：`postprocess.py webp2mp4 <src> [dst|--outdir]`（Pillow 解帧绕过损坏 Exif）；②失败镜一键补跑：`batch --retry-failed`（读 batch_run.json 只重跑 FAIL/PENDING，PENDING 先 harvest、仍在生成的不重提交防重复扣费）；③混编画风质检：`postprocess.py stylegrid frames/ --cols 5`（N 镜首帧并排拼图，跳变一眼可见）；④`plan-check <plan.json>`（未知字段/枚举值校验，防拼错静默失效）。
+**v2.8 工具箱**（详述见 CHANGELOG）：`postprocess.py webp2mp4`（.webp 产物转码）· `batch --retry-failed`（失败镜补跑，PENDING 先 harvest 防重复扣费）· `postprocess.py stylegrid`（混编画风拼图质检）· `plan-check`（plan.json 字段校验）。
 
 ---
 
@@ -118,7 +121,7 @@ python scripts/media_gen.py image --provider zhipu --prompt "probe" --size 1024x
 **问⑤ 视频模型顺序**（能出视频的模型 ≥2 个时才问，只接一个则跳过）：跑 `status` 看实际可用的视频模型，向用户呈现清单（模型名 + 一句"是什么"，全部来自其真实配置，零硬编码），问清**主用哪个、备选顺序**，记入 plan.json `video_pool_order`。
 
 **问⑥ custom 池的模型算哪一档？**（只问 custom 池；agnes/zhipu/modelscope 有内置口味卡，不问）
-- 话术必须大白话（完整选项见 `references/prompt_styles.md` 卡三"问档话术"）：**顶级 / 主流 / 开源中等 / 入门受限**，每档附熟悉例子；用户拿不准可点"帮我判断"，agent 才评估（探测+模型知识+必要时试跑）
+- 话术必须大白话（完整选项见 `references/prompt-styles.md` 卡三"问档话术"）：**顶级 / 主流 / 开源中等 / 入门受限**，每档附熟悉例子；用户拿不准可点"帮我判断"，agent 才评估（探测+模型知识+必要时试跑）
 - 答案落 env `MEDIA_CUSTOM_n_TIER=ultra|high|mid|low`（**挂 key 不挂池**，同池 key 能力可能差几档），之后不再问
 - plan.json 可选加 `"tier_map": {"custom_key1": "high", "custom_key2": "low"}` 便于回溯
 
@@ -142,7 +145,7 @@ python scripts/media_gen.py image --provider zhipu --prompt "probe" --size 1024x
 
 ## Step 3 — Prompt 撰写（**由对话模型 agent 直接写**，不再调 agnes-2.5-flash）
 
-按 `references/prompt-framework.md` 的六要素结构 + anti-slop 词汇表（`references/anti-slop-lexicon.md`），**用对话模型（袋袋）**为每镜撰写。**先查目标池的口味卡**（`references/prompt_styles.md`）——骨架保证“想得对”，口味卡保证“喂得对”（每池句式/语言/长度/忌讳不同，如 Qwen-Edit 要指令式、高规格视频模型必写音频提示）：
+按 `references/prompt-framework.md` 的六要素结构 + anti-slop 词汇表（`references/anti-slop-lexicon.md`），**用对话模型（袋袋）**为每镜撰写。**先查目标池的口味卡**（`references/prompt-styles.md`）——骨架保证“想得对”，口味卡保证“喂得对”（每池句式/语言/长度/忌讳不同，如 Qwen-Edit 要指令式、高规格视频模型必写音频提示）：
 - 一段散文体英文 prompt（120-220 词），**主体+动作放开头**（顺序即优先级），覆盖 scene/subject/action/camera/light/style
 - 一段 I2V prompt（40-80 词），只描述 motion + camera + atmosphere 微变，**不重写首帧内容**
 

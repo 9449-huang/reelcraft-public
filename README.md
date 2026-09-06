@@ -27,15 +27,19 @@
 reelcraft/
 ├── SKILL.md                 # 完整工作流（7 步 + 失败处理 + 诊断表）
 ├── scripts/
-│   ├── media_gen.py         # 生图/视频/图编辑/批量/QC/状态（主引擎）
-│   ├── postprocess.py       # 拼接/统一规格/烧字幕/自检
+│   ├── media_gen.py         # CLI 薄入口：image/video/edit/tts/qc/batch/status…
+│   ├── mg_core.py           # 核心引擎：provider 表/路由/熔断/节流/异步轮询
+│   ├── mg_batch.py          # batch 跨池混编 + harvest 收割
+│   ├── mg_status.py         # status/plan-check/qc/last-frame
+│   ├── postprocess.py       # 拼接/统一规格/烧字幕/kenburns/自检
 │   ├── delogo_watermark.py  # 去固定角标水印（档案驱动）
 │   ├── watermark_profiles.json # 水印档案（渠道→kind/框坐标，命中免测）
 │   ├── vo_build.py          # 旁白分句合成 + 精确字幕打轴
 │   ├── copy.py              # 文案批量出稿
-│   ├── agnes_gen.py         # [已弃用] 旧 enhance，仅供回溯
+│   ├── export_public.py     # 导出公开版（仅维护者用，剔除私有渠道痕迹）
 │   └── ffmpeg_probe.py      # 跨平台定位 ffmpeg
-├── references/              # prompt 框架 / 口味卡 / 模型能力 / 反套话词表 / 赛事规格
+├── tests/                   # 单元测试（python -m unittest discover tests，零网络）
+├── references/              # prompt 框架 / 口味卡 / 模型能力 / 反套话词表 / 赛事规格 / 变更日志
 └── media_keys.env.example   # 密钥模板（复制改名填真实 key）
 ```
 
@@ -71,7 +75,7 @@ python scripts/postprocess.py check final.mp4
 | `media_gen.py video --provider zhipu --image ... --video-size 1920x1080 --duration 5` | 图生视频（智谱兜底） |
 | `media_gen.py edit --image ... --prompt ... --out ...` | 首帧小改（魔塔） |
 | `media_gen.py last-frame <video> <out.png>` | 抽末帧（末帧链） |
-| `media_gen.py batch <dir> --phase images\|videos --provider agnes --workers N [--qc] [--retries N] [--dry-run]` | 批量并行（单池 N key 动态队列，视频输出 `clip_<shot_id>.mp4`） |
+| `media_gen.py batch <dir> --phase images\|videos --provider agnes --workers N [--qc] [--retries N] [--dry-run] [--video-size WxH] [--video-duration short\|medium\|long]` | 批量并行（跨池混编：N worker 各绑一个 (池,key)；size/duration 留空=每池各自默认；视频输出 `clip_<shot_id>.mp4`） |
 | `media_gen.py qc <video> <out_dir>` | 抽首/中/尾 3 帧验收 |
 | `media_gen.py tts --text ... --out ...` | 旁白 TTS |
 | `media_gen.py status [--no-probe]` | key 健康 + /models 能力探测（猜的仅供参考） |

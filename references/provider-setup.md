@@ -22,7 +22,7 @@ export MEDIA_AGNES_4_IMAGE_MODEL="..."     # 可选：该 key 单独换模型（
 
 1. env 里加 `MEDIA_CUSTOM_1_KEY` / `_BASE`（OpenAI 兼容 base，`/v1` 结尾）+ **必填** `MEDIA_CUSTOM_1_IMAGE_MODEL` / `MEDIA_CUSTOM_1_VIDEO_MODEL`（接哪个能力填哪个，`_ROLES` 同步声明）
 2. 可选：`MEDIA_CUSTOM_1_IMAGE_SIZES="1024x1024,..."` 自填白名单（超出仅警告）；视频默认按异步任务轮询风（`/videos/generations` + path 轮询），Sora 风渠道用 `_TASK_PATH=/_videos` 改
-3. 跑 `status`（自动 /models 探测能力）→ probe 一张图/一段视频目检 → 按 `references/prompt_styles.md` custom 卡沉淀口味
+3. 跑 `status`（自动 /models 探测能力）→ probe 一张图/一段视频目检 → 按 `references/prompt-styles.md` custom 卡沉淀口味
 4. 多把 custom key：`MEDIA_CUSTOM_2_...` 递增即可，轮转/熔断/节流/批量全套自动继承
 
 > 想把某渠道做成一等公民（带实测 size 白名单/专用 payload）：再在 `media_gen.py` 顶部 `PROVIDERS` 表加条目——**照抄 agnes 条目改参数**，多 key 轮转 / 熔断 / per-key 节流 / 跨池兜底 / QC / 断点续跑全套自动继承；并把它加进 `MEDIA_PRIORITY`（不加入则 `--provider <pool>` 显式使用）。定制条目 = 沉淀实测参数，通用池 = 快速试接，两者不冲突
