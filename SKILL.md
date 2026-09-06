@@ -3,7 +3,7 @@ name: reelcraft
 description: 一句话需求 → 多 provider 生图/视频流水线（主力池可配 + 智谱/魔塔兜底，图批量选优 + 首帧图编辑 + 视频双链兜底）→ 声音设计（VO/TTS/字幕/BGM 混音）→ 规格统一后期 → 自检。Use when user asks to 做个视频/出片/AIGC广告/多 provider 兜底 or 给出平台/赛事规格要求生成达标视频；强调多 key 轮转与**多 key 并行**、熔断、一镜多图选优、xfade/末帧链衔接、抽帧 QC 闭环、断点续跑。When NOT to use: 静态海报用 ppt-master 或 image-master，单帧修图用 buddy-image-processing。
 ---
 
-# ReelCraft — 多 provider 视频流水线（v3.0）
+# ReelCraft — 多 provider 视频流水线（v3.1）
 
 ### 何时使用
 - 用户给出主题 + 时长 + 风格，要求生成一段演示/参赛用 AIGC 视频
@@ -390,10 +390,11 @@ python scripts/vo_build.py vo/vo_lines.json --out vo/vo.m4a --total 55.94 --skip
 脚本会做：越界检查（实际时长 > 到下一句的间隔则警告）→ 静音底铺满总长 → 各句精确落位 →
 输出 `subtitles_final.json` → 报告有声/留白占比（公益片留白 40-50% 较合适）。
 
-**TTS 未配置 key 时**脚本会明确报错并给出配置指引（不是静默失败）。免费渠道优先级：
-1. Gitee AI 的 Spark-TTS / CosyVoice（免费额度，需新 key）
-2. 用户自录（版权零风险，最稳）
-3. 智谱 CogTTS（需付费资源包，用前先确认用户愿意花）
+**TTS 未配置 key 时**脚本会明确报错并给出配置指引（不是静默失败）。渠道优先级：
+1. 本地 Edge TTS 服务（`http://localhost:5050/v1`，OpenAI 兼容，免费无限、不耗 key；音色 zh-CN-XiaoxiaoNeural/YunxiNeural 等，支持 `--speed`）
+2. Gitee AI 的 Spark-TTS / CosyVoice（免费额度，需新 key）
+3. 用户自录（版权零风险，最稳）
+4. 智谱 CogTTS（需付费资源包，用前先确认用户愿意花）
 
 **BGM 版权**：必须无版权或明确可商用；用户提供音源，agent 不替用户担保曲目授权。
 
