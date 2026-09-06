@@ -1,10 +1,10 @@
 # ReelCraft
 
-一句话需求 → 多 provider 生图/视频流水线（主力池可配，Agnes/智谱/魔塔模板内置）→ 声音设计（VO/TTS/字幕/BGM 混音）→ 比赛片规格后期 → 自检。
+一句话需求 → 多 provider 生图/视频流水线（主力池可配，Agnes/智谱/魔塔模板内置）→ 声音设计（VO/TTS/字幕/BGM 混音）→ 规格统一后期 → 自检。
 
 > **定位**：本项目按 **AI agent skill** 设计——在 WorkBuddy / Claude Code 等环境加载 SKILL.md 由 agent 执行（分镜、prompt、QC 目检、开工三问均由 agent 完成）。纯命令行用户可用下方「快速开始」的命令子集跑通最小闭环，但完整七步体验建议在 agent 环境使用。
 
-面向比赛片（如 2026 黄山杯公益/商业赛道）与演示用 AIGC 视频，强调**多 key 轮转、双 key 并行、熔断、一镜多图选优、xfade/末帧链衔接、抽帧 QC 闭环、断点续跑**。
+面向演示/参赛用 AIGC 视频，强调**多 key 轮转、双 key 并行、熔断、一镜多图选优、xfade/末帧链衔接、抽帧 QC 闭环、断点续跑**。
 
 ## 特性
 
@@ -18,7 +18,7 @@
 - 一镜多图选优、xfade 交叉溶解 / 末帧链衔接、Ken Burns 兜底
 - 声音设计：分句 TTS → 精确字幕时间轴 → 旁白/BGM/环境音混音
 - 文案批量撒网（`copy.py`）+ 硬约束去空话
-- 后期统一比赛规格（H.264 / yuv420p / ≥720p）+ 自检
+- 后期统一规格（H.264 / yuv420p / ≥720p）+ 自检
 - 零第三方依赖（仅 Python 标准库 + ffmpeg）
 
 ## 目录
@@ -39,7 +39,7 @@ reelcraft/
 │   ├── export_public.py     # 导出公开版（仅维护者用，剔除私有渠道痕迹）
 │   └── ffmpeg_probe.py      # 跨平台定位 ffmpeg
 ├── tests/                   # 单元测试（python -m unittest discover tests，零网络）
-├── references/              # prompt 框架 / 口味卡 / 模型能力 / 反套话词表 / 赛事规格 / 变更日志
+├── references/              # prompt 框架 / 口味卡 / 模型能力 / 反套话词表 / 规格参考 / 变更日志
 └── media_keys.env.example   # 密钥模板（复制改名填真实 key）
 ```
 
@@ -80,7 +80,7 @@ python scripts/postprocess.py check final.mp4
 | `media_gen.py tts --text ... --out ...` | 旁白 TTS |
 | `media_gen.py status [--no-probe]` | key 健康 + /models 能力探测（猜的仅供参考） |
 | `postprocess.py concat <clips/> --out ... [--xfade ...] [--voice ...] [--bgm ...] [--subtitles ...]` | 拼接+混音+烧字幕 |
-| `postprocess.py check <final.mp4> [--min-res ...] [--max-duration ...] [--min-fps ...]` | 比赛规格自检 |
+| `postprocess.py check <final.mp4> [--min-res ...] [--max-duration ...] [--min-fps ...]` | 规格自检 |
 | `postprocess.py kenburns <img> <out.mp4> --duration 5` | Ken Burns 兜底（单镜） |
 | `postprocess.py kenburns-all <dir> --outdir clips/ [--duration 5,4,6]` | stills 档批量缓推（0 API，断点续跑，对齐 concat 命名契约） |
 | `delogo_watermark.py <video> --provider <channel> [--dry-run]` | 去固定角标水印（读档案自动缩放；`--dry-run` 只出红框自检图；产出 *_nowm.mp4 + check 图） |
