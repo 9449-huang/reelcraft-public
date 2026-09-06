@@ -2,6 +2,11 @@
 
 > 历史演进记录，从 SKILL.md 外置（2026-09-06, v2.9）——SKILL.md 只保留当前有效指令，读历史到这来。
 
+## v3.0（2026-09-06）
+
+- **通用化定位**：具体赛事规格档案 `references/competition-spec.md` 移出公开版（export_public SKIP，私有仓保留备赛用）；SKILL/README/postprocess/model-capabilities/prompt-styles 等 6 文件约 25 处赛事归属表述中性化为"默认质量下限（可配置）"——720p/120s/H.264/yuv420p 数值与代码逻辑不变，仅去具体赛事归属
+- **导出自检升级**：`export_public.py` 自检从"单一私有池零命中"升级为"私有痕迹零命中"（拦截清单见脚本内 FORBIDDEN：私有池名 + 具体赛事归属字样）
+
 ## v2.9（2026-09-06）
 
 - **视频参数每池化**：`--video-size`/`--video-duration` 默认改空 = 走各池 `default_size`/`default_duration`（智谱 1920x1080、本地网关 1280x720/short），显式传参才覆盖；修复共享 CLI 默认导致智谱视频被白名单拒绝的回归
