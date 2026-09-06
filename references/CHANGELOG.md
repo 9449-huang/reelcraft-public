@@ -6,6 +6,7 @@
 
 - **通用化定位**：具体赛事规格档案 `references/competition-spec.md` 移出公开版（export_public SKIP，私有仓保留备赛用）；SKILL/README/postprocess/model-capabilities/prompt-styles 等 6 文件约 25 处赛事归属表述中性化为"默认质量下限（可配置）"——720p/120s/H.264/yuv420p 数值与代码逻辑不变，仅去具体赛事归属
 - **导出自检升级**：`export_public.py` 自检从"单一私有池零命中"升级为"私有痕迹零命中"（拦截清单见脚本内 FORBIDDEN：私有池名 + 具体赛事归属字样）
+- **同步纪律教训**：export 的 DST 目录（reelcraft_public）是独立 git 仓——每轮"重导出"之后必须把 DST 中**实际变化**的文件也推送，只推源仓会漏（v3.0 版本号就漏推过一次，SKILL.md 云端停在 v2.9，靠逐文件内容比对才抓到）。发布后验证要"内容级"：逐文件比对本地↔云端（行尾归一化后），不能只看 commit 是否推成功
 
 ## v2.9（2026-09-06）
 
