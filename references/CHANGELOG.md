@@ -2,6 +2,10 @@
 
 > 历史演进记录，从 SKILL.md 外置（2026-09-06, v2.9）——SKILL.md 只保留当前有效指令，读历史到这来。
 
+## v3.1（2026-09-06）
+
+- **TTS 接入**：本地 OpenAI Edge TTS 服务（`localhost:5050`，`/v1/audio/speech`，模型 tts-1/tts-1-hd/gpt-4o-mini-tts）配进 `MEDIA_TTS_*` key 池——零代码改动（cmd_tts 本就是 OpenAI 兼容实现）；Edge 音色（zh-CN-XiaoxiaoNeural/YunxiNeural 等）与 `--speed` 实测可用（speed 真实生效，1.5 倍 17KB vs 1x 31KB）；SKILL 声音设计渠道优先级更新：本地 TTS 排第一（免费无限、不耗 key）
+
 ## v3.0（2026-09-06）
 
 - **通用化定位**：具体赛事规格档案 `references/competition-spec.md` 移出公开版（export_public SKIP，私有仓保留备赛用）；SKILL/README/postprocess/model-capabilities/prompt-styles 等 6 文件约 25 处赛事归属表述中性化为"默认质量下限（可配置）"——720p/120s/H.264/yuv420p 数值与代码逻辑不变，仅去具体赛事归属
