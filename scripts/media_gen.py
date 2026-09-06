@@ -87,8 +87,9 @@ def cmd_video(args) -> None:
         die("没有支持 video 角色的可用池。检查 media_keys.env（MEDIA_*_1_KEY/_BASE/_ROLES）"
             "或 MEDIA_PRIORITY", 2)
 
-    # 各池预校验（显式指定时硬失败；自动路由时跳过不满足参数的池）
-    valid: list[tuple[str, dict]] = []
+    # 各池预校验（显式指定时硬失败；自动路由时跳过不满足参数的池）。
+    # size/duration 默认取各池配置（default_size / default_duration），用户显式传参才覆盖。
+    valid: list[tuple[str, dict, str, object]] = []   # (pool, info, eff_size, eff_dur)
     for pool in pools:
         info = PROVIDERS[pool]["models"].get("video")
         if not info:
@@ -100,21 +101,38 @@ def cmd_video(args) -> None:
             if args.provider:
                 die(f"num_frames={nf} 不在白名单 {info['frame_choices']}", 2)
             continue
+        # 每池生效尺寸：CLI 显式 > 池 default_size
+        eff_size = args.video_size or info.get("default_size", "")
+        # 时长：智谱走 int（duration 5/10）；带字符串 durations 的网关走 video_duration / default_duration
         if info.get("payload_style") == "zhipu":
-            if args.video_size not in info["sizes"]:
+            eff_dur: object = args.duration
+            if eff_size not in info["sizes"]:
                 if args.provider:
-                    die(f"{pool} 不支持 video size={args.video_size}。可选: {info['sizes']}", 2)
+                    die(f"{pool} 不支持 video size={eff_size}。可选: {info['sizes']}", 2)
                 continue
-            if args.duration not in info["durations"]:
+            if eff_dur not in info["durations"]:
                 if args.provider:
-                    die(f"{pool} duration={args.duration} 不在 {info['durations']}", 2)
+                    die(f"{pool} duration={eff_dur} 不在 {info['durations']}", 2)
                 continue
-        valid.append((pool, info))
+        else:
+            if "sizes" in info and eff_size not in info["sizes"]:
+                if args.provider:
+                    die(f"{pool} 不支持 video size={eff_size}。可选: {info['sizes']}", 2)
+                continue
+            if "durations" in info:
+                eff_dur = args.video_duration or info.get("default_duration", "") or "short"
+                if eff_dur not in info["durations"]:
+                    if args.provider:
+                        die(f"{pool} 不支持 video duration={eff_dur}。可选: {info['durations']}", 2)
+                    continue
+            else:
+                eff_dur = None     # 无时长白名单的池（如 agnes）不传 duration
+        valid.append((pool, info, eff_size, eff_dur))
     if not valid:
         die("没有满足参数的视频池（检查 num_frames / --video-size / --duration）", 2)
 
     # 节流：pin 锁 key 时按 key 计时（多 worker 各走各的 1RPM），否则按池共享通道
-    for pool, info in valid:
+    for pool, info, _sz, _du in valid:
         rpm = info.get("rpm") or 1
         tag = f"{pool}_key{args.pin_key}" if args.pin_key else f"{pool}_shared"
         video_throttle(rpm, tag)
@@ -127,8 +145,9 @@ def cmd_video(args) -> None:
 
     errs: list[str] = []
     resp = used_key = None
-    for pool, info in valid:
-        def call_fn(k: dict, _info=info, _prefix=PROVIDERS[pool]["key_env_prefix"]) -> dict:
+    for pool, info, eff_size, eff_dur in valid:
+        def call_fn(k: dict, _info=info, _prefix=PROVIDERS[pool]["key_env_prefix"],
+                    _size=eff_size, _dur=eff_dur) -> dict:
             headers = {"Authorization": f"Bearer {k['key']}", "Content-Type": "application/json"}
             if _info.get("payload_style") == "zhipu":
                 payload: dict[str, Any] = {
@@ -136,8 +155,8 @@ def cmd_video(args) -> None:
                     "prompt": args.prompt,
                     "with_audio": False,
                     "fps": 30,
-                    "size": args.video_size,
-                    "duration": args.duration,
+                    "size": _size,
+                    "duration": _dur,
                 }
                 if args.image:
                     payload["image_url"] = image_to_url_or_path(args.image)
@@ -147,8 +166,10 @@ def cmd_video(args) -> None:
                     die(f"该池未配置模型名（模板无默认值）。请在 env 加 {_prefix}{k['n']}_VIDEO_MODEL=模型名", 2)
                 pfield = k.get("video_prompt_field") or "prompt"
                 payload = {"model": model, pfield: args.prompt}
-                if _info.get("default_duration"):
-                    payload["duration"] = _info["default_duration"]
+                if _size:
+                    payload["size"] = _size
+                if _dur:
+                    payload["duration"] = _dur
                 if args.image:
                     _img = image_to_url_or_path(args.image)
                     payload[_info.get("image_param", "image")] = (
@@ -300,8 +321,9 @@ def main() -> None:
     v.add_argument("--num-frames", type=int, default=121)
     v.add_argument("--negative", default="blurry, distorted faces, warped hands, extra limbs, text artifacts, watermark, camera shake, flickering, plastic skin, oversaturated")
     v.add_argument("--wait", type=int, default=15, help="轮询间隔秒")
-    v.add_argument("--video-size", default="1920x1080", help="智谱专用：输出分辨率（默认 1920x1080）")
+    v.add_argument("--video-size", default="", help="视频分辨率（留空=用所选池的默认，如智谱 1920x1080、本地网关 1280x720）")
     v.add_argument("--duration", type=int, default=5, help="智谱专用：时长秒（5 或 10）")
+    v.add_argument("--video-duration", default="", help="本地网关风：时长 short/medium/long（留空=池默认 short）")
     v.add_argument("--pin-key", type=int, default=0, help="锁定第 N 把 key（0=轮转；双 worker 并行时各锁一把）")
     v.add_argument("--poll-timeout", type=int, default=0,
                    help="轮询上限秒（0=自动：显式池 30 分钟 / 自动路由 20 分钟；超时落盘 task_id 并 exit 4）")
@@ -332,6 +354,8 @@ def main() -> None:
     bt.add_argument("--qc", action="store_true", help="videos 阶段每段生成后自动抽 3 帧到 clips/qc/")
     bt.add_argument("--retry-failed", action="store_true",
                     help="读上轮 batch_run.json，只重跑 FAIL/PENDING 镜（PENDING 先 harvest，仍在生成的不重提交）")
+    bt.add_argument("--video-size", default="", help="视频分辨率覆盖（默认留空=每池各自默认：智谱 1920x1080 / 本地网关 1280x720）")
+    bt.add_argument("--video-duration", default="", help="视频时长覆盖（默认留空=每池默认 short；本地网关风可 short/medium/long）")
 
     tt = sub.add_parser("tts", help="语音合成（OpenAI 兼容，需配置 MEDIA_TTS_*）")
     tt.add_argument("--text", default="")

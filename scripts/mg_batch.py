@@ -186,6 +186,10 @@ def cmd_batch(args) -> None:
                "--image", str(frame), "--out", str(out),
                "--num-frames", str(d.get("num_frames", 121)),
                "--negative", args.negative, "--pin-key", str(pin)]
+        if getattr(args, "video_size", ""):
+            cmd += ["--video-size", args.video_size]
+        if getattr(args, "video_duration", ""):
+            cmd += ["--video-duration", args.video_duration]
         return cmd, out, ""
 
     plan: list[tuple[Path, str]] = []
