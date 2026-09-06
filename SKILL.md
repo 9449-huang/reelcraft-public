@@ -1,12 +1,12 @@
 ---
 name: reelcraft
-description: 一句话需求 → 多 provider 生图/视频流水线（主力池可配 + 智谱/魔塔兜底，图批量选优 + 首帧图编辑 + 视频双链兜底）→ 声音设计（VO/TTS/字幕/BGM 混音）→ 比赛片规格后期 → 自检。Use when user asks to 做个视频/出片/AIGC广告/多 provider 兜底 or 提供赛事规格要求生成参赛视频；强调多 key 轮转与**多 key 并行**、熔断、一镜多图选优、xfade/末帧链衔接、抽帧 QC 闭环、断点续跑。When NOT to use: 静态海报用 ppt-master 或 image-master，单帧修图用 buddy-image-processing。
+description: 一句话需求 → 多 provider 生图/视频流水线（主力池可配 + 智谱/魔塔兜底，图批量选优 + 首帧图编辑 + 视频双链兜底）→ 声音设计（VO/TTS/字幕/BGM 混音）→ 规格统一后期 → 自检。Use when user asks to 做个视频/出片/AIGC广告/多 provider 兜底 or 给出平台/赛事规格要求生成达标视频；强调多 key 轮转与**多 key 并行**、熔断、一镜多图选优、xfade/末帧链衔接、抽帧 QC 闭环、断点续跑。When NOT to use: 静态海报用 ppt-master 或 image-master，单帧修图用 buddy-image-processing。
 ---
 
 # ReelCraft — 多 provider 视频流水线（v2.9）
 
 ### 何时使用
-- 用户给出主题 + 时长 + 风格，要求生成一段比赛用/演示用 AIGC 视频
+- 用户给出主题 + 时长 + 风格，要求生成一段演示/参赛用 AIGC 视频
 - 用户要求"用免费的 key 出片"
 - 用户要求多 provider 兜底以防单点失败
 
@@ -16,7 +16,7 @@ description: 一句话需求 → 多 provider 生图/视频流水线（主力池
 
 ### 新用户导览（30 秒看懂流程与问项）
 
-**流程**：Step 0 赛事规格 → **Step 1 体检 + 六问**（下面）→ Step 2 分镜 → Step 3 提示词（按口味卡）→ Step 4 关键帧出图 → Step 5 图生视频 → Step 6 后期+声音 → Step 7 交付。
+**流程**：Step 0 规格确认 → **Step 1 体检 + 六问**（下面）→ Step 2 分镜 → Step 3 提示词（按口味卡）→ Step 4 关键帧出图 → Step 5 图生视频 → Step 6 后期+声音 → Step 7 交付。
 
 **六问**（一次问完落 plan.json，之后不再重复问；全部大白话，对用户只说"模型"）：
 
@@ -42,7 +42,7 @@ description: 一句话需求 → 多 provider 生图/视频流水线（主力池
 3. **熔断**：401→换 key；429→冷却换 key；5xx→退避重试；**审核拒绝不换 key（改 prompt）**
 4. **末帧链一致性**（有适用条件，见 Step 5）：同场景连续镜头用末帧链，跨物体切换用 xfade
 5. **断点续跑**：已完成 clip 跳过，state 持久化跨会话
-6. **比赛片规格后期**：统一 1280×720 / H.264 / yuv420p / +faststart，ffmpeg 自检
+6. **规格统一后期**：统一 1280×720 / H.264 / yuv420p / +faststart，ffmpeg 自检
 7. **一镜多图选优**：`image --count N` 批量出 N 张候选，人工挑最好的一张进 i2v
 8. **视频兜底**：智谱 CogVideoX-Flash（免费，原生 1920×1080，无 Agnes 的 4:3 问题）
 9. **首帧小改**：魔塔 `edit` 子命令，移物/调光不用整图重 roll
@@ -62,20 +62,16 @@ description: 一句话需求 → 多 provider 生图/视频流水线（主力池
 
 ---
 
-## Step 0 — 赛事规格锁定（比赛片必做）
+## Step 0 — 目标规格确认（有平台/赛事要求时必做）
 
 向用户索取（最多 3 个问题）：
-- 赛事全称 + 截止日期
+- 平台/赛事全称 + 截止日期
 - 投稿类别（决定能否用 AIGC、时长/分辨率/大小上限、人数限制）
 - 主题方向 / 一句话创意
 
-如果用户已发附件（如黄山杯通知），**抓取正文**（WebFetch + 必要时 WebSearch 找附件原文），落到 `references/competition-spec.md`。
+如果用户已发规格附件（如某赛事通知），**抓取正文**（WebFetch + 必要时 WebSearch 找附件原文），落到 `references/competition-spec.md`（私有参考，不进公开版）。
 
-**附 2026 黄山杯公益+商业双赛道关键规格**（已落盘，作为 `check` 默认阈值示例；其它赛事用 `--min-res/--max-duration/--min-fps` 调整）：
-- 公益（皖市监函〔2026〕317）：**AIGC 数智类**限 1 人；视频 MP4/H.264/≥1280×720/≤300MB/≤120s
-- 商业（皖市监函〔2026〕318）：其它媒体类含 AI 生成；演示视频 ≤60s；平面 CMYK 300dpi
-- 截止：**2026-09-30 17:00**
-- 13 主题 + 文房四宝专项单元
+无明确规格时直接用 `check` 默认阈值：1280×720 / ≤120s / ≥24fps / H.264 yuv420p（通用平台下限），`--min-res/--max-duration/--min-fps` 可随时覆盖。
 
 ## Step 1 — 体检（5 分钟，必做）
 
@@ -88,7 +84,7 @@ python scripts/media_gen.py image --provider zhipu --prompt "probe" --size 1024x
 ```
 
 把生成的两张图用 Read 工具查看，**确认两个关键点**：
-1. **水印**：智谱免费档右下角带"AI 生成"水印（已验证 → 不能直接投比赛），Agnes 不带（已验证）
+1. **水印**：智谱免费档右下角带"AI 生成"水印（已验证 → 成片需先 delogo），Agnes 不带（已验证）
 2. **风格一致性预演**：两张图风格差异显著 → 同一片内不要中途切换 provider
 
 体检报告写入对话日志，下一步决策依据。
@@ -134,7 +130,7 @@ python scripts/media_gen.py image --provider zhipu --prompt "probe" --size 1024x
 
 ## Step 2 — 分镜拆解
 
-按 `references/prompt-framework.md` 拆镜（比赛片 60s 建议 10-14 镜，可弹性到 ≤120s）。
+按 `references/prompt-framework.md` 拆镜（60s 建议 10-14 镜，可弹性到 ≤120s）。
 
 **拆镜前先做 Director's Read**（framework 第 0 层）：每镜用一句话回答"这个镜头在故事里为什么存在"，写不出答案的镜头砍掉。把结论写进 shot JSON 的 `dramatic_function` 字段。
 
@@ -271,13 +267,13 @@ python scripts/postprocess.py concat clips/ \
    - **音频链同步**：各 clip 自带的 Agnes 环境音经 `acrossfade` 逐段对齐交叉，**不会丢音轨**
 2. **统一规格**：scale(increase) + crop（填满裁切，不出黑边）+ fps=24 + libx264 yuv420p + +faststart
    - 默认 `--target-res 1280x720`：Agnes 1088×832 源仅 1.18x 放大，画质最好且达标
-   - 1920×1080 可选（1.77x 放大，画质偏软），比赛只要求 ≥720p
+   - 1920×1080 可选（1.77x 放大，画质偏软），默认下限 720p 已够
    - `--freeze-last N` 末帧定格（落版余韵，建议 4-6s）
 3. **声音混音**（`--voice` / `--bgm` 任一给出才触发）：视频流 copy，只重编码音频，秒级完成
    - 环境音 `-10dB` 垫底 → 旁白 `0dB`（`--voice-delay` 起始延迟）→ BGM `-18dB`（`-stream_loop -1` 自动循环铺满）
    - `amix:normalize=0`：电平完全由 `--*-db` 决定，某路结束不会抬升其余音轨
 4. **烧字幕**（`--subtitles` JSON 列表 + `--slogan`）：多段 drawtext 链，淡入淡出由 alpha 表达式控制
-5. **自检** → 比赛硬指标
+5. **自检** → 默认质量下限
 
 `--subtitles` JSON 格式（`{at}` 出现秒、`{dur}` 持续秒、`{dur:0}`=持续到片尾）：
 ```json
@@ -315,11 +311,11 @@ python scripts/delogo_watermark.py in.mp4 --x 1133 --y 571 --w 54 --h 56   # 手
 python scripts/postprocess.py check final.mp4
 ```
 
-自检规则（阈值可配置，默认对齐黄山杯公益/商业赛道下限）：
+自检规则（阈值可配置，默认 = 通用平台质量下限）：
 - 分辨率 ≥ `--min-res`（默认 1280×720）✓
 - 时长 ≤ `--max-duration`（默认 120s）✓
 - 帧率 ≥ `--min-fps`（默认 24）✓
-- 否则 exit 2，必须修复。其它赛事：如商业赛道 ≤60s 用 `--max-duration 60`
+- 否则 exit 2，必须修复。目标平台/赛事有不同上限时按它覆盖，如演示片 ≤60s 用 `--max-duration 60`
 
 ## 声音设计（VO 稿 → TTS → 字幕 → BGM）
 
@@ -396,7 +392,7 @@ python scripts/vo_build.py vo/vo_lines.json --out vo/vo.m4a --total 55.94 --skip
 
 **TTS 未配置 key 时**脚本会明确报错并给出配置指引（不是静默失败）。免费渠道优先级：
 1. Gitee AI 的 Spark-TTS / CosyVoice（免费额度，需新 key）
-2. 用户自录（版权零风险，比赛最稳）
+2. 用户自录（版权零风险，最稳）
 3. 智谱 CogTTS（需付费资源包，用前先确认用户愿意花）
 
 **BGM 版权**：必须无版权或明确可商用；用户提供音源，agent 不替用户担保曲目授权。
@@ -426,7 +422,7 @@ python scripts/media_gen.py batch shots60/ --phase videos --workers 2 --qc
 
 ## Step 7 — 交付
 
-- `final.mp4`（比赛片）+ `shots/`（关键帧）+ `clips/`（原始视频）+ `state.json`（过程记录）
+- `final.mp4`（成片）+ `shots/`（关键帧）+ `clips/`（原始视频）+ `state.json`（过程记录）
 - 用 `present_files` 展示 final.mp4
 - 附分镜表（每镜的英文 prompt + i2v prompt + 实际选择）
 

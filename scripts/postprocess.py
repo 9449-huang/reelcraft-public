@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""postprocess.py — 后期统一（比赛片规格）+ 自检。
+"""postprocess.py — 后期统一（默认规格：1280x720/H.264/yuv420p）+ 自检。
 
 用法：
   python postprocess.py concat  clips/ --out out.mp4 [--target-res 1280x720] [--bgm audio.mp3]
@@ -150,9 +150,9 @@ def cmd_concat(args) -> None:
         run([_ffmpeg(), "-y", "-loglevel", "error", "-f", "concat", "-safe", "0",
              "-i", str(listfile), "-c", "copy", str(merged)])
 
-    # 第二步：统一分辨率/帧率/编码（比赛要求 H.264 yuv420p ≥1280x720）
+    # 第二步：统一分辨率/帧率/编码（默认下限 H.264 yuv420p ≥1280x720）
     # Agnes video 实测输出 1088x832（4:3 偏方），用 increase+crop 填满裁切
-    # （不要用 decrease+pad：会出黑边，比赛片观感差）
+    # （不要用 decrease+pad：会出黑边，观感差）
     norm = clips_dir / "_norm.mp4"
     vf = f"scale={tw}:{th}:force_original_aspect_ratio=increase,crop={tw}:{th},fps=24"
     if args.freeze_last > 0:
@@ -301,7 +301,7 @@ def cmd_check(args) -> None:
     path = args.path
     info = probe(path)
     print(json.dumps(info, indent=2))
-    # 自检阈值可配置（默认对齐黄山杯公益/商业赛道通用下限；其它赛事按需调整）
+    # 自检阈值可配置（默认 = 通用平台质量下限；目标平台/赛事不同时用 --min-res/--max-duration/--min-fps 覆盖）
     min_w, min_h = (int(x) for x in args.min_res.split("x"))
     rules = [
         (f"resolution >= {args.min_res}",
@@ -461,7 +461,7 @@ def main() -> None:
     c.add_argument("clips", help="clips 目录")
     c.add_argument("--out", required=True)
     c.add_argument("--target-res", default="1280x720",
-                   help="默认 1280x720（比赛硬指标下限，Agnes 1088x832 源仅 1.18x 放大画质最好；1920x1080 可选但更软）")
+                   help="默认 1280x720（通用质量下限；Agnes 1088x832 源仅 1.18x 放大画质最好；1920x1080 可选但更软）")
     c.add_argument("--bgm", default="", help="可选 BGM 音频文件（自动循环铺满）")
     c.add_argument("--bgm-db", type=float, default=-18.0, help="BGM 音量 dB（默认 -18）")
     c.add_argument("--voice", default="", help="旁白音频（TTS 产出），与环境音/BGM 混音")
@@ -484,8 +484,8 @@ def main() -> None:
 
     ck = sub.add_parser("check")
     ck.add_argument("path")
-    ck.add_argument("--min-res", default="1280x720", help="最低分辨率（默认 1280x720，黄山杯下限）")
-    ck.add_argument("--max-duration", type=float, default=120.0, help="最大时长秒（默认 120，黄山杯下限）")
+    ck.add_argument("--min-res", default="1280x720", help="最低分辨率（默认 1280x720，通用质量下限）")
+    ck.add_argument("--max-duration", type=float, default=120.0, help="最大时长秒（默认 120，通用上限）")
     ck.add_argument("--min-fps", type=float, default=24.0, help="最低帧率（默认 24）")
 
     e = sub.add_parser("extract")
