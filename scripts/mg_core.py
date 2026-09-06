@@ -74,6 +74,7 @@ PROVIDERS: dict[str, dict[str, Any]] = {
                 "payload_style": "zhipu",       # image_url / size / duration / fps 字段集
                 "supports_num_frames": False,   # 用 duration(5|10) + fps(30|60)，不用 num_frames
                 "supports_negative": False,
+                "default_size": "1920x1080",    # 智谱视频原生达标分辨率
                 "sizes": ["720x480", "1024x1024", "1280x960", "960x1280", "1920x1080", "1080x1920", "2048x1080", "3840x2160"],
                 "durations": [5, 10],
                 "rpm": 5,                       # 免费并发 30，保守节流

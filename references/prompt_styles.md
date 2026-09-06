@@ -135,6 +135,8 @@
 
 - 单焦点：1 主体 + 1 动作 + 1 种运镜，多主体必粘连
 - 必崩区禁入：抽象词、否定词（蒸馏版 CFG 1.0-3.5，负向几乎无效）、画面内文字、精确计数、多人交互、剧烈物理（流体/火焰/布料/碰撞）
+- **先查采样 cfg 再调 prompt**（2026-09-06 LTX 2B fp8 血泪）：cfg=1.0 会输出**字节级静态帧**（所有帧全等、avg_diff=0），提示词写得再好都白搭；cfg≥2.0 立刻恢复真运动——低档模型"完全不动"先怀疑配置链路，不是模型懒
+- cfg≥2.0 后运镜动词真实生效：gentle/slow + 单一运镜即可驱动画面（实测 "gentle camera push-in" 平滑前推）；动感偏强用 slow/gentle 收幅度；精细几何结构（栏杆/格栅类）会被重绘扭曲，优先自然场景/氛围镜
 - 英文单段流水 60-120 词，细节写前 100 词
 - 镜头语言要"可拍摄"：写 slow push-in 别写 cinematic
 - 单镜 ≤5s，短镜快切 + 后期调色/转场盖瑕疵
@@ -159,11 +161,14 @@
 
 - 接入：`MEDIA_CUSTOM_2_KEY=local`、`_BASE=http://127.0.0.1:8000/v1`、`_VIDEO_MODEL=ltx-video`、`_VIDEO_TASK_PATH=/videos`、`_VIDEO_PROMPT_FIELD=input`
 - payload `{"model","input","image":dataURI}`，POST `/v1/videos`，**同步响应约 60s**（body 含 `url`（相对路径）+ `local_path`；media_gen 走 url 分支直接下载，无需轮询）
-- 输出**固定 768×512 (3:2) / 24.39fps / 3-4s**（74-97 帧浮动）；`num_frames/width/height/duration` 一律被忽略；纯 t2v（无 image）返回空响应，**必须带首帧**
-- 产物为动画 WebP 且 **Exif 损坏**（ffmpeg 报 invalid TIFF header），ffmpeg 直接转码失败——用 Pillow 解帧→ffmpeg 编码（工作区 tools/webp2mp4.py 有现成实现；临时帧目录放系统 temp，批量删除可能被安全机制拦截需容错）
-- **i2v 不锁首帧像素**：把首帧当构图/内容参考，按 prompt 重绘成写实风 → 首帧务必用写实摄影风出图（agnes 卡一·活A photorealistic），不要给扁平插画/色块图
-- 无水印（本地模型）；画质中档，768×512 裁 16:9 放大 1280×720 达标偏软
+- 输出（**2026-09-06 调参后**）**1024×576 (16:9) / 24fps / ~5s（121 帧）**；`size` 默认值与 `frames = 121` 已改入 bridge_server.py（分辨率硬钳上限 1024，传 1280 会被钳）；纯 t2v（无 image）返回空响应，**必须带首帧**
+- **⚠️ cfg 必须 ≥2.0（2026-09-06 实测定论）**：cfg=1.0 时输出为**字节级全等的静态帧**（121 帧 md5 全同、avg_diff=0.000），strength 1.0/0.8/0.5 均救不回；cfg=2.0 后立刻正常（121/121 帧唯一，运镜连贯跟随 prompt）。字节级全等 = 配置/链路问题特征，不是"运动弱"
+- 现行桥参：steps=8 / **cfg=2.0** / euler / **strength=0.8** / img_compression=35；上游 RTX4060 8G 此配置**不 OOM**，~50-72s/条；上游仅 `ltxv-2b-0.9.8-distilled-fp8` 一个权重，换 bf16 需手动放 ComfyUI models/checkpoints
+- 产物为动画 WebP 且 **Exif 损坏**（ffmpeg 报 invalid TIFF header），ffmpeg 直接转码失败——用 Pillow 解帧→ffmpeg 编码（工作区 tools/webp2mp4.py 有现成实现；临时帧目录放系统 temp，批量删除可能被安全机制拦截需容错）。**Pillow 抽帧大坑**：`list(ImageSequence.Iterator(im))` 惰性求值会让所有帧变成最后一帧，必须 `[f.convert("RGB").copy() for f in Iterator(im)]` 迭代时立即落地
+- 无水印（本地模型）；单帧画质中档，1024×576 直接可用，放大 1280×720 偏软
 - prompt 喂法：照卡一·活C（短句、强动词、慢速控制词、单事件、locked camera 稳画面）
+- **定位升级（2026-09-06 cfg 修复后，摘"垃圾"帽）**：从"仅 kenburns 伪运动底片"升级为**本地免费真运动视频档**——运镜连贯已实测（前推/场景保持），可当补镜头、氛围镜、i2v 兜底；画质仍逊顶级商模级，参赛主力片依旧走高规格视频模型
+- **prompt 喂法升级（cfg≥2.0 后运动真实生效）**：运镜动词直接驱动画面（"gentle camera push-in"实测平滑前推）；配方 = 主体 + 单一运镜 + 单一环境微动（云/水/叶）+ 慢速词（cfg 2.0 动感偏强，用 slow/gentle 收幅度）；精细几何结构（栏杆/格栅类）会被重绘扭曲 → 优先自然场景/氛围镜，慎给精密结构特写
 
 ### 实测卡 · agnes-video（2026-09-05 沉淀）
 
