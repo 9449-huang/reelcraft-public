@@ -3,7 +3,7 @@ name: reelcraft
 description: 一句话需求 → 多 provider 生图/视频流水线（主力池可配 + 智谱/魔塔兜底，图批量选优 + 首帧图编辑 + 视频双链兜底）→ 声音设计（VO/TTS/字幕/BGM 混音）→ 规格统一后期 → 自检。Use when user asks to 做个视频/出片/AIGC广告/多 provider 兜底 or 给出平台/赛事规格要求生成达标视频；强调多 key 轮转与**多 key 并行**、熔断、一镜多图选优、xfade/末帧链衔接、抽帧 QC 闭环、断点续跑。When NOT to use: 静态海报用 ppt-master 或 image-master，单帧修图用 buddy-image-processing。
 ---
 
-# ReelCraft — 多 provider 视频流水线（v2.9）
+# ReelCraft — 多 provider 视频流水线（v3.0）
 
 ### 何时使用
 - 用户给出主题 + 时长 + 风格，要求生成一段演示/参赛用 AIGC 视频
