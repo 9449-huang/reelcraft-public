@@ -132,6 +132,17 @@ def cmd_status(args) -> None:
                 extra.append(f"sizes={len(k['image_sizes'])}项自填")
             suffix = f"  [{' '.join(extra)}]" if extra else ""
             print(f"  {p} key#{k['n']}: {key_mask(k['key'])}  base={k['base']}{suffix}")
+    # ─── TTS 池（cmd_tts 硬编码用 MEDIA_TTS_1_*；同步合成模式与 image/video 异步任务
+    # 不同构，不入 PROVIDERS 走通用枚举，这里单独显示/探测）───
+    tts_key = os.environ.get("MEDIA_TTS_1_KEY", "")
+    tts_base = os.environ.get("MEDIA_TTS_1_BASE", "").rstrip("/")
+    tts_model = os.environ.get("MEDIA_TTS_1_MODEL", "")
+    tts_ok = bool(tts_key and tts_base)
+    if tts_ok:
+        print(f"  tts key#1: {key_mask(tts_key)}  base={tts_base}"
+              f"  model={tts_model or 'cosyvoice-v1(缺省)'}")
+    else:
+        no_keys.append("tts")
     if no_keys:
         print(f"  {'/'.join(no_keys)}: 未配置 key（{KEY_ENV_FILE}）")
     if getattr(args, "no_probe", False):
@@ -150,6 +161,26 @@ def cmd_status(args) -> None:
             missing = [role for role in ("image", "video", "tts") if role not in r["guess"]]
             tail = f"  未命中: {'/'.join(missing)}" if missing else ""
             print(f"    {p} key#{k['n']}: {'  '.join(parts)}{tail}")
+    if tts_ok:
+        # TTS 探测不走 /models：本地 Edge TTS 等服务 /models 返回空列表，会误报"0 模型"。
+        # 改发 1 次极短 /audio/speech 小样验证链路真通；音色双降级（OpenAI 系 → Edge 系）。
+        last = ""
+        for v in ("Cherry", "zh-CN-XiaoxiaoNeural"):
+            try:
+                tbody = json.dumps({"model": tts_model or "cosyvoice-v1", "input": "测",
+                                    "voice": v, "response_format": "mp3"}).encode()
+                treq = urllib.request.Request(f"{tts_base}/audio/speech", data=tbody, method="POST")
+                treq.add_header("Authorization", f"Bearer {tts_key}")
+                treq.add_header("Content-Type", "application/json")
+                with urllib.request.urlopen(treq, timeout=15) as r:
+                    nbytes = len(r.read())
+                print(f"    tts key#1: 合成探测✅ ({nbytes // 1024}KB, voice={v} 小样)")
+                break
+            except Exception as e:
+                last = f"{e.__class__.__name__}: {e}"
+        else:
+            print(f"    tts key#1: 合成探测失败（{last}）——服务没起或音色不兼容；"
+                  f"用 media_gen.py tts --voice <服务实际音色> 实测为准")
 
 # ─── plan 校验（字段拼错静默失效是坑）────────────────────
 PLAN_KNOWN_KEYS = {"role_assign", "workers", "workers_image", "workers_video",

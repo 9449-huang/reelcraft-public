@@ -2,6 +2,11 @@
 
 > 历史演进记录，从 SKILL.md 外置（2026-09-06, v2.9）——SKILL.md 只保留当前有效指令，读历史到这来。
 
+## v3.1.1（2026-09-06）
+
+- **status 纳入 TTS 池**：v3.1 把本地 TTS 排成第一渠道但 status 里完全不可见（TTS 是 cmd_tts 硬编码单 key，不入 PROVIDERS 通用枚举）——本次在 cmd_status 补 TTS 专项段：配置行（key 掩码 + base + model，未配则并入 no_keys 提示）+ 小样合成探测。**探测不走 /models**（本地 Edge TTS 等服务 /models 返回空列表会误报），改发一次极短 /audio/speech 小样验证链路真通；音色双降级 Cherry→zh-CN-XiaoxiaoNeural（实测本地 Edge 服务拒 OpenAI 音色名 500，云端 OpenAI 系相反，双降级两边都覆盖）
+- **env.example TTS 段合并**：云端/本地两套示例合并为一段，补"音色命名随服务商"说明
+
 ## v3.1（2026-09-06）
 
 - **TTS 接入**：本地 OpenAI Edge TTS 服务（`localhost:5050`，`/v1/audio/speech`，模型 tts-1/tts-1-hd/gpt-4o-mini-tts）配进 `MEDIA_TTS_*` key 池——零代码改动（cmd_tts 本就是 OpenAI 兼容实现）；Edge 音色（zh-CN-XiaoxiaoNeural/YunxiNeural 等）与 `--speed` 实测可用（speed 真实生效，1.5 倍 17KB vs 1x 31KB）；SKILL 声音设计渠道优先级更新：本地 TTS 排第一（免费无限、不耗 key）
