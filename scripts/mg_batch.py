@@ -3,14 +3,20 @@ from __future__ import annotations
 from mg_core import (
     PROVIDERS,
     _abs_url,
+    _download,
     _extract_video_url,
     _final_out,
     _interleave_by_pool,
     _load_state,
     _pop_pending_task,
+    PRODUCT_EXTS,
     die,
     list_keys,
+    list_shot_files,
+    natkey,
+    negative_for_shot,
     pools_for_role,
+    run_capture,
 )
 import argparse
 import base64
@@ -28,6 +34,19 @@ from pathlib import Path
 from typing import Any
 
 from ffmpeg_probe import find_ffmpeg
+
+def prompt_lint_snapshot(j: Path, phase: str) -> str:
+    """出镜前 prompt lint（优化②）：返回 PASS/FAIL。延迟 import 避免循环依赖。
+    lint 词表默认读 references/anti-slop-lexicon.md，缺失回退内置。"""
+    import prompt_lint
+    hard, mood = prompt_lint.parse_lexicon_md(
+        Path(__file__).resolve().parents[1] / "references" / "anti-slop-lexicon.md")
+    try:
+        shot = json.loads(j.read_text(encoding="utf-8"))
+    except Exception:
+        return "FAIL"
+    issues = prompt_lint.lint_shot(shot, phase, hard, mood)
+    return "FAIL" if any(i["level"] == "FAIL" for i in issues) else "PASS"
 
 def cmd_harvest(args) -> None:
     """收割已完成的落盘任务（提交即扣模式下，慢任务出片自动变现）。
@@ -71,7 +90,7 @@ def _harvest_image(tid: str, rec: dict, pool: str) -> None:
         os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
         got = _abs_url(imgs[0], k.get("base", ""))
         out = _final_out(out, got)
-        urllib.request.urlretrieve(got, out)
+        _download(got, out)
         _pop_pending_task(tid)
         print(f"[harvest] {tid}: 已收割 -> {out}")
     elif status in ("FAIL", "FAILED", "ERROR"):
@@ -108,7 +127,7 @@ def _harvest_video(tid: str, rec: dict, pool: str) -> None:
         out = rec.get("out") or f"harvest_{tid}.mp4"
         os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
         out = _final_out(out, got)
-        urllib.request.urlretrieve(got, out)
+        _download(got, out)
         _pop_pending_task(tid)
         print(f"[harvest] {tid}: 已收割 -> {out}")
     elif status in ("FAIL", "FAILED", "ERROR"):
@@ -132,7 +151,9 @@ def cmd_batch(args) -> None:
     shots_dir = Path(args.shots)
     if not shots_dir.is_dir():
         die(f"shots 目录不存在: {shots_dir}", 2)
-    jsons = sorted(shots_dir.glob("S*.json")) + sorted(shots_dir.glob("shot_*.json"))
+    # 跨平台去重枚举：Windows glob 大小写不敏感，两个 pattern 会重复匹配 shot_*.json
+    # （见 mg_core.list_shot_files），不去重则每镜双跑
+    jsons = list_shot_files(shots_dir)
     if not jsons:
         die(f"未找到分镜 JSON: {shots_dir}/S*.json", 2)
 
@@ -176,8 +197,12 @@ def cmd_batch(args) -> None:
                    "--pin-key", str(pin)]
             return cmd, out, ""
         out = clips_dir / f"clip_{sid}.mp4"   # clip_ 前缀与 postprocess concat 的 glob("clip_*.mp4") 对齐
-        if out.exists() and out.stat().st_size > 0:
-            return [], out, "skip (exists)"
+        # 断点续跑：产物可能是 .webp（LTX/本地网关出动画 webp，_final_out 按真实后缀落盘）
+        # 只认 .mp4 会误判"未完成"→重新提交→重复扣费（#3）
+        for _ext in PRODUCT_EXTS:
+            cand = clips_dir / f"clip_{sid}{_ext}"
+            if cand.exists() and cand.stat().st_size > 0:
+                return [], cand, "skip (exists)"
         frame = frames_dir / f"{sid}.png"
         if not frame.exists():
             return [], out, "MISS (no frame)"
@@ -185,7 +210,8 @@ def cmd_batch(args) -> None:
                "--provider", pool, "--prompt", d.get("i2v_prompt", ""),
                "--image", str(frame), "--out", str(out),
                "--num-frames", str(d.get("num_frames", 121)),
-               "--negative", args.negative, "--pin-key", str(pin)]
+               "--negative", negative_for_shot(d, args.negative),
+               "--pin-key", str(pin)]
         if getattr(args, "video_size", ""):
             cmd += ["--video-size", args.video_size]
         if getattr(args, "video_duration", ""):
@@ -197,6 +223,15 @@ def cmd_batch(args) -> None:
         d = json.loads(j.read_text(encoding="utf-8"))
         sid = d.get("shot_id") or j.stem
         plan.append((j, sid))
+
+    # --only：只跑指定镜号（逗号分隔，按 shot_id）。hybrid 模式需要它：
+    # 重点镜出真视频、过场镜交给 kenburns，所以视频阶段只喂 hero_shots。
+    only = {s.strip() for s in (getattr(args, "only", "") or "").split(",") if s.strip()}
+    if only:
+        plan = [(j, sid) for j, sid in plan if sid in only]
+        if not plan:
+            die(f"--only 的镜号 {sorted(only, key=natkey)} 在分镜 JSON 里一个都没匹配上", 2)
+        print(f"[batch] --only 只跑 {sorted(only, key=natkey)}（共 {len(plan)} 镜）", file=sys.stderr)
 
     # --retry-failed：读上轮 batch_run.json，只重跑 FAIL/PENDING 镜；
     # PENDING 先 harvest（在生成的不重提交，防重复扣费），成功镜靠断点续跑跳过
@@ -216,12 +251,13 @@ def cmd_batch(args) -> None:
         waiting = bad_sids & still
         bad_sids -= waiting
         if waiting:
-            print(f"[batch] 仍在生成、暂不重提交：{sorted(waiting)}（出片后 harvest 收割）",
+            print(f"[batch] 仍在生成、暂不重提交：{sorted(waiting, key=natkey)}"
+                  f"（出片后 harvest 收割）",
                   file=sys.stderr)
         plan = [(j, sid) for j, sid in plan if sid in bad_sids]
         if not plan:
             print(f"[batch] 失败镜全部在生成中或无法定位，本轮无任务"
-                  f"（仍在生成：{sorted(waiting)}）")
+                  f"（仍在生成：{sorted(waiting, key=natkey)}）")
             sys.exit(0)
         print(f"[batch] 补跑 {len(plan)} 镜：{[sid for _, sid in plan]}", file=sys.stderr)
 
@@ -270,6 +306,19 @@ def cmd_batch(args) -> None:
                     results.append(f"skip {sid}")
                 consecutive_fail = 0
                 continue
+            # 出镜前 prompt lint（优化②）：slop 词/词数越界/i2v 重述主体，FAIL 直接
+            # 记失败不重试——prompt 问题重试 N 次也是白烧额度。--no-lint 可关。
+            if not getattr(args, "no_lint", False):
+                lv = prompt_lint_snapshot(j, args.phase)
+                if lv == "FAIL":
+                    with rl:
+                        results.append(f"FAIL(lint) {sid} [{pool} key#{pin}]")
+                        provider_map[sid] = f"{pool} key#{pin} (lint)"
+                    print(f"[batch W{w+1}] {sid} prompt lint 未过（slop/词数/主体漂移）——"
+                          f"修 shots/{Path(j).name} 后重跑（lint 详情："
+                          f"`python prompt_lint.py {Path(j)} --kind {args.phase}`）",
+                          file=sys.stderr)
+                    continue
             last_rc = 1
             for attempt in range(1, args.retries + 1):
                 rc = subprocess.call(cmd)
@@ -284,8 +333,38 @@ def cmd_batch(args) -> None:
                 print(f"[batch W{w+1}] {sid} 失败(rc={rc})，重试 {attempt}/{args.retries}",
                       file=sys.stderr)
             # 断点续跑兜底：重试后仍非 0，但产物已存在且非空，视为成功
-            if last_rc != 0 and out.exists() and out.stat().st_size > 0:
+            # （.webp 同认：_final_out 可能把产物落成动画 webp，见 make_cmd 的 #3 说明）
+            _prod = out if out.exists() and out.stat().st_size > 0 else None
+            if _prod is None and args.phase == "videos":
+                for _ext in PRODUCT_EXTS:
+                    _w = clips_dir / f"clip_{sid}{_ext}"
+                    if _w.exists() and _w.stat().st_size > 0:
+                        _prod = _w
+                        break
+            if last_rc != 0 and _prod is not None:
                 last_rc = 0
+            # QC 硬门禁（#4）：机器能判的（黑帧/过曝/静帧/规格）就地判，FAIL 的镜
+            # 覆盖为失败 → --retry-failed 重跑。只拦"明显生成失败"，美学崩坏仍交人眼。
+            if last_rc == 0 and args.qcgate and args.phase == "videos" and _prod is not None:
+                gate_cmd = [sys.executable,
+                            str(Path(__file__).resolve().parent / "postprocess.py"),
+                            "qcgate", str(_prod)]
+                if args.qcgate_strict:
+                    gate_cmd.append("--strict")
+                try:
+                    g = run_capture(gate_cmd, timeout=120)
+                except subprocess.TimeoutExpired:
+                    print(f"[batch W{w+1}] {sid} qcgate 超时 120s（ffmpeg 抽帧挂起？），记 FAIL 待重跑",
+                          file=sys.stderr)
+                    last_rc = 2
+                    g = None
+                if g is not None and g.returncode != 0:
+                    for ln in (g.stdout or "").splitlines():
+                        if ln.strip():
+                            print(f"[batch W{w+1}] {sid} qcgate: {ln.strip()}", file=sys.stderr)
+                    last_rc = 2      # 记为 FAIL，--retry-failed 会重跑
+                    print(f"[batch W{w+1}] {sid} qcgate 未过（黑帧/过曝/静帧/规格），记 FAIL 待重跑",
+                          file=sys.stderr)
             with rl:
                 if last_rc == 0:
                     consecutive_fail = 0
@@ -323,6 +402,20 @@ def cmd_batch(args) -> None:
     for r in results:
         print(r, flush=True)
     failed = [r for r in results if r.startswith("FAIL")]
+    pending = [r for r in results if r.startswith("PENDING")]
     print(f"[batch] phase={args.phase} workers={args.workers} done. "
-          f"failed={failed or 'none'}  (明细见 {shots_dir / 'batch_run.json'})", flush=True)
-    sys.exit(1 if failed else 0)
+          f"failed={failed or 'none'}"
+          + (f"  pending={len(pending)}（超时在途，跑 harvest 收割）" if pending else "")
+          + f"  (明细见 {shots_dir / 'batch_run.json'})", flush=True)
+    sys.exit(batch_exit_code(results))
+
+
+def batch_exit_code(results: list[str]) -> int:
+    """批量结果 → 进程退出码（供 pipeline 编排决策，须可单测）。
+    0=全成功；1=有 FAIL（重试后仍失败）；4=有 PENDING（超时在途，任务已受理落盘，
+    重试=重复扣费——pipeline 必须 exit 4 交还 agent 问用户三选，不能静默放行）。"""
+    if any(r.startswith("PENDING") for r in results):
+        return 4
+    if any(r.startswith("FAIL") for r in results):
+        return 1
+    return 0

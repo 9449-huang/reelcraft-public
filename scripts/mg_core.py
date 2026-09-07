@@ -28,6 +28,7 @@ def _ffmpeg() -> str:
 KEY_ENV_FILE = Path.home() / ".workbuddy" / "media_keys.env"
 LEGACY_KEY_ENV_FILE = Path.home() / ".workbuddy" / "agnes_key.env"
 STATE_FILE = Path.home() / ".workbuddy" / ".media_state.json"
+THROTTLE_FILE = Path.home() / ".workbuddy" / ".media_throttle.json"
 PROVIDERS: dict[str, dict[str, Any]] = {
     "agnes": {
         "label": "Agnes",
@@ -159,6 +160,75 @@ _load_env_file(LEGACY_KEY_ENV_FILE)  # 向后兼容
 
 _state_lock = threading.Lock()
 
+LOCK_TIMEOUT = 30.0          # 拿锁自旋上限（秒）：超时即告警降级，不再无限等
+_WARNED_LOCKS: set[str] = set()   # 同一锁文件只告警一次，避免刷屏
+
+class _FileLock:
+    """跨进程文件锁（Windows msvcrt / POSIX fcntl）。
+    batch 每镜是独立 subprocess，threading.Lock 挡不住跨进程竞态——
+    state 读改写与节流落盘必须走这里。锁不住时降级为无锁执行（功能优先），
+    但会向 stderr 告警，不做静默降级。"""
+
+    def __init__(self, path):
+        self.path = Path(str(path) + ".lock")
+        self.fd = None
+
+    def __enter__(self):
+        deadline = time.time() + LOCK_TIMEOUT
+        try:
+            self.fd = open(self.path, "a+")
+            self.fd.seek(0)
+            while True:
+                try:
+                    import msvcrt
+                    # 非阻塞 + 自旋到超时：LK_LOCK 会在内核里盲重试约 10s 再抛错，
+                    # 期间无法感知也无法区分"慢"和"死等"，超时预算必须自己掌握
+                    msvcrt.locking(self.fd.fileno(), msvcrt.LK_NBLCK, 1)
+                    return self
+                except ImportError:
+                    import fcntl
+                    fcntl.flock(self.fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    return self
+                except OSError:
+                    if time.time() >= deadline:
+                        raise
+                    time.sleep(0.05)
+        except Exception as e:
+            # 拿不到锁：必须关句柄（否则泄漏）并**明确告警**——
+            # 此前这里静默降级为无锁，等于 #1/#6 的跨进程保护在高并发下悄悄失效
+            if self.fd is not None:
+                try:
+                    self.fd.close()
+                except Exception:
+                    pass
+                self.fd = None
+            if self.path.name not in _WARNED_LOCKS:
+                _WARNED_LOCKS.add(self.path.name)
+                print(f"[media_gen] ⚠ 文件锁获取失败（{self.path.name}），降级无锁：{e}",
+                      file=sys.stderr)
+        return self
+
+    def __exit__(self, *exc):
+        if self.fd is None:
+            return False
+        try:
+            try:
+                import msvcrt
+                msvcrt.locking(self.fd.fileno(), msvcrt.LK_UNLCK, 1)
+            except ImportError:
+                import fcntl
+                fcntl.flock(self.fd.fileno(), fcntl.LOCK_UN)
+        except Exception:
+            pass
+        finally:
+            self.fd.close()
+        return False
+
+def _atomic_write_json(path: Path, s: dict) -> None:
+    tmp = Path(str(path) + ".tmp")
+    tmp.write_text(json.dumps(s, indent=2, ensure_ascii=False), encoding="utf-8")
+    os.replace(tmp, path)       # 原子替换：防并发写坏半截 JSON
+
 def _load_state() -> dict:
     with _state_lock:
         if STATE_FILE.exists():
@@ -167,12 +237,142 @@ def _load_state() -> dict:
             except Exception:
                 return {}
         return {}          # 状态文件不存在：返回空 dict（此前隐式返回 None，首次落盘会炸）
-def _save_state(s: dict) -> None:
-    try:
-        with _state_lock:
-            STATE_FILE.write_text(json.dumps(s, indent=2, ensure_ascii=False), encoding="utf-8")
-    except Exception:
-        pass
+# 注：旧的 _save_state() 已删除——它是"读改写"竞态的入口（#1），
+# 所有写路径必须走下面的 _update_state()，别再把它加回来。
+
+def _update_state(fn) -> dict:
+    """跨进程安全的 state 读改写：文件锁内 读→fn(state)→原子写。
+    fn 直接就地修改传入的 dict。返回处理后的 state。
+    锁内顺手惰性清理过期冷却条目（防止状态文件只进不出）。"""
+    with _state_lock:
+        with _FileLock(STATE_FILE):
+            s = {}
+            if STATE_FILE.exists():
+                try:
+                    s = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+                except Exception:
+                    s = {}
+            now = time.time()
+            for _p, _cd in (s.get("cooldown") or {}).items():
+                if isinstance(_cd, dict):
+                    for _kn in [k for k, t in _cd.items()
+                                if not isinstance(t, (int, float)) or t <= now]:
+                        _cd.pop(_kn, None)
+            fn(s)
+            _atomic_write_json(STATE_FILE, s)
+            return s
+
+def _cooldown_update(provider: str, kn: str, until: float | None) -> None:
+    """跨进程安全更新单把 key 的冷却：until=None 清除，否则设为 until。"""
+    def _fn(s):
+        cd = s.setdefault("cooldown", {}).setdefault(provider, {})
+        if until is None:
+            cd.pop(kn, None)
+        else:
+            cd[kn] = until
+    _update_state(_fn)
+
+# 产物扩展名白名单：有的池（LTX Bridge 等）出的是 .webp 动图而非 .mp4。
+# 凡是"这镜算不算已经出片了"的判断（断点续跑、拼接收集）都必须遍历这个常量，
+# 别再各处手写 .mp4——漏一个扩展名就是整镜重做或整镜丢失（#3）。
+PRODUCT_EXTS: tuple[str, ...] = (".mp4", ".webp")
+
+def find_existing_product(out: str) -> str:
+    """断点续跑：找"这镜算不算已经出片了"的落点——out 本身或按 PRODUCT_EXTS
+    换后缀的兄弟产物。有的池（LTX Bridge 等）会经 _final_out 把 .mp4 落成 .webp，
+    只查原路径会把已完成镜误判为未完成 → 重新提交 → 重复扣费（#3）。
+    返回已存在且非空的落点路径；都没有返回空串。"""
+    base = Path(out)
+    cands = [base] + [base.with_suffix(ext) for ext in PRODUCT_EXTS
+                      if ext.lower() != base.suffix.lower()]
+    for c in cands:
+        if c.exists() and c.stat().st_size > 0:
+            return str(c)
+    return ""
+
+def run_capture(cmd: list[str], timeout: int | None = None, env: dict | None = None
+                ) -> "subprocess.CompletedProcess[str]":
+    """统一 subprocess 文本捕获 runner：强制 utf-8 解码。
+    中文 Windows 的默认 locale 是 GBK，ffmpeg 等工具输出 UTF-8 中文（文件路径/提示）
+    时 text=True 缺省按 GBK 解会炸 UnicodeDecodeError——所有捕获输出的调用必须走这里
+    （或自带 encoding="utf-8", errors="replace"）。"""
+    return subprocess.run(cmd, capture_output=True, text=True,
+                          encoding="utf-8", errors="replace", timeout=timeout, env=env)
+
+
+def natkey(s) -> list:
+    """自然排序 key：数字段按数值比较（S2 < S10、clip_S2 < clip_S10）。
+    接受 str/Path。所有 glob 排序（分镜 JSON、clip 产物、帧序列）必须用它——
+    字典序在镜号不补零（S1..S10）时会把 S10 排到 S2 前，导致拼接镜序错乱（#2）。"""
+    return [int(x) if x.isdigit() else x
+            for x in re.split(r"(\d+)", str(s).lower())]
+
+
+# ─── 负面模板按题材分档（优化⑧）────────────────────────
+# 一套 negative 打天下是偷懒：人物镜最怕换脸/肢体乱，风景镜怕画面脏乱，产品镜怕光斑/畸变。
+# shot JSON 的 type/subject 关键词自动选档；兜底通用（原默认）。
+NEGATIVE_TEMPLATES: dict[str, str] = {
+    "character": ("distorted faces, warped hands, extra limbs, mutated fingers, "
+                  "asymmetrical eyes, teeth artifacts, clothing artifacts, face swap, "
+                  "body horror, plastic skin, oversaturated"),
+    "landscape": ("cluttered composition, noisy details, oversharpened, chromatic "
+                  "aberration, lens flare artifacts, double exposure, garbled textures, "
+                  "oversaturated, watermark"),
+    "product": ("distorted geometry, warped edges, specular blowout, reflection artifacts, "
+                "floating parts, broken symmetry, missing details, oversaturated, "
+                "text artifacts, watermark"),
+}
+NEGATIVE_GENERIC = ("blurry, distorted faces, warped hands, extra limbs, text artifacts, "
+                    "watermark, camera shake, flickering, plastic skin, oversaturated")
+
+_TYPE_KWS = {
+    "character": ("character", "person", "portrait", "face", "human", "figure",
+                  "role", "actor", "人物", "角色", "肖像", "人脸"),
+    "landscape": ("landscape", "scenery", "nature", "mountain", "cityscape", "ocean",
+                  "forest", "sky", "风景", "自然", "山川", "城市"),
+    "product": ("product", "object", "bottle", "packaging", "gadget", "商品", "产品",
+                "器物", "瓶"),
+}
+
+def _kw_hit(keywords, hay: str) -> bool:
+    """题材关键词命中：英文按词边界（防 "nature" 误中 "naturally"、"product" 误中
+    "produce" 的子串误档）；中文关键词无空格边界，保持子串（独立成义，误伤率低）。"""
+    for k in keywords:
+        if any("\u4e00" <= c <= "\u9fff" for c in k):
+            if k in hay:
+                return True
+        elif re.search(rf"(?<![a-z]){re.escape(k)}(?![a-z])", hay):
+            return True
+    return False
+
+
+def negative_for_shot(shot: dict, fallback: str = "") -> str:
+    """按 shot 题材自动选 negative 模板；命中多档取第一个（character→landscape→
+    product），未命中兜底。题材来源：slot type / subject / role / dramatic_function。"""
+    hay = " ".join([
+        str(shot.get("type") or ""), str(shot.get("subject") or ""),
+        str(shot.get("role") or ""), str(shot.get("dramatic_function") or ""),
+    ]).lower()
+    for kind in ("character", "landscape", "product"):
+        if _kw_hit(_TYPE_KWS[kind], hay):
+            return NEGATIVE_TEMPLATES[kind]
+    return fallback or NEGATIVE_GENERIC
+
+
+def list_shot_files(shots_dir) -> list:
+    """枚举分镜 JSON（S*.json 与 shot_*.json 两种命名），自然排序，**按文件去重**。
+
+    去重不可省：Windows 的文件 glob 大小写不敏感，`glob("S*.json")` 与
+    `glob("shot_*.json")` 都会匹配到 `shot_01.json` → 每镜被算两次（双跑/双缓推）。
+    Linux/macOS 大小写敏感不复现，故只有 Windows 上静默出错。
+    返回 Path 列表（唯一、已排序）。"""
+    d = Path(shots_dir)
+    seen: dict[str, Path] = {}
+    for pat in ("S*.json", "shot_*.json"):
+        for p in d.glob(pat):
+            seen[str(p.resolve())] = p          # 按解析后路径去重
+    return [seen[k] for k in sorted(seen, key=lambda k: natkey(Path(k).name))]
+
 def list_keys(provider: str, pin: int = 0, required: bool = True, role: str = "") -> list[dict]:
     """返回 [{key, base, poll, n, roles, image_model, video_model}]（n 为序号）。
     pin>0 时只返回第 pin 把 key（多 worker 并行：各锁一把，互不踩 429）。
@@ -308,10 +508,7 @@ def call_with_failover(
     keys = list_keys(provider, pin_key, role=kind)   # 按 _ROLES 过滤（如 custom 池图/视频分 key）
     state = _load_state() or {}
     cooldown = (state.get("cooldown") or {}).get(provider) or {}
-    # 惰性清理：过期冷却/黑名单条目直接移除，防止状态文件只进不出
-    now = time.time()
-    for kn in [kn for kn, t in cooldown.items() if t <= now]:
-        cooldown.pop(kn, None)
+    # 过期条目由 _update_state 惰性清理；这里仅按时间判断是否跳过
     last_err = None
     for k in keys:
         kn = str(k["n"])
@@ -320,37 +517,46 @@ def call_with_failover(
             continue
         try:
             resp = call_fn(k)
-            cooldown.pop(kn, None)                 # 成功 → 清除冷却
-            state.setdefault("cooldown", {})[provider] = cooldown
-            _save_state(state)
+            _cooldown_update(provider, kn, None)    # 成功 → 清除冷却（跨进程安全）
             return resp, k
         except ProviderFatal:
             raise
         except PermissionError as e:
             print(f"[media_gen] {provider} key #{kn} 鉴权失败，记入黑名单: {e}", file=sys.stderr)
-            cooldown[kn] = time.time() + 86400
+            _cooldown_update(provider, kn, time.time() + 86400)
+            cooldown[kn] = time.time() + 86400      # 内存镜像同步，避免同轮重复打
             last_err = e
         except RateLimitedError as e:
-            cooldown[kn] = time.time() + cooldown_default
+            _cooldown_update(provider, kn, time.time() + cooldown_default)
+            cooldown[kn] = time.time() + cooldown_default   # 内存镜像同步
             print(f"[media_gen] {provider} key #{kn} 限流，冷却 {cooldown_default}s: {e}", file=sys.stderr)
             last_err = e
         except Exception as e:
             last_err = e
             continue
-    state.setdefault("cooldown", {})[provider] = cooldown
-    _save_state(state)
     raise AllKeysFailed(f"{provider} 所有 key 失败: {last_err}")
 
 # ─── 视频节流（按 key 各自计时 → 双 key 双线并行不互卡）────
-_last_video_at: dict[str, float] = {}
-_throttle_lock = threading.Lock()
+# 时间戳落盘（THROTTLE_FILE）：batch 每镜是独立 subprocess，内存 dict 跨进程
+# 各自为空会令 RPM 节流失效——必须跨进程共享（文件锁内读改写）。
 
 def video_throttle(rpm: int, tag: str = "default") -> None:
-    """tag 形如 agnes_key1 / agnes_key2 / default。每个 tag 独立计时。"""
+    """tag 形如 agnes_key1 / agnes_key2 / default。每个 tag 独立计时（跨进程共享）。"""
     interval = max(1.0, 60.0 / max(1, rpm))
-    with _throttle_lock:
-        wait = interval - (time.time() - _last_video_at.get(tag, 0.0))
-        _last_video_at[tag] = time.time() + max(0.0, wait)
+    wait = 0.0
+    with _FileLock(THROTTLE_FILE):
+        ts: dict[str, float] = {}
+        try:
+            ts = json.loads(THROTTLE_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            ts = {}
+        now = time.time()
+        # 惰性清理：超过 1 天没再打过的 tag 直接丢，防止节流文件只进不出
+        ts = {k: v for k, v in ts.items()
+              if isinstance(v, (int, float)) and now - float(v) < 86400}
+        wait = interval - (now - float(ts.get(tag, 0.0)))
+        ts[tag] = now + max(0.0, wait)
+        _atomic_write_json(THROTTLE_FILE, ts)
     if wait > 0:
         print(f"[media_gen] 视频节流 {rpm} RPM [{tag}]，等待 {wait:.0f}s", file=sys.stderr)
         time.sleep(wait)
@@ -388,6 +594,27 @@ def _final_out(out: str, url: str) -> str:
         return new
     return out
 
+def _download(url: str, out: str | Path, timeout: float = 120) -> None:
+    """带超时的下载：urlopen 流式写文件（urlretrieve 无超时，网络半死会无限挂起，#7）。
+    先写临时文件再 os.replace 原子落盘，防半截文件被断点续跑误判吞掉。
+    临时名带 pid：两个 subprocess 下同一 out 不会互相覆盖半截内容；
+    失败必须清掉残骸，否则 *.dl 垃圾会一直堆在工作区。"""
+    tmp = f"{out}.dl.{os.getpid()}"
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as r, open(tmp, "wb") as f:
+            while True:
+                chunk = r.read(1 << 16)
+                if not chunk:
+                    break
+                f.write(chunk)
+        os.replace(tmp, out)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
 def _download_image(resp: dict, out: str, base: str = "") -> None:
     d = (resp.get("data") or [{}])[0]
     url = _abs_url(d.get("url"), base)
@@ -395,7 +622,7 @@ def _download_image(resp: dict, out: str, base: str = "") -> None:
     os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
     if url:
         out = _final_out(out, url)
-        urllib.request.urlretrieve(url, out)
+        _download(url, out)
     elif b64:
         with open(out, "wb") as f:
             f.write(base64.b64decode(b64))
@@ -502,18 +729,19 @@ def image_to_url_or_path(path: str) -> str:
 # ─── 视频超时协议：落盘 / 续等 / 收割 ─────────────────────
 def _save_pending_task(pool: str, task_id: str, out: str, base: str,
                        kind: str = "video", poll_path: str = "") -> None:
-    s = _load_state()
-    s.setdefault("pending_tasks", {})[str(task_id)] = {
-        "pool": pool, "out": out, "base": base, "submitted_at": time.time(),
-        "kind": kind, "poll_path": poll_path,
-    }
-    _save_state(s)
+    def _fn(s):
+        s.setdefault("pending_tasks", {})[str(task_id)] = {
+            "pool": pool, "out": out, "base": base, "submitted_at": time.time(),
+            "kind": kind, "poll_path": poll_path,
+        }
+    _update_state(_fn)          # 跨进程安全：防并发覆盖丢 pending 记录
 
 def _pop_pending_task(task_id: str) -> dict | None:
-    s = _load_state()
-    rec = s.get("pending_tasks", {}).pop(str(task_id), None)
-    if rec:
-        _save_state(s)
+    rec: dict | None = None
+    def _fn(s):
+        nonlocal rec
+        rec = s.get("pending_tasks", {}).pop(str(task_id), None)
+    _update_state(_fn)
     return rec
 
 def _extract_video_url(st: dict) -> str | None:
@@ -533,6 +761,11 @@ def _extract_video_url(st: dict) -> str | None:
         for k_ in ("video_url", "url"):
             if isinstance(data.get(k_), str) and data[k_].startswith("http"):
                 return data[k_]
+    elif isinstance(data, list) and data and isinstance(data[0], dict):
+        # 部分网关 data 是数组（OpenAI 兼容结构），此前仅认 dict 漏检（#9）
+        for k_ in ("video_url", "url"):
+            if isinstance(data[0].get(k_), str) and data[0][k_].startswith("http"):
+                return data[0][k_]
     return None
 
 def _print_timeout_menu(exclude: str) -> None:
@@ -577,7 +810,7 @@ def _poll_video_task(pool: str, info: dict, k: dict, video_id: str, out: str, ar
         if url:
             os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
             out = _final_out(out, url)
-            urllib.request.urlretrieve(url, out)
+            _download(url, out)
             print(f"[media_gen] video OK via {pool} -> {out}")
             return
         status = str(st.get("task_status") or st.get("status") or "").upper()

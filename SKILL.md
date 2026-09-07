@@ -3,7 +3,7 @@ name: reelcraft
 description: 一句话需求 → 多 provider 生图/视频流水线（主力池可配 + 智谱/魔塔兜底，图批量选优 + 首帧图编辑 + 视频双链兜底）→ 声音设计（VO/TTS/字幕/BGM 混音）→ 规格统一后期 → 自检。Use when user asks to 做个视频/出片/AIGC广告/多 provider 兜底 or 给出平台/赛事规格要求生成达标视频；强调多 key 轮转与**多 key 并行**、熔断、一镜多图选优、xfade/末帧链衔接、抽帧 QC 闭环、断点续跑。When NOT to use: 静态海报用 ppt-master 或 image-master，单帧修图用 buddy-image-processing。
 ---
 
-# ReelCraft — 多 provider 视频流水线（v3.1.1）
+# ReelCraft — 多 provider 视频流水线（v3.1.11）
 
 ### 何时使用
 - 用户给出主题 + 时长 + 风格，要求生成一段演示/参赛用 AIGC 视频
@@ -18,6 +18,12 @@ description: 一句话需求 → 多 provider 生图/视频流水线（主力池
 
 **流程**：Step 0 规格确认 → **Step 1 体检 + 六问**（下面）→ Step 2 分镜 → Step 3 提示词（按口味卡）→ Step 4 关键帧出图 → Step 5 图生视频 → Step 6 后期+声音 → Step 7 交付。
 
+**一键编排（Step 2-6 串起来）**：Step 1 的六问已落 `plan.json`、Step 2/3 的分镜与 prompt 写好后，
+跑 `python scripts/pipeline.py <shots目录>` 即可把出图→出视频→(缓推)→后期一条串完。
+它**只做编排、不做审美决策**——mode/重点镜/池顺序全读 `plan.json`；plan.json 缺 mode 就退回 Step 1，
+**绝不默认 full 替用户拍板**。出片后**停在 QC 门前**（视觉验收必须人看）。
+`--dry-run` 先看各阶段命令；`--stop-after images` 可每阶段人工把关。手动逐条跑见 Step 4/5/6。
+
 **六问**（一次问完落 plan.json，之后不再重复问；全部大白话，对用户只说"模型"）：
 
 | 问 | 内容 | 何时跳过 |
@@ -31,6 +37,11 @@ description: 一句话需求 → 多 provider 生图/视频流水线（主力池
 
 **例外交互**：仅当视频生成超时（exit 4）时再问一次三选——切换模型 / 续等（`--wait-task`）/ 放弃；任务自动落盘，`harvest` 随时收割。
 **新用户前置**：把各家 key 写进 `media_keys.env`（模板见"扩容指南"→ `references/provider-setup.md`）。
+
+**运行前提（中文 Windows 必读，P2-6）**：本 skill 输出/日志含 ✅⚠️❌ 等非 GBK 字符，脚本内 subprocess 统一按 UTF-8 解码——**必须在 UTF-8 环境跑**。中文 Windows 控制台（cmd/PowerShell）默认 GBK 会直接 UnicodeEncodeError（症状：一跑就红、报错全在 print 中文/符号处）。解决二选一：
+- 命令行先 `set PYTHONIOENCODING=utf-8`（或 PowerShell `$env:PYTHONIOENCODING="utf-8"`），或
+- 在 UTF-8 终端（Windows Terminal / VS Code 终端）里跑，或设 `PYTHONUTF8=1`。
+裸跑红了不是 skill 坏了——先看是不是编码环境。
 
 ### 核心设计
 
@@ -48,12 +59,12 @@ description: 一句话需求 → 多 provider 生图/视频流水线（主力池
 9. **首帧小改**：魔塔 `edit` 子命令，移物/调光不用整图重 roll
 10. **N key 并行 + 跨池混编**：`batch --workers N` 轮流把镜分给 N 个 (池,key)，per-key 节流，吞吐 ×N；`--provider` 留空=全部池混编，传单池/逗号分隔=指定范围
 11. **声音设计**：VO 稿 → `tts` 子命令 → `--subtitles` 多段字幕 → `--voice/--bgm/--ambient-db` 混音
-12. **QC 闭环**：`qc`/`batch --qc` 每段抽首中尾 3 帧验收，不合格按诊断表单变量重拍
+12. **QC 闭环**：先 `qcgate` 机器门禁（黑帧/过曝/静帧/规格，FAIL 自动重跑），再 `qc`/`batch --qc` 抽首中尾 3 帧人眼验收，不合格按诊断表单变量重拍
 13. **文案批量出稿**：`copy.py --brief --count` AI 撒网出候选 → 人工筛选改写。
     ⚠️ 注意与第 1 条区分：**prompt 归对话模型写（机器看的技术描述），文案走 AI 批量（人看的创意）**——
     实测证明约束到位时 agnes-2.5-flash 写中文文案质量很高，前提是给它硬约束
 14. **水印探测-抹除旁线**：档案 `scripts/watermark_profiles.json` 记各渠道水印状态（clean / corner-delogo / unknown / fatal）——命中档案免测直抹；首遇新渠道跑**固定镜头纯色画面** probe 片，抽帧目检定位（agent 自带视觉，0 API）后 `delogo_watermark.py --provider` 抹除并回写档案。只管小而静态的角标水印；动态/大面积记 fatal 换渠道
-15. **通用池 + 能力探测 + 三档模式**：任意 OpenAI 兼容渠道填 4 行 env 即接入（`MEDIA_CUSTOM_1_*`，零改码）；`status` 自动 GET /models 启发式猜能力（标注“猜的未验证”，实跑才算数）；成片三档 **full 全真视频 / hybrid 按镜混用（重点镜 i2v + 过场镜 kenburns） / stills 全缓推（0 视频调用）**——探测结果报给用户选，绝不自动降级
+15. **通用池 + 能力单源 + 三档模式**：任意 OpenAI 兼容渠道填 4 行 env 即接入（`MEDIA_CUSTOM_1_*`，零改码）。**能力以实测为权威**：`media_gen.py caps probe <pool> --kind image|video --real` 真发一次最小请求，把"能出片 + 实际规格"落盘 `~/.workbuddy/.media_caps.json`；`caps show` 三栏对照（声明=候选 / 实测=权威 / 生效值）；`status` 的 /models 启发式仅作线索、不当结论。新后端接入 = 配 env → `caps probe --real` 验一次，零改码。实测 7 天过期自动回落声明。成片三档 **full 全真视频 / hybrid 按镜混用（重点镜 i2v + 过场镜 kenburns） / stills 全缓推（0 视频调用）**——探测结果报给用户选，绝不自动降级
 16. **prompt 口味卡**：`references/prompt-styles.md` 三张"怎么喂"小卡——轻量卡（agnes/zhipu/qwen-edit 共用，按文生图/图编辑/视频三种活对号）／高规格卡（sora/kling 级大模型逐字段写全）／custom 两档（按模型实力选，判断不了问用户）——通用骨架保证"想得对"，口味卡保证"喂得对"；custom 池踩坑回写沉淀，越用越准
 
 **回归测试**：`python -m unittest discover tests -v`（纯逻辑零网络；改 media_gen.py 后必跑）。
@@ -91,6 +102,14 @@ python scripts/media_gen.py image --provider zhipu --prompt "probe" --size 1024x
 
 ### Key 方案确认（体检后、拆镜前，必问）
 
+**Step 1.5 能力实测（新池/久未验证的池才跑）**：`status` 只报 key 家底，能力以实测为准——
+对要用的池跑 `media_gen.py caps probe <pool> --kind video --real`（出图池 `--kind image`），
+出片即落盘 `~/.workbuddy/.media_caps.json` 成为权威值；失败原因也落盘，照着改 env（`_TASK_PATH`/模型名）。
+`caps show` 可随时看三栏对照。**问② 清点"能出几个"时，优先报实测值而非 /models 猜的**；
+7 天内实测过就免跑（`caps show` 的生效源=measured 即可信）。
+实测快照会由 `media_gen.py caps sync` 同步进 `references/model-capabilities.md` 的自动区块
+（手改会被覆盖；区块外叙述文字机器不碰）；`caps sync --check` 做 drift 校验，导出/交接前跑一遍。
+
 `status` 已报出各池 key 家底，向用户确认三件事（**只问一次**，答案落 `shots/plan.json`）：
 
 **问① key 怎么搭配（谁出图、谁出视频）？**（问法要大白话："生图交给哪个模型、视频交给哪个模型"）
@@ -99,7 +118,7 @@ python scripts/media_gen.py image --provider zhipu --prompt "probe" --size 1024x
 - 用户选完由 agent 落 env（持久配置，问一次即可）；执行时 media_gen 按 `_ROLES` 自动路由，零改码
 
 **问② 开几发并行？**（先清点后发问，禁止预设数字；某阶段只有 1 个模型则该阶段直接跳过此问）
-- 跑 `status` 分两列清点：**能出图**的模型有几个、**能出视频**的模型有几个——把真实家底报给用户（如"能出图的模型有 5 个，最多同时 5 发"）；上限永远随接入数增长，不设固定数字，举例必须用真实清点数字
+- 跑 `status` 分两列清点：**能出图**的模型有几个、**能出视频**的模型有几个——把真实家底报给用户（如"能出图的模型有 5 个，最多同时 5 发"）；上限永远随接入数增长，不设固定数字，举例必须用真实清点数字。**"能出"以 `caps` 实测为准**（Step 1.5），/models 命中只是候选
 - 某阶段 ≥2 个模型才问：明说**可以混用不同模型**（`batch` 支持跨池混编：每个 worker 绑一个模型，不同模型同场开工），同时带一句大白话提醒："不同模型画风会不一样，介意的话可以指定只用某一个"
 - 图/视频家底不同时分两行问清，落 plan.json `workers_image` / `workers_video`
 
@@ -213,7 +232,12 @@ python scripts/media_gen.py video --provider zhipu --prompt "<i2v shotN>" \
 
 **硬约束**：
 - Agnes 视频 **num_frames ∈ {9,17,25,...,121}**（8n+1），脚本白名单校验；智谱视频不用 num_frames，用 `--duration 5|10` + `--video-size`
-- **negative_prompt**（Agnes）默认：`blurry, distorted faces, warped hands, extra limbs, text artifacts, watermark, camera shake, flickering, plastic skin, oversaturated`
+- **negative_prompt 按题材分档**（batch 自动选，优化⑧）：shot JSON 的 type/subject 命中关键词自动套对应档——
+  人物（防换脸/肢体乱）/ 风景（防画面脏乱）/ 产品（防光斑畸变）；未命中兜底通用
+  `blurry, distorted faces, warped hands, extra limbs, text artifacts, watermark, camera shake, flickering, plastic skin, oversaturated`。
+  手动指定 `--negative` 时显式覆盖自动档
+- **出镜前强制 prompt lint**（优化②）：batch 每镜先过 `scripts/prompt_lint.py`（slop 禁词 / 词数区间 t2i 120-220、i2v 40-80 / i2v 误写 subject），
+  FAIL 记 FAIL 不重试（prompt 问题重试也白烧额度）；`--no-lint` 可关
 - **节流**：Agnes 视频 1 RPM **按 key 计** / 智谱 5 RPM，脚本内自动等待
 - **N key 并行**（批量生成提速，推荐）：N 把 key = N 路独立 1RPM，吞吐 ×N。
   用 `batch` 子命令自动分队列，worker 按 `_ROLES` 过滤后轮流分镜，**不会重复生成同一镜**：
@@ -257,7 +281,7 @@ python scripts/postprocess.py concat clips/ \
   --slogan "文房四宝 · 皖美传承" --slogan-position left
 # slogan 默认：楷体 64px 白字+阴影，左侧负空间垂直居中，距结尾 4s 淡入 0.8s
 # 可调：--slogan-position bottom（底部居中）/--slogan-fade 秒 / --slogan-at 秒
-# 字体自动探测（楷体>雅黑>黑体>宋体），可用环境变量 FFMPEG_FONT 覆盖
+# 字体自动探测（楷体>雅黑>黑体>宋体），可用环境变量 _FFMPEG_FONT 覆盖（注意下划线前缀，#5）
 # --slogan 等价于在字幕列表末尾追加一条 dur=0（持续到片尾）的字幕
 ```
 
@@ -390,11 +414,13 @@ python scripts/vo_build.py vo/vo_lines.json --out vo/vo.m4a --total 55.94 --skip
 脚本会做：越界检查（实际时长 > 到下一句的间隔则警告）→ 静音底铺满总长 → 各句精确落位 →
 输出 `subtitles_final.json` → 报告有声/留白占比（公益片留白 40-50% 较合适）。
 
-**TTS 未配置 key 时**脚本会明确报错并给出配置指引（不是静默失败）。渠道优先级：
-1. 本地 Edge TTS 服务（`http://localhost:5050/v1`，OpenAI 兼容，免费无限、不耗 key；音色 zh-CN-XiaoxiaoNeural/YunxiNeural 等，支持 `--speed`）
-2. Gitee AI 的 Spark-TTS / CosyVoice（免费额度，需新 key）
-3. 用户自录（版权零风险，最稳）
-4. 智谱 CogTTS（需付费资源包，用前先确认用户愿意花）
+**TTS 未配置 key 时**脚本会明确报错并给出配置指引（不是静默失败）。渠道优先级（多 key 自动 failover，`media_gen.py tts` 按 n 依次试、成功即停，**每把 key 连音色一起切**）：
+1. **硅基流动 CosyVoice2-0.5B**（`api.siliconflow.cn/v1`，OpenAI 兼容；中文情感强——`--emotion 高兴/悲伤/激昂…` 走**文本引导**"你能用{情感}的情感说吗"拼进正文，音色用预置 `FunAudioLLM/CosyVoice2-0.5B:<name>` 或用上传的自定义音色）——默认主力
+2. **本地 Edge TTS 服务**（`localhost:5050/v1`，免费无限；音色 zh-CN-XiaoxiaoNeural 女 / YunxiNeural 男——**无情感、平铺直叙，仅作降级兜底**，MEDIA_TTS_2_VOICE 自动切）
+3. **用户自录**（版权零风险，最稳；`--skip-tts` 只拼接打轴）
+4. 情感词表与场景→语速/音色/情感组合见 `references/voice-guide.md`（声音风格卡）
+
+**vo_lines.json 逐句声音属性**（情绪节奏靠它，别整篇念经）：每行可带 `voice`(逐句换音色) / `emotion`(高兴/悲伤/激昂/温柔/平稳/俏皮/严肃/沉稳…) / `speed`(语速倍率)，省略则用命令行 `--voice/--speed` 全局值——高潮句用激昂档、情感独白用温柔档、产品介绍用平稳档（组合建议见风格卡）。
 
 `media_gen.py status` 会显示 TTS 配置行并发极短小样探测链路真通（不走 /models——Edge 系服务返回空列表会误报；探测音色双降级 Cherry→zh-CN-XiaoxiaoNeural，兼容云端与本地 Edge 服务）。
 
@@ -402,10 +428,22 @@ python scripts/vo_build.py vo/vo_lines.json --out vo/vo.m4a --total 55.94 --skip
 
 ## QC 闭环（生成后验收：让 prompt 优化从开环变闭环）
 
-只写不验 = 抽卡。每段视频生成后必须验收，不合格按诊断表**单变量重拍**：
+只写不验 = 抽卡。每段视频生成后必须验收，不合格按诊断表**单变量重拍**。
+
+**第一道·机器门禁（先跑，零成本）**：`qcgate` 把机器能判的"明显生成失败"就地拦下——
+≥80% 帧近黑（失败/审核拒/纯色）、规格不达标 → FAIL；过曝/完全静帧 → WARN。
+美学崩坏（手/脸/穿模）它**不硬判**，那部分交给下面的抽帧人眼，避免误杀好片。
 
 ```bash
-# 单段抽首/中/尾 3 帧
+# 单段机器门禁（PASS/WARN/FAIL + exit code，FAIL 时 --retry-failed 自动重跑）
+python scripts/postprocess.py qcgate clips/clip_05.mp4
+# 批量生成时就地过门禁（推荐，#4）：FAIL 的镜记为 FAIL，配合 --retry-failed 重跑
+python scripts/media_gen.py batch shots60/ --phase videos --workers 2 --qcgate
+# 跨镜首帧一致性粗检（v3.1.8）：HSV 直方图相邻对比，抓"某镜风格跑偏"（混编画风跳变）
+# WARN 报告不拦流程：跑偏镜单独重拍，或整体统一调色；concat 阶段自动跑（--no-qcseq 关）
+python scripts/postprocess.py qcseq clips/
+python scripts/media_gen.py run shots60/ --stop-after concat   # 内含 qcseq 粗检
+# 单段抽首/中/尾 3 帧（人眼/视觉模型验收）
 python scripts/media_gen.py qc clips/clip_05.mp4 qc_frames/
 # 或批量生成时自动抽（推荐）
 python scripts/media_gen.py batch shots60/ --phase videos --workers 2 --qc
@@ -428,6 +466,38 @@ python scripts/media_gen.py batch shots60/ --phase videos --workers 2 --qc
 - `final.mp4`（成片）+ `shots/`（关键帧）+ `clips/`（原始视频）+ `state.json`（过程记录）
 - 用 `present_files` 展示 final.mp4
 - 附分镜表（每镜的英文 prompt + i2v prompt + 实际选择）
+
+---
+
+## 一键编排（Step 2-6 串起来，#1）
+
+Step 1 六问落 `plan.json` + Step 2/3 写完分镜与 prompt 后，一条命令跑完出图→出视频→(缓推)→声音→后期：
+
+```bash
+python scripts/media_gen.py run shots60/ --dry-run          # 统一入口（= pipeline.py），先看各阶段命令
+python scripts/media_gen.py envcheck                         # #65 开跑前体检：ffmpeg/PIL/字体/key env/本地服务
+python scripts/media_gen.py clean shots60/                   # #66 产物治理：scan-only 清单；--yes 移入 .trash；--purge 真删
+python scripts/media_gen.py audit shots60/                   # 进度审计：每镜状态 + 下一步
+python scripts/media_gen.py audit shots60/                  # 进度盘点：每镜出图/出片/失败 + 下一步
+python scripts/media_gen.py run shots60/ --qcgate           # 视频阶段过机器门禁
+python scripts/media_gen.py run shots60/ --stop-after images# 每阶段人工把关
+python scripts/media_gen.py run shots60/ --watermark <渠道> --watermark-dry-run  # 交付出前只列待抹水印档
+```
+
+**阶段**（顺序固定，`--stop-after` 提前停）：`images`（全镜出图）→ `videos`（full 全镜 / hybrid 只 `hero_shots`，靠 batch `--only`）→ `harvest` → `kenburns`（只补缺失 clip 的镜）→ `sound`（有 `shots/vo_lines.json` 才跑 vo_build 出旁白+字幕，自动带进 concat）→ `concat`（后期+声音三件套+xfade+自检→final）→ `watermark`（可选：`--watermark <provider>` 走 delogo，`--watermark-dry-run` 只出红框自检图不真抹）。
+
+**编排边界（硬规则）**：
+- **只做编排，不做审美决策**——mode / 重点镜 / 池顺序 / 水印全读 `plan.json`（那是问过用户的结果）。
+  plan.json 缺 mode 或 hybrid 缺 hero_shots → **直接 die 退回 Step 1**，绝不默认 full。
+- **出镜前强制 prompt lint**：videos 阶段先对全部镜 i2v_prompt 过 `prompt_lint.py`（slop 禁词/词数越界/误写 subject），
+  FAIL 直接 die(3) 退回改写——**别让 slop 词白烧额度**；batch 侧逐镜再拦一道（lint FAIL 记 FAIL 不重试）。`--no-lint` 可关。
+- **超时交还 agent**：videos 有镜超时在途（提交已扣）→ pipeline 以 **exit 4** 停，按「视频超时询问协议」
+  问用户三选（切池/续等/放弃），不自动重试防重复扣费；出片后 `harvest` 收割、`--retry-failed` 补跑。
+- **停在 QC 门前**：concat 一完即停——视觉验收（抽帧美学）必须人看，机器门禁可先 `qcgate final.mp4`。
+
+**断点续跑**：每阶段都幂等（images/videos 有产物即跳过，kenburns 只补缺失镜），中途失败重跑即可续。
+执行清单落 `shots/pipeline_run.json` 可追溯。命令行脚本入口记不住没关系：`media_gen.py run`（编排）/ `audit`（盘点）是统一门面，
+底层转发给 `pipeline.py`（参数单一事实源）。
 
 ---
 
@@ -460,3 +530,14 @@ python scripts/media_gen.py batch shots60/ --phase videos --workers 2 --qc
 ## 扩容指南（多 key / 新 provider 接入）
 
 完整模板与步骤已外置 → `references/provider-setup.md`（加 key、通用池零改码接入、一等公民沉淀路径、序号连续规则）。
+
+## 维护本 skill 时（改脚本必读）
+
+**改完 scripts/ 下任何文件，提交前必须做完这三步**——它们各自真实拦下过一次事故：
+
+1. **AST 结构校验**：抽取/移动函数时，`def` 缩进错位会把函数体拦腰截断，Python 不报错、语法完全合法，只是后半段变成不可达死代码。已发生两次（v3.1 postprocess `_escape_drawtext`、v3.1.2 copy.py `clean_text`）。用 `ast.parse` 打印各函数起止行、确认 `main()` 实际调用了它该调的东西。
+2. **CLI 冒烟**：至少跑一次真实入口（`python scripts/copy.py --help` 级别也行），确认不是静默 exit 0。
+3. **测试要覆盖 main 层**：只测被抽出的纯函数会掩盖第 1 类事故（46 项全绿却没发现 copy.py 根本不落盘）。新增 CLI 能力时，端到端测试与单函数测试同等必要。
+4. **跨平台 glob 要警惕大小写**：Windows 的文件 glob 大小写不敏感——`glob("S*.json")` 与 `glob("shot_*.json")` 都会匹配 `shot_01.json`，两 pattern 拼接不去重就每镜双跑（Linux/macOS 不复现，只在 Windows 静默出错）。已发生一次（v3.1.5 抓出，mg_batch/pipeline 共用 `mg_core.list_shot_files` 单源去重）。新写"多 pattern 收集"时一律走它或按解析路径去重。
+
+另：`batch` 每个分镜是**独立 subprocess**，任何"读改写"状态都必须走 `_update_state()`（跨进程锁 + 原子写），内存 dict / `threading.Lock` 一律无效；产物扩展名判断统一走 `PRODUCT_EXTS`（有的池出 .webp 动图）。

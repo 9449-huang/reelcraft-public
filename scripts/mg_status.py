@@ -8,6 +8,7 @@ from mg_core import (
     die,
     key_mask,
     list_keys,
+    run_capture,
 )
 import argparse
 import base64
@@ -49,7 +50,7 @@ def cmd_qc(args) -> None:
     outdir.mkdir(parents=True, exist_ok=True)
     dur = 5.0
     # 用 ffmpeg 探测时长
-    probe_out = subprocess.run([ffmpeg, "-i", str(src)], capture_output=True, text=True).stderr
+    probe_out = run_capture([ffmpeg, "-i", str(src)]).stderr
     m = re.search(r"Duration:\s*(\d+):(\d+):(\d+\.\d+)", probe_out)
     if m:
         dur = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
@@ -184,7 +185,8 @@ def cmd_status(args) -> None:
 
 # ─── plan 校验（字段拼错静默失效是坑）────────────────────
 PLAN_KNOWN_KEYS = {"role_assign", "workers", "workers_image", "workers_video",
-                   "watermark", "mode", "hero_shots", "video_pool_order", "tier_map"}
+                   "watermark", "mode", "hero_shots", "video_pool_order", "tier_map",
+                   "xfade", "freeze_last"}   # xfade/freeze_last：pipeline concat 阶段读
 
 def cmd_plan_check(args) -> None:
     """校验 plan.json：未知键 warn（拼错会被静默忽略）、枚举值/类型检查。"""
