@@ -2,6 +2,193 @@
 
 > 历史演进记录，从 SKILL.md 外置（2026-09-06, v2.9）——SKILL.md 只保留当前有效指令，读历史到这来。
 
+## 版本速查表（结构化索引）
+
+> 回滚定位用：撞上"自己造的 bug"→ 用表里 commit 直接 `git diff <上一版commit>..<坏版本commit>` 看引入点，
+> 或在 `git log` 里 `git show <commit>` 逐项核对。**回滚 = `git checkout <commit>^ -- scripts/ tests/` 拿回上一版文件**。
+> 测试数 = 该版本全量 unittest 通项（skipped 不计）。
+
+| 版本 | 日期 | commit | 测试数 | 一句话概括 | 引入了什么隐患（回滚重点） |
+|---|---|---|---|---|---|
+| v3.1.11 | 2026-09-08 | （待提交） | 163 | 复核修复批：watermark 提升 stop + qcseq 错误中断 + 中文词数折算 + negative 词界 + 导出防护 | watermark 自动提 stop 改变运行边界；qcseq exit2 现在会中断（此前静默放行） |
+| v3.1.10 | 2026-09-07 | e8bd3cf | 150 | TTS 升级：硅基流动 CosyVoice2 主力 + 多 key failover + 情感/逐句声音参数 + 声音风格卡 | tts 默认音色从 Cherry 改为 env 驱动（旧写法失效）；emotion 只对 CosyVoice 系生效 |
+| v3.1.9 | 2026-09-07 | 21dccea | 144 | envcheck 环境自检 + clean 产物治理（#65/#66） | clean --purge 不可逆；envcheck 本地服务探测受本机服务状态影响 |
+| v3.1.8 | 2026-09-07 | 7083c10 | 131 | qcseq 跨镜一致性粗检 + caps sync 文档单源化 + 导出残留清理 | qcseq 阈值判据可能误杀（组合判据已防明度误判）；md 快照区块勿手改 |
+| v3.1.7 | 2026-09-07 | 86816b1 | 117 | pipeline 补完 end-to-end + prompt_lint + 负面分档 + 统一入口/审计 | run/audit 是新入口；lint 默认强制（旧 shots 目录需 --no-lint） |
+| v3.1.6 | 2026-09-07 | f2f03f8 | 87 | PENDING→exit4 链路 + cmd_video 认 .webp + caps 写读对齐 + P2 四项 | batch 退出码语义变化（0/1/4）；pipeline lint 前需 --no-lint 场景 |
+| v3.1.5 | 2026-09-07 | b2fd4b0 | 73 | 一键编排 pipeline.py（#1）+ Windows glob 去重 bug | pipeline 是新增编排入口，改动面大 |
+| v3.1.4 | 2026-09-07 | aa3fe7a | 66 | QC 硬门禁 qcgate（#4） | 门禁阈值可能误杀（WARN 不硬拦，设计如此） |
+| v3.1.3 | 2026-09-07 | 609f574 | 63 | 能力单源化 mg_caps（#2）+ ffmpeg 管线真冒烟（#6） | caps 写读 key 错位（v3.1.6 才修）；effective 非唯一出口 |
+| v3.1.2 | 2026-09-07 | 41c491b | 53 | copy.py main 截断 P0 + 锁静默降级 + #2/#3/#4 遗漏点 | — |
+| v3.1.1 | 2026-09-06 | 827f206 | — | status 纳 TTS 池 + 小样合成探测 | TTS 探测会真发合成请求（耗少量额度） |
+| v3.1 | 2026-09-06 | 59d570d | — | 本地 Edge TTS 接入 key 池 | TTS 依赖本地服务（localhost:5050）在线 |
+| v3.0 | 2026-09-06 | 8d3a975 | 27 | 通用化中性化（去赛事归属） | 公开仓剔除私有池，私有能力不在公开版 |
+| v2.9 | 2026-09-05 | c37fa8e | — | 公开仓体检修复 | — |
+
+## v3.1.11（2026-09-08）
+
+外部复核修复批（逐条核验后只修真问题；误报项不改并记录理由）：
+
+- **P2-1 水印静默跳过**：`--watermark` 已给但 stop_after 不含 watermark → 自动提升 stop 到
+  watermark + 打印提示（此前"以为做了 dry-run，实际一行没跑"）。
+- **P2-2 qcseq 真错误被吞**：区分 exit——1=WARN 提示放行 / ≥2=真错误（输入错/抽帧失败）
+  中断 pipeline，不再当色调跳变提示放过。
+- **P2-5 prompt_lint 中文按字计词失真**：改中英信息密度折算（中文 ≈1.8 字/词）——
+  纯中文/中英混排不再虚高爆 220 上限；200 字中文 ≈167 词语义相当。
+- **P3-1 negative_for_shot 子串误档**：英文关键词改词边界（`(?<![a-z])…(?![a-z])`）——
+  "naturally" 不再误中 nature、"produce" 不再误中 product；中文关键词保持子串。
+- **P3-7 qcseq 结果落盘**：pipeline_run.json 记 qcseq rc/note，audit 显示"上次 qcseq"。
+- **P3-2/P3-3 导出加固**：目标目录名必须含 reelcraft_public（防 argv 误配 rmtree 误删）；
+  语法校验动态收集全部 scripts/*.py（新增脚本不漏，"N 脚本通过"不再是写死文案）。
+- **P2-6 UTF-8 运行前提文档化**：SKILL.md 加"中文 Windows 必读"——需 PYTHONIOENCODING=utf-8
+  或 UTF-8 终端（裸 GBK 控制台跑会因 ✅/⚠️ 等非 GBK 字符 print 崩溃）。
+- **误报澄清（未修）**：P1"三处 subprocess 无 encoding"全部不实——delogo:55/mg_core:329
+  (run_capture)/vo_build:48 均已带 encoding="utf-8"（v3.1.6 修过，跨行写法）；GBK 崩的真凶是
+  print emoji，由 P2-6 文档覆盖。P2-3 测试数/P2-4 envcheck 入日志/P3-6 envcheck 无单测 均为
+  误报/口径误解（encheck 已有 TestEnvcheck 8 项）。
+- **P3-5 子链端到端真跑补课**：lavfi 造 2 片带音轨 → qcseq（真跳变 WARN）→ vo_build
+  （硅基 TTS 温柔+激昂 2 句）→ concat --voice/--subtitles/--slogan（audio=True）→
+  delogo --dry-run 红框标注，全链零视频 API 冒烟通过。
+- 测试 150→**163 项**（词数折算×4 / negative 词界×4 / watermark 提升×2 / qcseq 中断×2 / 导出防护×1）。
+
+## v3.1.10（2026-09-07）
+
+TTS 声音线升级（用户拍板：接硅基流动 + 方案 A+C）：
+
+- **主力渠道切硅基流动 CosyVoice2-0.5B**：`MEDIA_TTS_1_*` = `api.siliconflow.cn/v1`
+  （OpenAI 兼容 /audio/speech），本地 Edge TTS 降为 `MEDIA_TTS_2` 兜底。实测出片
+  ✓（69KB/4.3s 情感引导生效）。key 只进 `~/.workbuddy/media_keys.env`，不进 repo。
+- **TTS 多 key 自动 failover**：`cmd_tts` 从"只读 TTS_1"改为按序号扫描（遇配置后
+  连续空号停），key#n 失败自动降级下一把；**每把 key 可独立 `_VOICE`，降级时音色
+  自动跟随切换**（硅基挂 → Edge 女声兜底）。全挂 exit 3 明示。
+- **情感参数 `--emotion`**：CosyVoice 系情感走文本引导——`你能用{情感}的情感说吗，`
+  拼进正文（`_tts_emotion_prefix` 纯函数，6 项新测试）。
+- **vo_build 逐句声音属性**：vo_lines.json 每行可带 `voice`/`emotion`/`speed`，
+  覆盖全局默认——高潮句激昂档、独白温柔档，情绪节奏机器化。
+- **声音风格卡 `references/voice-guide.md`**（新）：场景→语速/情感/音色组合表 +
+  情感词表（含 `[laughter]` 等官方标记）+ 自定义音色说明 + vo_lines 完整示例。
+- 测试 144→**150 项**（TestTtsFailover ×4 + TestVoBuildPerLine ×2）。
+
+## v3.1.9（2026-09-07）
+
+运维侧两件套（#65/#66）——不出片，但让"多轮试拍"不翻车：
+
+- **#65 envcheck 开跑前体检**：`media_gen.py envcheck`（= envcheck.py）13 项检查——
+  python/ffmpeg/libx264/PIL/中文字体/各池 key env/本地服务 TCP 探测/caps 可读性。
+  设计纪律：本地 base 挂 → fail；远程 API 不探（能力看 caps，网络抖动不当环境故障）；
+  **key 值绝不进结果**（单测钉死，envcheck 常被截图贴日志）；`scan_key_env` 修
+  `list_keys` 遇"KEY 在 BASE 缺"静默吞后续序号的盲区（断档显式报）。
+  exit：0 全过（warn 允许）/ 1 有 fail。
+- **#66 clean 产物治理**：`pipeline.py clean <shots>`（audit 同胞）。默认 **scan-only**
+  只列清单；`--yes` 把可再生产物（frames/clips/qc_frames/临时文件）移入
+  `.trash/<时间戳>/`（**Trash, not delete，可反悔**）；`--purge` 才真删。
+  源（shots JSON/plan/vo_lines）、账单（batch_run.json）、成片（final*）永不触碰。
+- **测试污染修复**：TestEnvcheck 曾写坏并误删用户真实 `.media_caps.json`
+  （冒烟时 envcheck 报"无实测记录"暴露）——重定向 tmp 修复，实测记录已从 md
+  快照恢复。测试 131→**144 项**。
+
+## v3.1.8（2026-09-07）
+
+优化批 ⑤⑥ —— QC 闭环补上"跨镜视角"、能力文档从手抄变生成物：
+
+- **优化⑤ qcseq 跨镜首帧一致性粗检**：postprocess 新增 `qcseq` 子命令——抽每段首帧 →
+  HSV 直方图（H12×S3×V3 桶）相邻 Bhattacharyya 对比。WARN = BC 阈值下 **且** 色相/饱和度
+  确实漂移（组合判据：纯 BC 判据会把"同色相不同明度"误杀成 BC=0，已用单测钉死）；
+  彩色↔黑白（ΔS 跳变）也会报。WARN 报告不拦流程（跑偏镜重拍/整体调色是人的决策）；
+  pipeline concat 阶段自动跑（--no-qcseq 关），`media_gen run` 同步透传。实测快照：
+  stylegrid 看全貌人眼判，qcseq 给机器定量。测试 125→**131 项**（含 PIL 造图纯函数测试）。
+- **优化⑥ caps sync 文档单源化**：`model-capabilities.md` 内嵌 `<!-- caps-auto -->` 区块，
+  由 `~/.workbuddy/.media_caps.json` 生成——实测更新文档自动跟上，不再出现"第三个矛盾源"。
+  `caps sync` 重写区块（区块外叙述机器不碰）；`caps sync --check` drift 校验（不一致 exit 1）。
+- **导出残留清理（v3.1.7 遗留）**：v3.1.7 新增的测试/示例把私有池名字样带回公开仓
+  （自检必挂）——测试 tag/帮助文案改中性名，私有档测试方法加 `# private-begin` 标记，
+  SKIP_DIRS 补 `.pytest_cache`。重新导出自检 [OK] 零命中。
+
+## v3.1.7（2026-09-07）
+
+优化批 ②④⑦⑧⑨⑩⑪ —— 把"最后一公里"（词级约束 / 声音 / 去水印 / 文档回滚定位）机器化：
+
+- **优化④ pipeline 补完 end-to-end**：阶段扩为 images→videos→harvest→kenburns→**sound**→concat→**watermark**。
+  sound 阶段有 `shots/vo_lines.json` 才跑 vo_build（旁白+字幕，产物自动带进 concat，纯画面成片仍合法）；
+  concat 透传 plan.json 的 xfade/freeze_last（PLAN_KNOWN_KEYS 已补此二键，plan-check 不再 warn）；
+  watermark 阶段 `--watermark <provider> --watermark-dry-run` 只列待处理档/出红框自检图，目检后再真抹。
+- **优化⑦ CHANGELOG 结构化**：文件头加「版本速查表」（版本/日期/commit/测试数/一句话/回滚重点），
+  撞上自己造的 bug 可直接 `git diff <上一版commit>..<坏版本>` 定位、`git checkout <commit>^ -- scripts/` 回滚。
+- **优化⑧ 负面模板按题材分档**：mg_core 新增 `negative_for_shot()` + `NEGATIVE_TEMPLATES`（人物/风景/产品三套），
+  batch 出镜时按 shot 的 type/subject 关键词自动选档；未命中兜底原通用 negative；`--negative` 显式覆盖。
+- **优化⑨ 测试补三块盲区**：prompt 决策路径（batch lint 快照 PASS/FAIL）、xfade 管线（lavfi 两段实跑 concat --xfade）、
+  水印旁线（真实 watermark_profiles.json 读取 + 跨分辨率框缩放）。测试 95→**117 项**。
+- **优化⑩ 统一 CLI 入口**：`media_gen.py run <shots>`（转发 pipeline.py，参数单一事实源在 pipeline 侧，subprocess 转发
+  零重复实现 + 退出码透传）与 `media_gen.py audit <shots>`——用户不再需要记 pipeline.py 脚本名。
+- **优化⑪ plan.json 审计视图**：`pipeline.py audit <shots>`（= `media_gen.py audit`）一键盘点——
+  每镜 出图/出片/失败 状态（读 batch_run.json 标签对照 frames/clips 产物）+ 汇总 + 可执行下一步清单
+  （harvest 在途 / --retry-failed 补 FAIL / images 补缺帧 / 全出片→concat）。
+- 维护纪律追加：**编辑任何脚本后跑 AST 结构校验**（本批再犯一次：改 mg_core 时误删 natkey 函数体，
+  AST 立即抓出——纪律已生效）；测试 112→117 项。
+
+## v3.1.5（2026-09-07）
+
+架构整改第三批 —— **#1 一键编排 `pipeline.py`**（"流程依赖 agent 手工串联"）：
+
+- **新增 `scripts/pipeline.py`**：把 Step 2-6 的既有命令按 `plan.json` 串起来——
+  `images`（全镜出图）→ `videos`（full 全镜 / hybrid 只 `hero_shots`，靠 batch `--only`）→ `harvest` →
+  `kenburns`（只补缺失 clip 的镜）→ `concat`（后期+自检→final）。
+  **只做编排、不做审美决策**：mode / 重点镜 / 池顺序 / 水印全读 `plan.json`（那是问过用户的结果）；
+  **plan.json 缺 mode 或 hybrid 缺 hero_shots → 直接 die 退回 Step 1，绝不默认 full 替用户拍板**
+  （"绝不自动降级"在此同样成立）。videos 有镜超时在途 → **exit 4** 交还 agent 走超时三选协议（不自动重试防重复扣费）。
+  出片后**停在 QC 门前**（视觉验收必须人看）。每阶段幂等断点续跑，执行清单落 `shots/pipeline_run.json`。
+  `--dry-run` 预览各阶段命令；`--stop-after` 提前停；声音/字幕/xfade 参数透传给后期。
+- **`batch` 加 `--only`**（只跑指定镜号，按 shot_id）：hybrid 模式喂 `hero_shots` 用。
+- **抓出一个 Windows 专属 bug**：分镜枚举 `glob("S*.json")+glob("shot_*.json")` 在 **Windows 大小写不敏感**的
+  glob 下两个 pattern 都匹配 `shot_01.json` → 每镜被算两次（mg_batch 双跑 / pipeline 双缓推）。
+  Linux/macOS 不复现，只 Windows 静默出错。抽 `mg_core.list_shot_files()` 单源去重（按解析路径），
+  mg_batch 与 pipeline 共用；SKILL「维护本 skill 时」加第 4 条纪律"跨平台 glob 警惕大小写"。
+- 测试 66 → **73 项**：`TestPipelineOrchestration`（5，dry-run 不烧钱——hybrid 只跑 hero / stills 跳过视频 /
+  full 无 --only 无缓推 / **缺 mode 必须 die 不能猜** / hybrid 缺 hero 必须 die）+ `TestListShotFiles`（2，跨平台去重）。
+- SKILL 加"新用户导览"一键入口 + 「一键编排 pipeline.py」专章。
+
+## v3.1.4（2026-09-07）
+
+架构整改第二批 —— **#4 QC 硬门禁半自动**（"QC 未做满机器可验收"）：
+
+- **新增 `postprocess.py qcgate <video>`**：单段机器门禁，与 `check`（只查规格）互补——
+  补上"画面是不是坏的"这类机器能判项：
+  ① 规格（分辨率/时长/帧率，同 check 阈值）；
+  ② 抽 6 帧（沿时长均布）算 **近黑帧占比 / 过曝占比 / 相邻帧运动量**：
+  - ≥80% 帧近黑 → **FAIL**（生成失败/审核拒/纯色）
+  - ≥60% 帧过曝、或近乎完全静帧 → WARN（可能故意的淡入淡出/kenburns，交人眼）
+  - 输出 PASS/WARN/FAIL + exit code（0 过 / 2 拦），`--strict` 把 WARN 也升 FAIL
+  - 机器**判不了**的（手部/面部崩坏、主体漂移）**不硬判**——仍走 `qc` 抽帧人眼，避免误杀好片
+- **batch 加 `--qcgate`**：videos 阶段每镜出片后就地过门禁，FAIL 的镜记为 `FAIL` →
+  `--retry-failed` 自动重跑；`--qcgate-strict` 可选把 WARN 也纳入重跑。
+  只拦"明显生成失败"，不打断美学层面的重 roll 决策
+- 抽帧指标用 PIL `tobytes()`（灰度每字节一像素），弃 `getdata()`（Pillow 14 将移除）
+- 测试 63 → **66 项**：`TestFFmpegPipeline` 补 qcgate 好片 PASS / 纯黑片 FAIL / 低分辨率规格 FAIL（lavfi 造片零 API，实跑 postprocess.py qcgate）
+
+## v3.1.3（2026-09-07）
+
+架构整改第一批（用户拍板优先级：#2 能力单源化最高、#6 管线测试次之）：
+
+- **#2 能力单源化（声明=候选，实测=权威）**：新增 `scripts/mg_caps.py` + `media_gen.py caps` 子命令（show / probe / clear）。整改前"这个池到底支持什么"有三个互相矛盾的答案（PROVIDERS 硬编码 / status 的 /models 关键字猜 / 真跑才知道但不落盘）；现在收敛成一条链：声明（PROVIDERS，候选与默认）→ `caps probe <pool> --kind image|video --real`（真发一次最小请求，subprocess 调 media_gen 自身，端到端零重复实现）→ 落盘 `~/.workbuddy/.media_caps.json`（权威）→ `effective()` 唯一出口。**新后端接入从此零改码**：配 env → probe --real 验一次 → 后续所有决策自动采用。/models 探测降级为"线索"（method=models-guess 不当权威）；实测 7 天过期自动回落声明。实测即抓真实现象：请求 1024x576、agnes 实际出 1312x736（`caps show` 会标 ⚠ 请求≠实测）
+- **#6 ffmpeg 管线真冒烟测试**：新增 `TestFFmpegPipeline`（4 项）——lavfi testsrc+sine 零 API 造片，实跑 `postprocess.py concat` 三条真实路径：同规格 -c copy 直切 / 混分辨率转码 / **同分辨率不同 codec（h264 vs vp9）必须转码**（#4 回归钉：旧签名只比分辨率这条会变红）/ **filter 分支带音轨不丢**（#4 回归钉：旧代码写死 a=0）。此前 postprocess 的拼接分支只有"读代码觉得对"
+- **测试修复**：TestCapsSource 漏 import time（3 处 NameError）+ test_clear 数据漏 probed_at_ts 被误判过期（断言错在测试数据，代码逻辑正确）
+- **copy.py**：`open().write()` 未关文件（ResourceWarning）改 with 语句
+- SKILL.md：能力探测表述升级为"能力单源"，新增 Step 1.5（新池/久未验证先 `caps probe --real`；问②清点以实测为准）
+- 测试 53 → **63 项**（新增 6 caps 单测 + 4 ffmpeg 管线冒烟），全绿
+
+## v3.1.2（2026-09-07）
+
+复核 v3.1.1 那轮 11 条修复（外部审查报告）后的补漏，全部由"改代码 skills"两轴复核（Standards / Spec）抓出：
+
+- **P0 `copy.py` main() 被拦腰截断（本轮修复自己造的）**：#10 抽 `clean_text` 时 `def` 写成了 0 缩进，插进 `main()` 体内 → main 在 122 行提前结束，调用 chat / 写文件那段变成 `return` 之后的死代码，CLI 静默 exit 0 不产出任何文案；死代码还引用了已变成 `clean_text` 局部变量的 `lines`（光调缩进也修不好）。**测试 46 项全绿却完全没发现**——因为只 import 了 `clean_text` 单函数，没人跑 `main()`。修复：函数提到 main 之前，调用链复原，条数改由 `out.splitlines()` 统计。**这是同类事故第二次**（v3.1 修 postprocess 时把 `_escape_drawtext` 误插进 `cmd_concat` 尾部），故新增纪律：编辑任何脚本后必须做 AST 结构校验 + CLI 冒烟；纯函数测试之外至少有一条端到端 main 层测试
+- **#1 锁的静默降级**：`_FileLock` 用 `msvcrt.LK_LOCK`，高争用时内核盲重试约 9–10s 后抛 `OSError`，被 `except` 吞掉 → `fd=None` 降级无锁、且句柄从不关闭（泄漏）。等于跨进程保护在 batch 高并发下悄悄失效却无人知晓。改：非阻塞 `LK_NBLCK` + 自旋到 30s 预算自持，失败关句柄并向 stderr 告警（同锁只报一次）。**实测**：8 进程 ×100 次 `_update_state` 累加 = 800/800 无丢更新；拆掉锁的对照组直接撞 `PermissionError`（连原子写都互冲突）
+- **#2 排序漏点**：`postprocess` 三处仍字典序（stylegrid 帧收集、webp2mp4 目标、kenburns 帧序列），与 natkey 注释自称冲突 → 全改 natkey；`mg_batch` 打印在生成中的镜号同理
+- **#3 拼接漏点**：`cmd_concat` 仍只 glob `clip_*.mp4`，.webp 分镜进不了成片 → 收集逻辑抽出 `_collect_clips()`（可单测），扩展名统一走 `PRODUCT_EXTS`；含非 mp4 分片时强制重编码（webp 动图进 concat demuxer 不可靠）
+- **#4 一致性签名只比分辨率**：同分辨率不同编码（h264 vs vp9）仍走 `-c copy` 直拼 → probe 增补 `codec`、签名改三元组；filter 重编码分支原写死 `a=0` 会静默丢环境音（xfade 分支是保音轨的，两分支不对称）→ 按 `all(audio)` 补音频链
+- **#5 文档不一致**：SKILL.md 字体变量写作 `FFMPEG_FONT`，代码是 `_FFMPEG_FONT`
+- **清理**：删除已无调用者的 `_save_state()`（读改写竞态入口，留着会被误用回退）；`_download` 临时名带 pid（两 subprocess 同 out 曾互串）+ 失败清理残骸；节流文件惰性清理超过 1 天的 tag；`PRODUCT_EXTS` 常量收敛（此前 mg_batch 两处手写 `.mp4/.webp`）
+- **测试 46 → 53**：新增 copy.main 端到端落盘冒烟、_FileLock 句柄释放、_download 失败无残骸、`_collect_clips` 自然序+webp、probe codec 解析
+
 ## v3.1.1（2026-09-06）
 
 - **status 纳入 TTS 池**：v3.1 把本地 TTS 排成第一渠道但 status 里完全不可见（TTS 是 cmd_tts 硬编码单 key，不入 PROVIDERS 通用枚举）——本次在 cmd_status 补 TTS 专项段：配置行（key 掩码 + base + model，未配则并入 no_keys 提示）+ 小样合成探测。**探测不走 /models**（本地 Edge TTS 等服务 /models 返回空列表会误报），改发一次极短 /audio/speech 小样验证链路真通；音色双降级 Cherry→zh-CN-XiaoxiaoNeural（实测本地 Edge 服务拒 OpenAI 音色名 500，云端 OpenAI 系相反，双降级两边都覆盖）

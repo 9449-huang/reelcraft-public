@@ -64,6 +64,22 @@ CONSTRAINTS = """硬性要求：
 SYSTEM = "你是广告文案，厌恶空话套话，擅长用具体细节替代形容词。"
 
 
+def clean_text(text: str) -> str:
+    """清洗模型输出：去序号（只剥"数字+分隔符/括号包数字"形态）、去空行、去 markdown 符号。"""
+    lines = []
+    for ln in text.splitlines():
+        s = ln.strip().lstrip("-*·").strip()
+        s = "".join(ch for ch in s if ch not in "**`")
+        # 只剥"序号"形态（数字+分隔符 / 括号包数字），
+        # 别裸剥数字开头的中文文案（如"30年的墨"→"年的墨"，#10）
+        m = re.match(r"^(?:\d+[.、)）]\s*|[（(]\d+[）)]\s*)", s)
+        if m:
+            s = s[m.end():]
+        if s:
+            lines.append(s)
+    return "\n".join(lines)
+
+
 def chat(base: str, key: str, model: str, system: str, user: str,
          temperature: float, tries: int = 3) -> str:
     body = {"model": model,
@@ -120,20 +136,14 @@ def main() -> None:
     if args.provider == "zhipu":
         print("[copy] 提示：智谱免费档文本模型限流严重（实测持续 429），建议用 agnes",
               file=sys.stderr)
+
     text = chat(base, key, args.model, SYSTEM, user, args.temperature)
 
-    # 清洗：去序号、去空行、去 markdown 符号
-    lines = []
-    for ln in text.splitlines():
-        s = ln.strip().lstrip("-*·").strip()
-        s = "".join(ch for ch in s if ch not in "**`")
-        while s and (s[0].isdigit() or s[0] in ".)、"):
-            s = s[1:].lstrip(". )、")
-        if s:
-            lines.append(s)
-    out = "\n".join(lines)
+    out = clean_text(text)
+    lines = out.splitlines()
     if args.out:
-        open(args.out, "w", encoding="utf-8").write(out + "\n")
+        with open(args.out, "w", encoding="utf-8") as f:
+            f.write(out + "\n")
         print(f"[copy] -> {args.out}  ({len(lines)} 条)")
     else:
         print(out)

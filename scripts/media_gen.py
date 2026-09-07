@@ -5,7 +5,9 @@ from mg_core import (
     AllKeysFailed,
     PROVIDERS,
     _abs_url,
+    _download,
     _download_image,
+    _extract_video_url,
     _final_out,
     _gen_image_once,
     _image_rpm_for,
@@ -24,6 +26,7 @@ from mg_core import (
 )
 from mg_batch import cmd_batch, cmd_harvest
 from mg_status import cmd_status, cmd_qc, cmd_last_frame, cmd_plan_check
+import mg_caps                      # 能力单源（#2）：声明=候选，实测=权威
 import argparse
 import base64
 import json
@@ -137,13 +140,15 @@ def cmd_video(args) -> None:
         tag = f"{pool}_key{args.pin_key}" if args.pin_key else f"{pool}_shared"
         video_throttle(rpm, tag)
 
-    # 断点续跑（已存在则跳过，不白等节流）
-    out = args.out
-    if os.path.exists(out) and os.path.getsize(out) > 0:
-        print(f"[media_gen] 已存在 {out}，跳过生成", file=sys.stderr)
+    # 断点续跑（已存在则跳过，不白等节流；产物可能因上游落成 .webp——
+    # 只查 args.out 会把已完成镜误判为未完成而重复提交扣费，#3 单命令漏网点）
+    existing = find_existing_product(args.out)
+    if existing:
+        print(f"[media_gen] 已存在 {existing}，跳过生成", file=sys.stderr)
         return
 
     errs: list[str] = []
+    out = args.out
     resp = used_key = None
     for pool, info, eff_size, eff_dur in valid:
         def call_fn(k: dict, _info=info, _prefix=PROVIDERS[pool]["key_env_prefix"],
@@ -197,12 +202,12 @@ def cmd_video(args) -> None:
     provider = used_key["pool"]
     info = PROVIDERS[provider]["models"]["video"]
     video_id = resp.get("video_id") or resp.get("id") or resp.get("task_id")
-    direct_url = resp.get("video_url") or resp.get("url")
-    du = _abs_url(direct_url, used_key.get("base", ""))
+    # 同步出片 URL 复用统一解析（兼容 video_url/url/data dict/data list，#8）
+    du = _abs_url(_extract_video_url(resp), used_key.get("base", ""))
     if isinstance(du, str) and du.startswith("http"):
         os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
         out = _final_out(out, du)
-        urllib.request.urlretrieve(du, out)
+        _download(du, out)
         print(f"[media_gen] video OK via {provider} key#{used_key['n']} -> {out}")
         return
     if not video_id:
@@ -260,45 +265,114 @@ def cmd_edit(args) -> None:
                 die(f"成功但无图: {json.dumps(st, ensure_ascii=False)[:300]}")
             out = args.out
             os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
-            urllib.request.urlretrieve(imgs[0], out)
+            _download(imgs[0], out)
             print(f"[media_gen] edit OK via {provider} -> {out}")
             return
         if status in ("FAILED", "FAIL", "ERROR"):
             die(f"编辑任务失败: {json.dumps(st, ensure_ascii=False)[:300]}")
     die("编辑轮询超时 5 分钟")
+def cmd_run(args) -> None:
+    """优化⑩：一键编排入口——转发 pipeline.py（参数单一事实源在 pipeline 侧）。
+    subprocess 转发而非 import cmd：直接复用 pipeline 的 argparse/退出码，零重复实现。"""
+    pipe = str(Path(__file__).resolve().parent / "pipeline.py")
+    cmd = [sys.executable, pipe, args.shots]
+    for flag in ("--final", "--stop-after", "--target-res", "--bgm",
+                 "--slogan", "--slogan-position", "--provider-image", "--provider-video",
+                 "--workers-image", "--workers-video", "--watermark"):
+        val = getattr(args, flag[2:].replace("-", "_"), "")
+        if val:
+            cmd += [flag, str(val)]
+    for flag in ("--dry-run", "--qcgate", "--qcgate-strict", "--retry-failed",
+                 "--no-lint", "--no-qcseq", "--watermark-dry-run"):
+        if getattr(args, flag[2:].replace("-", "_"), False):
+            cmd.append(flag)
+    sys.exit(subprocess.call(cmd))
+
+
+def cmd_audit(args) -> None:
+    """优化⑪：项目进度审计——转发 pipeline.py audit。"""
+    pipe = str(Path(__file__).resolve().parent / "pipeline.py")
+    sys.exit(subprocess.call([sys.executable, pipe, "audit", args.shots]))
+
+
+def cmd_envcheck(args) -> None:
+    """#65：外部环境自检——转发 envcheck.py（subprocess 零重复实现）。"""
+    ec = str(Path(__file__).resolve().parent / "envcheck.py")
+    sys.exit(subprocess.call([sys.executable, ec]))
+
+
+def cmd_clean(args) -> None:
+    """#66：工作区产物治理——转发 pipeline.py clean（scan-only 默认）。"""
+    pipe = str(Path(__file__).resolve().parent / "pipeline.py")
+    cmd = [sys.executable, pipe, "clean", args.shots]
+    if getattr(args, "yes", False):
+        cmd.append("--yes")
+    if getattr(args, "purge", False):
+        cmd.append("--purge")
+    sys.exit(subprocess.call(cmd))
+
+
+def _tts_emotion_prefix(emotion: str) -> str:
+    """CosyVoice 系 TTS 的情感走文本引导（官方示例句式），拼在正文前。
+    空情感返回空串（原样合成）。纯函数可单测。"""
+    e = (emotion or "").strip()
+    return f"你能用{e}的情感说吗，" if e else ""
+
+
 def cmd_tts(args) -> None:
-    """OpenAI 兼容 /audio/speech 接口。
+    """OpenAI 兼容 /audio/speech 接口。多把 key 自动 failover（n 从 1 依次试，成功即停）；
+    每把 key 可独立 MEDIA_TTS_<n>_VOICE（降级时音色自动切换）；--emotion 走文本引导。
     配置：media_keys.env 加
       export MEDIA_TTS_1_KEY="xxx"
       export MEDIA_TTS_1_BASE="https://host/v1"      # 含 /v1
       export MEDIA_TTS_1_MODEL="cosyvoice-v1"        # 或 Spark-TTS 等
+      export MEDIA_TTS_1_VOICE="xxx"                 # 可选：该 key 默认音色
     """
-    key = os.environ.get("MEDIA_TTS_1_KEY", "")
-    base = os.environ.get("MEDIA_TTS_1_BASE", "").rstrip("/")
-    model = os.environ.get("MEDIA_TTS_1_MODEL", "")
-    if not (key and base):
-        die("TTS 未配置。请在 ~/.workbuddy/media_keys.env 加 "
-            "MEDIA_TTS_1_KEY / MEDIA_TTS_1_BASE / MEDIA_TTS_1_MODEL（见 SKILL.md 声音设计节）", 2)
     text = args.text
     if not text and args.text_file:
         text = Path(args.text_file).read_text(encoding="utf-8")
     if not text:
         die("需 --text 或 --text-file", 2)
-    headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
-    body = {"model": model or "cosyvoice-v1", "input": text,
-            "voice": args.voice, "response_format": "mp3"}
-    if args.speed and args.speed != 1.0:
-        body["speed"] = args.speed        # 非标准字段，服务商不支持可忽略
-    req = urllib.request.Request(f"{base}/audio/speech",
-                                 data=json.dumps(body).encode(), method="POST")
-    for k, v in headers.items():
-        req.add_header(k, v)
-    with urllib.request.urlopen(req, timeout=300) as r:
-        audio = r.read()
+    prefix = _tts_emotion_prefix(getattr(args, "emotion", ""))
+    if prefix:
+        text = prefix + text
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_bytes(audio)
-    print(f"[media_gen] tts OK -> {out} ({len(audio)//1024}KB)")
+    # 扫描已配 TTS key 序号：遇第一个配置后连续空号即停（容忍断档与起始空号）
+    last_err, tried = "", False
+    for n in range(1, 20):
+        key = os.environ.get(f"MEDIA_TTS_{n}_KEY", "")
+        base = os.environ.get(f"MEDIA_TTS_{n}_BASE", "").rstrip("/")
+        if not (key or base):
+            if tried:
+                break
+            continue       # 起始空号不算：允许配置从任意序号开始
+        tried = True
+        if not (key and base):
+            last_err = f"MEDIA_TTS_{n} 的 KEY/BASE 不完整"
+            continue
+        model = os.environ.get(f"MEDIA_TTS_{n}_MODEL", "") or "cosyvoice-v1"
+        voice = os.environ.get(f"MEDIA_TTS_{n}_VOICE", "") or args.voice
+        headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+        body = {"model": model, "input": text, "voice": voice, "response_format": "mp3"}
+        if args.speed and args.speed != 1.0:
+            body["speed"] = args.speed        # 非标准字段，服务商不支持可忽略
+        req = urllib.request.Request(f"{base}/audio/speech",
+                                     data=json.dumps(body).encode(), method="POST")
+        for k, v in headers.items():
+            req.add_header(k, v)
+        try:
+            with urllib.request.urlopen(req, timeout=300) as r:
+                audio = r.read()
+        except Exception as e:
+            last_err = f"key#{n} {base}：{e}"
+            print(f"[tts] key#{n} {base} 失败（{e}）——降级下一把", file=sys.stderr)
+            continue
+        out.write_bytes(audio)
+        print(f"[media_gen] tts OK key#{n} -> {out} ({len(audio)//1024}KB)"
+              + (f"  emotion={getattr(args, 'emotion', '')}" if prefix else ""))
+        return
+    die(f"TTS 全部失败：{last_err or 'TTS 未配置（见 SKILL.md 声音设计节）'}", 3)
 def main() -> None:
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -351,17 +425,29 @@ def main() -> None:
     bt.add_argument("--retries", type=int, default=2, help="每镜失败重试次数（默认 2）")
     bt.add_argument("--dry-run", action="store_true", help="仅打印执行计划不实际生成")
     bt.add_argument("--negative", default="blurry, distorted faces, warped hands, extra limbs, text artifacts, watermark, camera shake, flickering, plastic skin, oversaturated")
-    bt.add_argument("--qc", action="store_true", help="videos 阶段每段生成后自动抽 3 帧到 clips/qc/")
+    bt.add_argument("--qc", action="store_true", help="videos 阶段每段生成后自动抽 3 帧到 clips/qc/（人眼）")
+    bt.add_argument("--qcgate", action="store_true",
+                    help="videos 阶段每段过 postprocess qcgate 机器门禁（黑帧/过曝/静帧/规格）；"
+                         "FAIL 的镜记为 FAIL，--retry-failed 会重跑（#4）")
+    bt.add_argument("--qcgate-strict", action="store_true",
+                    help="qcgate 的 WARN（偏黑/过曝/静帧）也判 FAIL 重跑（默认只拦硬 FAIL）")
     bt.add_argument("--retry-failed", action="store_true",
                     help="读上轮 batch_run.json，只重跑 FAIL/PENDING 镜（PENDING 先 harvest，仍在生成的不重提交）")
+    bt.add_argument("--only", default="",
+                    help="只跑指定镜号（逗号分隔，按 shot_id；hybrid 模式喂 hero_shots 用）")
+    bt.add_argument("--no-lint", action="store_true",
+                    help="跳过出镜前 prompt lint（slop/词数/主体漂移检查；默认强制）")
     bt.add_argument("--video-size", default="", help="视频分辨率覆盖（默认留空=每池各自默认：智谱 1920x1080 / 本地网关 1280x720）")
     bt.add_argument("--video-duration", default="", help="视频时长覆盖（默认留空=每池默认 short；本地网关风可 short/medium/long）")
 
-    tt = sub.add_parser("tts", help="语音合成（OpenAI 兼容，需配置 MEDIA_TTS_*）")
+    tt = sub.add_parser("tts", help="语音合成（OpenAI 兼容，多 key failover，需配置 MEDIA_TTS_*）")
     tt.add_argument("--text", default="")
     tt.add_argument("--text-file", default="")
     tt.add_argument("--out", required=True)
-    tt.add_argument("--voice", default="Cherry")
+    tt.add_argument("--voice", default="",
+                    help="音色名（默认读 MEDIA_TTS_<n>_VOICE，再留空用服务商默认）")
+    tt.add_argument("--emotion", default="",
+                    help="情感词（高兴/悲伤/激昂/温柔…）——CosyVoice 系走文本引导，原样拼进正文")
     tt.add_argument("--speed", type=float, default=1.0,
                     help="语速倍率（服务商支持时生效，1.0=正常）")
 
@@ -375,6 +461,45 @@ def main() -> None:
 
     st = sub.add_parser("status", help="key 健康 + /models 能力探测（--no-probe 跳过探测）")
     st.add_argument("--no-probe", action="store_true", help="只看 key 配置，不发 /models 探测")
+
+    # 优化⑩：统一 CLI 入口——一键编排/审计都从这里进，不用记 pipeline.py 脚本名
+    runp = sub.add_parser(
+        "run", help="一键编排（转发 pipeline.py：images→videos→harvest→kenburns→sound→concat→watermark）")
+    runp.add_argument("shots", help="shots 目录（含 plan.json；缺 mode 会 die 退回 Step 1）")
+    runp.add_argument("--final", default="", help="成片输出路径（默认 <shots>/../final.mp4）")
+    runp.add_argument("--stop-after", default="concat",
+                      choices=["images", "videos", "harvest", "kenburns", "sound", "concat", "watermark"],
+                      help="跑到该阶段后停（默认 concat，停在 QC 门前）")
+    runp.add_argument("--dry-run", action="store_true", help="只打印各阶段命令不执行")
+    runp.add_argument("--workers-image", type=int, default=3)
+    runp.add_argument("--workers-video", type=int, default=3)
+    runp.add_argument("--provider-image", default="")
+    runp.add_argument("--provider-video", default="")
+    runp.add_argument("--qcgate", action="store_true",
+                      help="视频阶段过机器门禁（FAIL 记失败待重跑）")
+    runp.add_argument("--qcgate-strict", action="store_true")
+    runp.add_argument("--retry-failed", action="store_true", help="只补跑上轮 FAIL/PENDING 镜")
+    runp.add_argument("--no-lint", action="store_true", help="跳过出镜前 prompt lint")
+    runp.add_argument("--no-qcseq", action="store_true",
+                      help="跳过 concat 前的跨镜首帧一致性粗检（qcseq）")
+    runp.add_argument("--watermark", default="", help="去水印 provider（渠道名，读 watermark_profiles.json）")
+    runp.add_argument("--watermark-dry-run", action="store_true",
+                      help="水印只列待处理档/出红框自检图，不真抹")
+    runp.add_argument("--target-res", default="1280x720")
+    runp.add_argument("--bgm", default="")
+    runp.add_argument("--slogan", default="")
+    runp.add_argument("--slogan-position", default="left", choices=["left", "bottom"])
+
+    au = sub.add_parser("audit", help="项目进度审计：每镜 出图/出片/失败 + 下一步清单")
+    au.add_argument("shots", help="shots 目录")
+
+    ec = sub.add_parser("envcheck", help="#65 外部环境自检：ffmpeg/PIL/字体/key env/本地服务——开跑前体检")
+    cn = sub.add_parser("clean", help="#66 工作区产物治理：默认 scan-only 清单；--yes 移入 .trash；--purge 真删")
+    cn.add_argument("shots", help="shots 目录")
+    cn.add_argument("--yes", action="store_true", help="执行清理（移入 .trash/<时间戳>/，可反悔）")
+    cn.add_argument("--purge", action="store_true", help="清空 .trash（不可逆）")
+
+    mg_caps.build_parser(sub)        # caps show / probe / clear
 
     args = ap.parse_args()
     if args.cmd == "image":
@@ -397,6 +522,16 @@ def main() -> None:
         cmd_status(args)
     elif args.cmd == "plan-check":
         cmd_plan_check(args)
+    elif args.cmd == "caps":
+        mg_caps.cmd_caps(args)
+    elif args.cmd == "run":
+        cmd_run(args)
+    elif args.cmd == "audit":
+        cmd_audit(args)
+    elif args.cmd == "envcheck":
+        cmd_envcheck(args)
+    elif args.cmd == "clean":
+        cmd_clean(args)
 
 if __name__ == "__main__":
     main()

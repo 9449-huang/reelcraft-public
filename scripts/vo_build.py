@@ -45,17 +45,20 @@ def die(msg: str, code: int = 1) -> None:
 
 def probe(path: str | Path) -> float:
     """返回音频/视频时长秒。"""
-    out = subprocess.run([_ffmpeg(), "-i", str(path)], capture_output=True, text=True).stderr
+    out = subprocess.run([_ffmpeg(), "-i", str(path)], capture_output=True, text=True,
+                         encoding="utf-8", errors="replace").stderr
     m = re.search(r"Duration:\s*(\d+):(\d+):(\d+\.\d+)", out)
     if not m:
         return 0.0
     return int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
 
 
-def tts_line(text: str, out: Path, voice: str, speed: float) -> None:
+def tts_line(text: str, out: Path, voice: str, speed: float, emotion: str = "") -> None:
     cmd = [sys.executable, MEDIA_GEN, "tts", "--text", text, "--out", str(out)]
     if voice:
         cmd += ["--voice", voice]
+    if emotion:
+        cmd += ["--emotion", emotion]
     if speed and speed != 1.0:
         cmd += ["--speed", str(speed)]
     rc = subprocess.call(cmd)
@@ -111,7 +114,14 @@ def main() -> None:
                 die(f"--skip-tts 但缺少录音 {lines_dir}/{lid}.mp3|wav", 2)
         else:
             if not f.exists():
-                tts_line(ln["text"], lines_dir / f"{lid}.mp3", args.voice, args.speed)
+                # per-line 声音属性覆盖全局（感情/音色/语速逐句可换：高潮句用激昂档）
+                voice = ln.get("voice") or args.voice
+                emotion = ln.get("emotion", "")
+                try:
+                    speed = float(ln.get("speed") or args.speed)
+                except (TypeError, ValueError):
+                    die(f"{lid} 的 speed {ln.get('speed')!r} 不是数字", 2)
+                tts_line(ln["text"], lines_dir / f"{lid}.mp3", voice, speed, emotion)
                 f = lines_dir / f"{lid}.mp3"
         ln["_file"] = str(f)
         ln["_dur"] = probe(f)
