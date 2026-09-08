@@ -328,6 +328,7 @@ def audit(shots_dir: Path) -> int:
     """优化⑪：项目进度审计视图——每镜 出图/出片/失败 状态 + 对应操作清单。
     读 batch_run.json 状态标签（OK/FAIL/lint/timeout-pending），对照 frames/ 与 clips/ 产物。
     输出可执行的下一步清单（harvest / --retry-failed / 缺帧补图），exit 0 恒。"""
+    from postprocess import probe   # 方案B：audit 探 clip 音轨（有声/哑片 列）
     frames = shots_dir / "frames"
     clips = shots_dir / "clips"
     js = list_shot_files(shots_dir)
@@ -353,9 +354,17 @@ def audit(shots_dir: Path) -> int:
         d = json.loads(j.read_text(encoding="utf-8"))
         sid = d.get("shot_id") or j.stem
         frame = (frames / f"{sid}.png").exists() and (frames / f"{sid}.png").stat().st_size > 0
-        clip = any((clips / f"clip_{sid}{e}").exists() and
-                   (clips / f"clip_{sid}{e}").stat().st_size > 0
-                   for e in (".mp4", ".webp"))
+        clip_path = next(((clips / f"clip_{sid}{e}") for e in (".mp4", ".webp")
+                          if (clips / f"clip_{sid}{e}").exists() and
+                          (clips / f"clip_{sid}{e}").stat().st_size > 0), None)
+        clip = clip_path is not None
+        # 方案B：出片带不带音轨（probe 首帧视频即可——audio 探测驱动 triage 决策）
+        au = "—"
+        if clip_path is not None:
+            try:
+                au = "有音" if probe(str(clip_path)).get("audio") else "哑片"
+            except Exception as e:
+                au = "?"
         tag = prev.get(sid, "")
         st = "OK" if clip else ("出图✓" if frame else "缺帧")
         if tag.endswith("(timeout-pending)"):
@@ -367,7 +376,7 @@ def audit(shots_dir: Path) -> int:
         elif not frame and not clip:
             st = "缺首帧 → images 阶段"
             n_missing_frame += 1
-        rows.append((sid, "出图✓" if frame else "—", "出片✓" if clip else "—", st))
+        rows.append((sid, "出图✓" if frame else "—", "出片✓" if clip else "—", au, st))
 
     print(f"[audit] {shots_dir}  mode={plan.get('mode', '?')}"
           + (f" hero={plan.get('hero_shots')}" if plan.get("hero_shots") else ""))
@@ -375,9 +384,11 @@ def audit(shots_dir: Path) -> int:
     if qc:
         print(f"  上次 qcseq：rc={qc.get('rc')} {qc.get('note', '')}")
     print(f"  镜数 {len(rows)}   出图 {sum(1 for r in rows if r[1] == '出图✓')}   "
-          f"出片 {sum(1 for r in rows if r[2] == '出片✓')}")
-    for sid, f, c, st in rows:
-        print(f"  {sid:6s} frame={f:4s} clip={c:4s}  {st}")
+          f"出片 {sum(1 for r in rows if r[2] == '出片✓')}"
+          f"   有声 {sum(1 for r in rows if r[3] == '有音')} / 哑片 {sum(1 for r in rows if r[3] == '哑片')}"
+          f"（triage 可判要不要补朗读）")
+    for sid, f, c, au, st in rows:
+        print(f"  {sid:6s} frame={f:4s} clip={c:4s} {au:4s}  {st}")
     todo = []
     if n_pend:
         todo.append(f"harvest 收割 {n_pend} 个在途任务")
@@ -400,7 +411,7 @@ _CLEAN_FILES = ("style_grid.png", "pipeline_run.json")
 _CLEAN_GLOBS = ("*.tmp",)
 # 绝不动：shots/*.json（源）、plan.json、vo_lines.json（旁白脚本）、batch_run.json
 # （账单+断点续跑依据）、final*.mp4（成片）、.trash 本身
-_KEEP_NAMES = {"plan.json", "vo_lines.json", "batch_run.json"}
+# （实现上走默认 keep 分支，无需枚举——见 _walk 的 else）
 
 
 def plan_clean(root: Path) -> dict:
@@ -418,15 +429,11 @@ def plan_clean(root: Path) -> dict:
                 else:
                     _walk(child)
                 continue
-            rel_names = {child.name, *child.parts}
             if child.name in _CLEAN_FILES or child.suffix == ".tmp" \
                or any(child.match(g) for g in _CLEAN_GLOBS):
                 remove.append(child)
-            elif child.name in _KEEP_NAMES or child.suffix == ".json" and child.parent == root \
-                    or child.name.startswith("final"):
-                keep.append(child)
             else:
-                keep.append(child)
+                keep.append(child)   # 其余一律 keep（含 final_* 成片/plan/vo_lines/batch_run）
 
     if root.is_dir():
         _walk(root)
@@ -453,21 +460,29 @@ def execute_clean(plan: dict, root: Path) -> int:
 
 
 def purge_trash(root: Path) -> int:
-    """清空 .trash（不可逆——仅对已确认不要的再生产物使用）。返回删除文件数。"""
+    """清空 .trash（不可逆——仅对已确认不要的再生产物使用）。返回删除文件数。
+    Windows 文件被占用（播放器/杀软）不炸：单文件失败跳过并告警，其余继续。"""
     trash = root / _TRASH_NAME
     if not trash.exists():
         return 0
     n = 0
     for f in sorted(trash.rglob("*"), reverse=True):
         if f.is_file():
-            f.unlink()
-            n += 1
-        elif f.is_dir() and not any(f.iterdir()):
-            f.rmdir()
+            try:
+                f.unlink()
+                n += 1
+            except OSError as e:
+                print(f"[clean] purge 跳过 {f}（{e}）", file=sys.stderr)
     for sub in sorted(trash.rglob("*"), reverse=True):
         if sub.is_dir() and not any(sub.iterdir()):
-            sub.rmdir()
-    trash.rmdir() if trash.exists() and not any(trash.iterdir()) else None
+            try:
+                sub.rmdir()
+            except OSError:
+                pass
+    try:
+        trash.rmdir() if trash.exists() and not any(trash.iterdir()) else None
+    except OSError as e:
+        print(f"[clean] purge 未能移除 {trash}（{e}）——残留文件下次再 purge", file=sys.stderr)
     return n
 
 

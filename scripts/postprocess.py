@@ -64,8 +64,14 @@ def _escape_drawtext(text: str) -> str:
     字幕含 \"100%\" 不转义会解析异常，#11）。顺序必须先 \\ 再 ' 最后 %。"""
     return str(text).replace("\\", "\\\\").replace("'", "\\'").replace("%", "\\%")
 
+_PROBE_CACHE: dict = {}   # path -> info（同进程内 probe 结果复用：audit/triage 不重复起 ffmpeg）
+
+
 def probe(path: str) -> dict:
-    """ffprobe 等价的简化：跑 ffmpeg -i，提取第一行 Duration 与 Stream 行。"""
+    """ffprobe 等价的简化：跑 ffmpeg -i，提取第一行 Duration 与 Stream 行。
+    结果按 path 进程内缓存——一个 20 镜 audit 只起 20 个进程而非 40。"""
+    if path in _PROBE_CACHE:
+        return _PROBE_CACHE[path]
     out = run_capture([_ffmpeg(), "-i", path]).stderr
     info = {}
     m = re.search(r"Duration:\s*(\d+):(\d+):(\d+\.\d+)", out)
@@ -88,6 +94,7 @@ def probe(path: str) -> dict:
         info["bitrate_kbps"] = int(m.group(1))
     if re.search(r"Audio:", out):
         info["audio"] = True
+    _PROBE_CACHE[path] = info
     return info
 
 # ─── 拼接 + 后期统一 ──────────────────────────────────────

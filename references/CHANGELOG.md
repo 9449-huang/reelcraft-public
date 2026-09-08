@@ -10,7 +10,10 @@
 
 | 版本 | 日期 | commit | 测试数 | 一句话概括 | 引入了什么隐患（回滚重点） |
 |---|---|---|---|---|---|
-| v3.1.11 | 2026-09-08 | （待提交） | 163 | 复核修复批：watermark 提升 stop + qcseq 错误中断 + 中文词数折算 + negative 词界 + 导出防护 | watermark 自动提 stop 改变运行边界；qcseq exit2 现在会中断（此前静默放行） |
+| v3.1.14 | 2026-09-08 | e486a2d | 179 | 二次复核修复：triage 档案读路径（--pool 命中免转录）+ tts 空体校验 | --pool 现在会跳过听诊直用档案结论（旧行为每次重转录）；响应 <64B 视为失败（某些网关返回极短真音频会被误拦，--refresh 重验） |
+| v3.1.13 | 2026-09-08 | 51fd23d | 176 | 复核修复批：cmd_tts 原子写+CLI voice 优先+槽位动态扫描 + probe 进程内缓存 + triage 多 key + purge 容错 + envcheck ASCII | voice 优先级反转（CLI 显式参数现在赢 env）；probe 缓存同进程内不感知外部文件变化（长流水线场景慎用同 path 重 probe） |
+| v3.1.12 | 2026-09-08 | 53ad152 | 171 | 方案B triage 听诊链（SenseVoice ASR 判补不补朗读）+ audio_profiles + audit 有声列 | triage 转录走硅基（file 字段必须在 model 前，已钉死）；听诊只粗筛，拍板留人 |
+| v3.1.11 | 2026-09-08 | b866f3a | 163 | 复核修复批：watermark 提升 stop + qcseq 错误中断 + 中文词数折算 + negative 词界 + 导出防护 | watermark 自动提 stop 改变运行边界；qcseq exit2 现在会中断（此前静默放行） |
 | v3.1.10 | 2026-09-07 | e8bd3cf | 150 | TTS 升级：硅基流动 CosyVoice2 主力 + 多 key failover + 情感/逐句声音参数 + 声音风格卡 | tts 默认音色从 Cherry 改为 env 驱动（旧写法失效）；emotion 只对 CosyVoice 系生效 |
 | v3.1.9 | 2026-09-07 | 21dccea | 144 | envcheck 环境自检 + clean 产物治理（#65/#66） | clean --purge 不可逆；envcheck 本地服务探测受本机服务状态影响 |
 | v3.1.8 | 2026-09-07 | 7083c10 | 131 | qcseq 跨镜一致性粗检 + caps sync 文档单源化 + 导出残留清理 | qcseq 阈值判据可能误杀（组合判据已防明度误判）；md 快照区块勿手改 |
@@ -24,6 +27,47 @@
 | v3.1 | 2026-09-06 | 59d570d | — | 本地 Edge TTS 接入 key 池 | TTS 依赖本地服务（localhost:5050）在线 |
 | v3.0 | 2026-09-06 | 8d3a975 | 27 | 通用化中性化（去赛事归属） | 公开仓剔除私有池，私有能力不在公开版 |
 | v2.9 | 2026-09-05 | c37fa8e | — | 公开仓体检修复 | — |
+
+## v3.1.14（2026-09-08）
+
+外部二批复核（6 条：2 误报/1 部分/3 成立中的两条真问题）修复：
+
+- **triage 档案读路径**（P2）：v3.1.12 只写不读——“同模型下次免测”承诺未兑现，每镜重复烧转录额度。
+  现在 `--pool` 传入即自动查档案，命中直接用实测结论（不 probe 不转录，reason 标注实测时间）；
+  换模型版本/结论存疑时 `--refresh` 强制重测。media_gen 转发同步加 --refresh。
+- **tts 空体校验**（P3）：网关半死时常返 200+空体——旧版会落盘 0KB 废 mp3 并报 OK，静默流入
+  下游拼接。现在响应 <64 字节视为失败进 failover（next key）。
+- 测试 176→**179 项**（档案命中免转录/refresh 绕过/空体 failover；顺带修旧用例假音频过短被新阈值误拦）。
+
+## v3.1.13（2026-09-08）
+
+改代码 skills 双轴全量复核（v3.1.8..v3.1.12 共 13 commit +1852 行）后的修复批，8 条（2×P2+6×P3）：
+
+- **cmd_tts 原子写 + 旧文件警告**（P2）：成功路径 tmp+os.replace（被杀不留半截）；全 key 失败且 out 是旧文件时 stderr 明确警告"下游勿复用"。
+- **probe 进程内缓存**（P2）：postprocess.probe 按 path 缓存——audit 逐镜 + triage 双 probe 同文件从 2 次降 1 次，20 镜 audit 少起 20 个 ffmpeg 进程。
+- **purge_trash 容错**（P2）：Windows 文件被占用（播放器/杀软）单文件跳过不炸，其余继续删。
+- **envcheck badge ASCII 化**（P3）：envcheck 恰是"环境坏了才跑"的工具，裸 cmd 无 PYTHONUTF8 时 emoji 会替真报告炸掉，改 [OK]/[WARN]/[FAIL]。
+- **triage 转录通道多 key 扫描**（P3）：旧版只读 MEDIA_TTS_1（key 配 TTS_2 时误报"未配置"），现扫 MEDIA_TTS_<n>_* 取第一个可用，与 cmd_tts/envcheck 同口径。
+- **CLI --voice 优先于 env**（P3）：旧版 env VOICE 赢 CLI 显式参数，反转后 CLI 显式传入优先，env 只作各 key 默认。
+- **TTS key 槽位动态扫描**（P3）：旧版 range(1,20) 封死 19 把，现 _scan_tts_slots()（起始空号跳过、断档容忍、连续 3 空号停、空值不算已配）。
+- **plan_clean 死代码清理 + envcheck 空值口径**（P3）：删 rel_names 死变量与冗余 elif；scan_key_env 判"已配"改真值（空字符串=未配，与 mg_core.list_keys 一致）。
+- 测试 171→**176 项**（TestReviewFixBatch ×9：槽位扫描/voice 优先/旧文件警告/probe 缓存/triage TTS_2/空值断档/purge 容错/ASCII badge）。
+
+## v3.1.12（2026-09-08）
+
+方案B 出片听诊链（承接声音方案讨论：每个视频模型音频能力未知，不能假设、不能每镜人工听）：
+
+- **`media_gen.py triage <clips>`（audio_triage.py）**：机器粗筛"这镜要不要补朗读"，拍板留人——
+  probe 无音轨 → yes（哑片，需后期配）；有音轨 → 抽中段 9s → **硅基 SenseVoiceSmall 转写**
+  （/audio/transcriptions，通道复用 MEDIA_TTS_1 硅基 key，零新依赖）→ 中文人声 → no；
+  英文 → yes；转录空/失败 → listen（纯音乐/环境音？机器不硬判，交人听）。
+- **audio_profiles.json**（~/.workbuddy，同 watermark/caps 档案模式）：`--pool <名> --update-profile`
+  实测一次回写，同一模型下次免测。
+- **audit 加"有声/哑片"列**：逐镜 probe 音轨状态，汇总"有声 n / 哑片 m"，直接回答"该不该开 triage"。
+- **实测坑（已钉死到代码注释）**：硅基网关 multipart 要求 **file 字段在前、model 字段在后且带
+  Content-Type: text/plain**——OpenAI SDK 默认顺序（model 先）会被网关 400 "Error when parsing
+  request"。真实闭环验证：用 v3.1.10 情感引导生成的旁白片 → SenseVoice 转写回 23 字中文 → 判 no ✓。
+- 测试 163→**171 项**（TestAudioTriageDecision ×6 + TestAudioProfile ×2）。
 
 ## v3.1.11（2026-09-08）
 

@@ -884,7 +884,7 @@ class TestTtsFailover(unittest.TestCase):
                 def __exit__(self, *a):
                     return False
                 def read(self):
-                    return b"audio-data"
+                    return b"audio-data" + b"x" * 118
             return Resp()
         return fake
 
@@ -904,7 +904,7 @@ class TestTtsFailover(unittest.TestCase):
         body2 = reqs[1][1]
         self.assertEqual(body2["model"], "tts-1")
         self.assertEqual(body2["voice"], "zh-CN-XiaoxiaoNeural", "降级音色必须跟随 key")
-        self.assertEqual(self.out.read_bytes(), b"audio-data")
+        self.assertEqual(self.out.read_bytes(), b"audio-data" + b"x" * 118)
 
     def test_all_fail_dies_3(self):
         import argparse
@@ -1924,5 +1924,236 @@ class TestExportSafety(unittest.TestCase):
         self.assertIn("reelcraft_public", r.stdout + r.stderr)
 
 
+class TestAudioTriageDecision(unittest.TestCase):
+    """方案B：听诊决策纯函数——机器只粗筛，拍板留人。
+    无音轨→yes / 中文人声→no / 英文→yes / 空转录→listen。"""
+
+    @classmethod
+    def setUpClass(cls):
+        import importlib
+        cls.at = importlib.import_module("audio_triage")
+
+    def test_no_audio_suggests_voice(self):
+        d = self.at.triage_decision(has_audio=False)
+        self.assertEqual(d["verdict"], "yes")
+
+    def test_zh_speech_no_voice_needed(self):
+        d = self.at.triage_decision(has_audio=True, transcript="晨雾散开，湖面醒了过来。")
+        self.assertEqual(d["verdict"], "no", "自带完整中文人声不用补朗读")
+
+    def test_english_speech_suggests_voice(self):
+        d = self.at.triage_decision(has_audio=True,
+                                    transcript="the morning mist clears over the lake")
+        self.assertEqual(d["verdict"], "yes", "非中文人声建议补中文旁白")
+
+    def test_empty_transcript_listen(self):
+        d = self.at.triage_decision(has_audio=True, transcript="")
+        self.assertEqual(d["verdict"], "listen", "空转录=纯音乐/环境音/噪声，机器不硬判给人听")
+
+    def test_zh_short_fragment_listen(self):
+        """只转出一个词（如背景中文广播）不算完整人声——交人听。"""
+        d = self.at.triage_decision(has_audio=True, transcript="好")
+        self.assertEqual(d["verdict"], "listen", "单字不成人声覆盖，别误判 native")
+
+    def test_verdict_reason_present(self):
+        d = self.at.triage_decision(has_audio=False)
+        self.assertIn("reason", d)
+
+
+class TestAudioProfile(unittest.TestCase):
+    """方案B：audio_profiles.json 读写（同 watermark/caps 档案模式：实测一次回写）。"""
+
+    @classmethod
+    def setUpClass(cls):
+        import importlib
+        cls.at = importlib.import_module("audio_triage")
+
+    def setUp(self):
+        self._td = tempfile.TemporaryDirectory()
+        real = self.at.PROFILE_FILE
+        self.at.PROFILE_FILE = Path(self._td.name) / "audio_profiles.json"
+        self.real = real
+
+    def tearDown(self):
+        self.at.PROFILE_FILE = self.real
+        self._td.cleanup()
+
+    def test_record_and_load(self):
+        self.at.record_profile("model-x", {"verdict": "no", "has_audio": True, "detail": "中文人声"})
+        p = self.at.load_profile("model-x")
+        self.assertEqual(p["verdict"], "no")
+
+    def test_unknown_pool_empty(self):
+        self.assertEqual(self.at.load_profile("nonexistent"), {})
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestReviewFixBatch(unittest.TestCase):
+    """v3.1.13 复核修复批：cmd_tts 原子写/voice 优先级/槽位扫描、probe 缓存、
+    triage 多 key 扫描、envcheck 空值口径、purge 容错。"""
+
+    def test_scan_tts_slots_dynamic(self):
+        """槽位扫描：起始空号跳过、断档容忍、连续 3 空号停（不再封死 19）。"""
+        env = {"MEDIA_TTS_2_KEY": "k", "MEDIA_TTS_2_BASE": "https://b",
+               "MEDIA_TTS_5_KEY": "k5", "MEDIA_TTS_5_BASE": "https://c"}
+        self.assertEqual(mg._scan_tts_slots(env), [2, 5])
+        self.assertEqual(mg._scan_tts_slots({}), [])
+
+    def test_scan_tts_slots_empty_value_not_configured(self):
+        """KEY="" 是未配置不是已配（与 mg_core.list_keys 口径一致）。"""
+        env = {"MEDIA_TTS_1_KEY": "", "MEDIA_TTS_1_BASE": "",
+               "MEDIA_TTS_2_KEY": "k", "MEDIA_TTS_2_BASE": "https://b"}
+        self.assertEqual(mg._scan_tts_slots(env), [2])
+
+    def test_tts_cli_voice_overrides_env(self):
+        """CLI --voice 显式传入必须赢过 env 默认音色。"""
+        import argparse
+        reqs = []
+        ns = argparse.Namespace(text="x", text_file="", out=str(Path(tempfile.mkdtemp()) / "o.mp3"),
+                                voice="cli-voice", emotion="", speed=1.0)
+        env = {"MEDIA_TTS_1_KEY": "k1", "MEDIA_TTS_1_BASE": "https://alpha/v1",
+               "MEDIA_TTS_1_VOICE": "env-voice"}
+        resp = type("Resp", (), {"__enter__": lambda s: s, "__exit__": lambda s, *a: False,
+                                  "read": lambda s: b"a" * 128})()
+        with mock.patch.dict(os.environ, env, clear=False):
+            with mock.patch.object(mg.urllib.request, "urlopen",
+                                   side_effect=lambda r, timeout=300: reqs.append(r) or resp):
+                mg.cmd_tts(ns)
+        import json as _j
+        self.assertEqual(_j.loads(reqs[0].data)["voice"], "cli-voice")
+
+    def test_tts_all_fail_warns_stale_out(self):
+        """全 key 失败时若 out 是旧文件，stderr 必须警告防下游复用。"""
+        import argparse, io, contextlib
+        out = Path(tempfile.mkdtemp()) / "o.mp3"
+        out.write_bytes(b"old-audio")
+        ns = argparse.Namespace(text="x", text_file="", out=str(out),
+                                voice="", emotion="", speed=1.0)
+        env = {"MEDIA_TTS_1_KEY": "k1", "MEDIA_TTS_1_BASE": "https://alpha/v1"}
+        err = io.StringIO()
+        with mock.patch.dict(os.environ, env, clear=False):
+            with mock.patch.object(mg.urllib.request, "urlopen",
+                                   side_effect=OSError("down")):
+                with contextlib.redirect_stderr(err):
+                    with self.assertRaises(SystemExit) as cm:
+                        mg.cmd_tts(ns)
+        self.assertEqual(cm.exception.code, 3)
+        self.assertIn("旧文件", err.getvalue())
+
+    def test_probe_cached_by_path(self):
+        """同一路径第二次 probe 不再起 ffmpeg（audit/triage 双倍进程的根修）。"""
+        import postprocess as pp
+        with tempfile.TemporaryDirectory() as td:
+            f = Path(td) / "v.mp4"
+            f.write_bytes(b"x")
+            calls = []
+            with mock.patch.object(pp, "run_capture",
+                                   side_effect=lambda c: calls.append(1) or
+                                   type("R", (), {"stderr": "Duration: 00:00:05.00"})()):
+                pp._PROBE_CACHE.clear()
+                a = pp.probe(str(f))
+                b = pp.probe(str(f))
+                self.assertEqual(len(calls), 1, "第二次必须命中缓存")
+                self.assertEqual(a, b)
+
+    def test_triage_scan_tts_slot_finds_n2(self):
+        """key 配在 TTS_2 时能扫到（旧版只读 TTS_1 会误报未配置）。"""
+        import audio_triage as at
+        env = {"MEDIA_TTS_2_KEY": "k", "MEDIA_TTS_2_BASE": "https://sf/v1"}
+        self.assertEqual(at._scan_tts_slot(env), (2, "https://sf/v1", "k"))
+        self.assertEqual(at._scan_tts_slot({}), (0, "", ""))
+
+    def test_scan_key_env_empty_value_is_gap(self):
+        """KEY="" 不算已配：断档口径与 list_keys 一致。"""
+        import envcheck as ec
+        env = {"MEDIA_AGNES_1_KEY": "k1", "MEDIA_AGNES_1_BASE": "https://x",
+               "MEDIA_AGNES_3_KEY": "k3", "MEDIA_AGNES_3_BASE": "https://y"}
+        r = ec.scan_key_env("agnes", env=env)
+        self.assertEqual(r["ns"], [1, 3])
+
+    def test_purge_trash_skips_locked_file(self):
+        """Windows 文件被占用：purge 跳过该文件不炸，其余正常删。"""
+        import pipeline as pl
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            trash = root / ".trash" / "ts"
+            trash.mkdir(parents=True)
+            (trash / "a.mp4").write_bytes(b"a")
+            locked = trash / "b.mp4"
+            locked.write_bytes(b"b")
+            real_unlink = Path.unlink
+
+            def fake_unlink(self, missing_ok=False):
+                if self.name == "b.mp4":
+                    raise PermissionError("file in use")
+                return real_unlink(self, missing_ok=missing_ok)
+            with mock.patch.object(Path, "unlink", fake_unlink):
+                n = pl.purge_trash(root)
+            self.assertEqual(n, 1, "只删掉没被占用的 a.mp4")
+            self.assertTrue(locked.exists(), "被占用文件必须幸存")
+
+    def test_envcheck_badge_ascii_only(self):
+        """envcheck 报告 badge 必须 ASCII（裸 cmd 无 PYTHONUTF8 不崩）。"""
+        import envcheck as ec
+        rc, text = ec.summarize([{"check": "c", "level": "fail", "detail": "d"}])
+        self.assertEqual(rc, 1)
+        self.assertTrue(all(ord(ch) < 128 for ch in
+                            text.split("\n")[0]), "badge 行必须纯 ASCII")
+
+    def test_tts_empty_response_fails_over(self):
+        """200 但空体（<64B）不能落盘——必须降级下一把 key。"""
+        import argparse
+        reqs = []
+        ns = argparse.Namespace(text="x", text_file="", out=str(Path(tempfile.mkdtemp()) / "o.mp3"),
+                                voice="", emotion="", speed=1.0)
+        env = {"MEDIA_TTS_1_KEY": "k1", "MEDIA_TTS_1_BASE": "https://alpha/v1",
+               "MEDIA_TTS_2_KEY": "k2", "MEDIA_TTS_2_BASE": "https://beta/v1"}
+
+        def fake(req, timeout=300):
+            reqs.append(req.full_url)
+
+            class Resp:
+                def __enter__(self):
+                    return self
+                def __exit__(self, *a):
+                    return False
+                def read(self):
+                    return b"" if "alpha" in req.full_url else b"real-audio" + b"x" * 128
+            return Resp()
+        with mock.patch.dict(os.environ, env, clear=False):
+            with mock.patch.object(mg.urllib.request, "urlopen", side_effect=fake):
+                mg.cmd_tts(ns)
+        self.assertEqual(len(reqs), 2, "空体必须触发 failover")
+        self.assertEqual(Path(ns.out).read_bytes(), b"real-audio" + b"x" * 128)
+
+    def test_triage_profile_hit_skips_transcribe(self):
+        """档案命中（--pool 未 --refresh）直接用结论，不再转录（免烧额度）。"""
+        import audio_triage as at
+        with tempfile.TemporaryDirectory() as td:
+            clip = Path(td) / "clip_S01.mp4"
+            clip.write_bytes(b"x")
+            prof = Path(td) / "prof.json"
+            with mock.patch.object(at, "PROFILE_FILE", prof):
+                at.record_profile("model-x", {"verdict": "no", "has_audio": True,
+                                              "detail": "自带中文人声"})
+                with mock.patch.object(at, "probe", side_effect=AssertionError("不许 probe")):
+                    r = at.triage_one(clip, pool="model-x")
+            self.assertEqual(r["verdict"], "no")
+            self.assertIn("档案命中", r["reason"])
+
+    def test_triage_refresh_bypasses_profile(self):
+        """--refresh 忽略档案强制重测。"""
+        import audio_triage as at
+        with tempfile.TemporaryDirectory() as td:
+            clip = Path(td) / "clip_S01.mp4"
+            clip.write_bytes(b"x")
+            prof = Path(td) / "prof.json"
+            with mock.patch.object(at, "PROFILE_FILE", prof):
+                at.record_profile("model-x", {"verdict": "no", "has_audio": True})
+                with mock.patch.object(at, "probe", return_value={}) as pr:
+                    r = at.triage_one(clip, pool="model-x", refresh=True)
+                pr.assert_called_once()
+            self.assertEqual(r["verdict"], "yes", "哑片（probe 无 audio）→ 补")
