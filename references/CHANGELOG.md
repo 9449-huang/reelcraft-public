@@ -10,6 +10,8 @@
 
 | 版本 | 日期 | commit | 测试数 | 一句话概括 | 引入了什么隐患（回滚重点） |
 |---|---|---|---|---|---|
+| v3.1.16 | 2026-09-08 | b09f4bf | 194 | 声音链三件套：vo_build fit 声画对账 + pick 选优半自动 + BGM 床闪避混音；双轴复核收尾（测量法 P1 + webp 哨兵） | vo_build 录音查找扩 .m4a；fit/pick 只建议不拍板；export 新增 CHANGELOG 赛事词替换规则 |
+| v3.1.15 | 2026-09-08 | f77cdb9 | 179 | 移除 references/competition-spec.md（赛后脱敏收尾）+ 引用清理 | 文件在 git 历史 f3ed235..e486a2d 可恢复；export SKIP 名保留防将来重建漏脱敏 |
 | v3.1.14 | 2026-09-08 | e486a2d | 179 | 二次复核修复：triage 档案读路径（--pool 命中免转录）+ tts 空体校验 | --pool 现在会跳过听诊直用档案结论（旧行为每次重转录）；响应 <64B 视为失败（某些网关返回极短真音频会被误拦，--refresh 重验） |
 | v3.1.13 | 2026-09-08 | 51fd23d | 176 | 复核修复批：cmd_tts 原子写+CLI voice 优先+槽位动态扫描 + probe 进程内缓存 + triage 多 key + purge 容错 + envcheck ASCII | voice 优先级反转（CLI 显式参数现在赢 env）；probe 缓存同进程内不感知外部文件变化（长流水线场景慎用同 path 重 probe） |
 | v3.1.12 | 2026-09-08 | 53ad152 | 171 | 方案B triage 听诊链（SenseVoice ASR 判补不补朗读）+ audio_profiles + audit 有声列 | triage 转录走硅基（file 字段必须在 model 前，已钉死）；听诊只粗筛，拍板留人 |
@@ -27,6 +29,44 @@
 | v3.1 | 2026-09-06 | 59d570d | — | 本地 Edge TTS 接入 key 池 | TTS 依赖本地服务（localhost:5050）在线 |
 | v3.0 | 2026-09-06 | 8d3a975 | 27 | 通用化中性化（去赛事归属） | 公开仓剔除私有池，私有能力不在公开版 |
 | v2.9 | 2026-09-05 | c37fa8e | — | 公开仓体检修复 | — |
+
+## v3.1.16（2026-09-08）
+
+改进批第一批（TDD：红→绿，每项先测后码；三 CLI 均 lavfi 造片端到端真跑）：
+
+- **`vo_build.py fit <vo_lines> <clips/>`（A1' 声画对账）**：VO 时间轴 vs 逐镜 clip 时长对账表——
+  每镜 VO 需求（末句 at+dur+gap − 首句 at）对比 clip 实测时长，verdict 四档
+  ok/warn/info（空镜合法）/missing（镜缺成片）；warn 镜给建议（kenburns 补长或 VO 提速比）。
+  纯函数 fit_report 可单测（TestVoFit ×4）。
+- **`postprocess.py pick <images...>`（A3 选优半自动）**：count N 张候选图启发式打分
+  （清晰度×2 + 对比度 − 亮度偏离惩罚），排序只做参考——**最终人选人做**，脚本明说。
+  score_images 纯函数（TestPick ×2）。
+- **`vo_build.py --bgm <file>`（拓展#1 BGM 床）**：BGM 循环补齐到成片长 + 基础音量
+  -14dB（--bgm-duck 调），sidechaincompress 以 VO 总线为 key——有旁白处 BGM 自动压低，
+  无旁白处保持底床。bgm_filter_chain 纯函数（TestBgmMix ×2）。
+- 顺手：vo_build 录音查找扩展名 .mp3/.m4a/.wav（TTS 产物就是 m4a，旧版 --skip-tts 找不到自己的产物）。
+- 修复：export_public 新增 references/CHANGELOG.md 赛事词替换规则（v3.1.15 条目的具体赛事截止表述
+  差点带进公开版，自检拦截后补规则；其余赛事提及本就在 private 块内）。
+- 测试 179→**187 项**（+4 fit +2 pick +2 bgm）。
+- **复盘修复（P1）**：首版 BGM 链 sidechaincompress 输入顺序反（VO 成了被压缩方）且 VO 未进最终
+  amix——成片只剩 BGM 没旁白；第一版端到端只验 rc=0 漏网。重构为 bgm_assembly 纯函数
+  （BGM 主输入 + VO asplit 出片/触发两路 + VO 必进 amix）+ volumedetect 内容级测试。
+  **教训：音频混音 rc=0 ≠ 对，必须验内容**。最终 189 项。
+- **双轴复核收尾（b09f4bf，194 项）**：①测试硬编码绝对路径改相对（他机不挂）；②e2e 断言收紧为
+  电平差（VO 段 vs 纯 BGM 段 >6dB）——顺藤摸出**测量法 P1**：`-ss` 放 `-i` 后是输出侧 seek，
+  只在 mux 层丢帧，volumedetect 吃全量样本报**整文件均值**（静默段假响 67dB），旧断言因此假绿；
+  改输入侧 seek（`-ss` 在 `-i` 前）后链路电平实测健康：VO -24.1dB vs BGM -38.2dB（闪避真实生效）。
+  ③cmd_fit 静态 webp probe=0 被丢 → 误报 missing；改哨兵 -1.0 报 info（图片镜不缺成片，
+  VO 需求照算供 kenburns 配 --duration），新增回归测试钉死。④fit_report 删未使用的 total 参数。
+  P3：kenburns-all 注明 NN=图序≠shot_id；duck_db 注释改"全程基础音量"。
+
+## v3.1.15（2026-09-08）
+
+改进分析落地（用户拍板只做 #7 删除项）：
+
+- **移除 `references/competition-spec.md`**：赛事截止日期临近，赛事敏感内容整文件删除（git 历史 f3ed235 起全程可恢复）。SKILL.md Step 0 的规格附件指引改为存会话工作区（不再落 skill 目录）。
+- export_public 的 SKIP_FILES 保留 `competition-spec.md` 条目并加注释——将来若再建同名文件自动防泄漏，不因删文件而丢防护。
+- 测试 179 全绿、导出自检私有词零命中不变。
 
 ## v3.1.14（2026-09-08）
 

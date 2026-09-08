@@ -3,7 +3,7 @@ name: reelcraft
 description: 一句话需求 → 多 provider 生图/视频流水线（主力池可配 + 智谱/魔塔兜底，图批量选优 + 首帧图编辑 + 视频双链兜底）→ 声音设计（VO/TTS/字幕/BGM 混音）→ 规格统一后期 → 自检。Use when user asks to 做个视频/出片/AIGC广告/多 provider 兜底 or 给出平台/赛事规格要求生成达标视频；强调多 key 轮转与**多 key 并行**、熔断、一镜多图选优、xfade/末帧链衔接、抽帧 QC 闭环、断点续跑。When NOT to use: 静态海报用 ppt-master 或 image-master，单帧修图用 buddy-image-processing。
 ---
 
-# ReelCraft — 多 provider 视频流水线（v3.1.14）
+# ReelCraft — 多 provider 视频流水线（v3.1.16）
 
 ### 何时使用
 - 用户给出主题 + 时长 + 风格，要求生成一段演示/参赛用 AIGC 视频
@@ -80,7 +80,7 @@ description: 一句话需求 → 多 provider 生图/视频流水线（主力池
 - 投稿类别（决定能否用 AIGC、时长/分辨率/大小上限、人数限制）
 - 主题方向 / 一句话创意
 
-如果用户已发规格附件（如某赛事通知），**抓取正文**（WebFetch + 必要时 WebSearch 找附件原文），落到 `references/competition-spec.md`（私有参考，不进公开版）。
+如果用户已发规格附件（如某赛事通知），**抓取正文**（WebFetch + 必要时 WebSearch 找附件原文）存档到会话工作区（私有，不进 skill/公开版）。
 
 无明确规格时直接用 `check` 默认阈值：1280×720 / ≤120s / ≥24fps / H.264 yuv420p（通用平台下限），`--min-res/--max-duration/--min-fps` 可随时覆盖。
 
@@ -410,7 +410,12 @@ python scripts/vo_build.py vo/vo_lines.json --out vo/vo.m4a --total 55.94
 # 用户自录：录 11 条存 vo/lines/L01.wav… 然后只拼接打轴
 python scripts/vo_build.py vo/vo_lines.json --out vo/vo.m4a --total 55.94 --skip-tts
 # 某句太长挤到下一句：--auto-shift 自动顺延后续句子（--gap 0.3 控制间隔）
+# BGM 床（循环补齐到成片长，VO 出现自动闪避压低，--bgm-duck 控制基础音量）
+python scripts/vo_build.py vo/vo_lines.json --out vo/vo.m4a --total 55.94 --bgm vo/bgm.m4a
+# 声画对账（TTS 后跑最准）：VO 时间轴 vs 逐镜 clip 时长，哪镜差多少一目了然
+python scripts/vo_build.py fit vo/vo_lines.json clips/
 ```
+**选优半自动**（count N 张候选图）：`postprocess.py pick shot_01_*.png` 启发式打分排序（清晰度/对比度/亮度合理域），只做参考、人拍板；配合 `batch --count 3` 用。
 脚本会做：越界检查（实际时长 > 到下一句的间隔则警告）→ 静音底铺满总长 → 各句精确落位 →
 输出 `subtitles_final.json` → 报告有声/留白占比（公益片留白 40-50% 较合适）。
 

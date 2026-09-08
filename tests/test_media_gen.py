@@ -2157,3 +2157,170 @@ class TestReviewFixBatch(unittest.TestCase):
                     r = at.triage_one(clip, pool="model-x", refresh=True)
                 pr.assert_called_once()
             self.assertEqual(r["verdict"], "yes", "哑片（probe 无 audio）→ 补")
+
+
+class TestVoFit(unittest.TestCase):
+    """A1' VO-镜头对账：vo_build fit 子命令的纯函数 fit_report。
+
+    seam：fit_report(vo_lines_dict, clip_durs: dict[shot_id->秒], total) -> list[dict]
+    输出每镜对账行：shot/vo 段数/vo 需求时长(含 gap)/clip 时长/差值/verdict/建议。
+    """
+
+    def _lines(self):
+        return {"lines": [
+            {"id": "L01", "shot": "S01", "at": 0.8, "text": "a"},
+            {"id": "L02", "shot": "S01", "at": 2.0, "text": "b"},
+            {"id": "L03", "shot": "S02", "at": 4.0, "text": "c"},
+        ]}
+
+    def test_fit_report_basic(self):
+        import vo_build as vb
+        rows = vb.fit_report(self._lines(), {"S01": 3.5, "S02": 2.0})
+        by = {r["shot"]: r for r in rows}
+        # S01: VO 0.8~3.0（两句）→ 需求约 2.2s+句尾 gap；clip 3.5s 富余
+        self.assertEqual(by["S01"]["clip"], 3.5)
+        self.assertIn(by["S01"]["verdict"], ("ok", "warn"))
+        # S02: VO 4.0 起，句长未知（无 _dur 时用文本估不了）→ 对账按 0 处理应报 ok
+        self.assertEqual(by["S02"]["clip"], 2.0)
+
+    def test_fit_report_with_real_durs(self):
+        """句级 _dur 已知时精确对账：S02 的 VO 段比 clip 长要报 warn。"""
+        import vo_build as vb
+        data = self._lines()
+        data["lines"][2]["_dur"] = 2.6   # L03 实测 2.6s
+        rows = vb.fit_report(data, {"S01": 3.5, "S02": 2.0})
+        by = {r["shot"]: r for r in rows}
+        self.assertEqual(by["S02"]["verdict"], "warn", "VO 2.6s > clip 2.0s 必须报 warn")
+        self.assertIn("建议", by["S02"]["advice"])
+
+    def test_fit_report_missing_clip(self):
+        """vo 提到但 clips 缺镜 → 缺失行（verdict=missing），不能静默跳过。"""
+        import vo_build as vb
+        rows = vb.fit_report(self._lines(), {"S01": 3.5})
+        self.assertTrue(any(r["shot"] == "S02" and r["verdict"] == "missing" for r in rows))
+
+    def test_fit_report_clip_without_vo(self):
+        """有 clip 无 VO 的镜 → 报 info（不是错误，纯音乐/空镜合法）。"""
+        import vo_build as vb
+        rows = vb.fit_report(self._lines(), {"S01": 3.5, "S02": 2.0, "S03": 4.0})
+        self.assertTrue(any(r["shot"] == "S03" and r["verdict"] == "info" for r in rows))
+
+    def test_fit_report_webp_sentinel(self):
+        """静态图片镜（clip_durs 值 -1.0 哨兵）→ info 不 missing：
+        webp probe 不到时长不是缺成片（v3.1.16 复盘修复，回归钉死）。"""
+        import vo_build as vb
+        rows = vb.fit_report(self._lines(), {"S01": -1.0, "S02": -1.0})
+        by = {r["shot"]: r for r in rows}
+        self.assertEqual(by["S01"]["verdict"], "info", "图片镜不能误报 missing")
+        self.assertIsNone(by["S01"]["clip"])
+        self.assertEqual(by["S01"]["n_lines"], 2, "有 VO 的图片镜句数照常算")
+        self.assertGreater(by["S01"]["vo"], 0, "VO 需求时长给 kenburns --duration 参考")
+
+
+class TestPick(unittest.TestCase):
+    """A3 选优半自动：pick 的纯函数 score_images。
+    只排序不拍板——启发式（清晰度/对比度/亮度合理域）给参考，最终人选人做。
+    seam：score_images(paths: list[Path]) -> list[dict(path, sharpness, contrast, score)]
+    """
+
+    def test_score_images_orders_by_score(self):
+        import vo_build  # 确保包上下文可用（不必要但统一 import 风格）
+        import postprocess as pp
+        from PIL import Image
+        with tempfile.TemporaryDirectory() as td:
+            # 两张图：清晰高对比 vs 模糊低对比
+            sharp = Image.new("RGB", (64, 64), "white")
+            for x in range(0, 64, 4):
+                for y in range(64):
+                    sharp.putpixel((x, y), (0, 0, 0))
+            blurry = Image.new("RGB", (64, 64), (128, 128, 128))
+            p1, p2 = Path(td) / "shot_01_1.png", Path(td) / "shot_01_2.png"
+            sharp.save(p1); blurry.save(p2)
+            rows = pp.score_images([p2, p1])
+            self.assertEqual(rows[0]["path"], str(p1), "清晰高对比应排第一")
+            self.assertGreater(rows[0]["score"], rows[1]["score"])
+
+    def test_score_images_empty(self):
+        import postprocess as pp
+        self.assertEqual(pp.score_images([]), [])
+
+
+class TestBgmMix(unittest.TestCase):
+    """拓展#1 BGM 床：bgm_filter_chain 纯函数——VO 出现自动压低（闪避）。
+
+    seam：bgm_filter_chain(total: float, duck_db: int = -14) -> str
+    返回 ffmpeg filter 片段：BGM 输入循环补齐到 total + 音量基准。
+    闪避靠拼接时 sidechaincompress（VO 为 key），此函数只管 BGM 侧准备。
+    """
+
+    def test_bgm_chain_basic(self):
+        import vo_build as vb
+        fc = vb.bgm_filter_chain(60.0)
+        self.assertIn("aloop", fc, "BGM 短于成片必须循环")
+        self.assertIn("atrim=0:60.000", fc, "必须裁到成片总长")
+
+    def test_bgm_chain_duck_volume(self):
+        import vo_build as vb
+        fc = vb.bgm_filter_chain(30.0, duck_db=-10)
+        self.assertIn("volume=-10dB", fc, "基础音量=闪避目标电平，非闪避时段也保持低配")
+
+    def test_bgm_assembly_order(self):
+        """BGM 闪避链结构：sidechain 主输入必须是 BGM（被压方），VO 只当 key；
+        且 VO 必须进最终 amix（只输出 BGM 是 bug——复盘中抓到过）。"""
+        import vo_build as vb
+        segs = vb.bgm_assembly(["[base]", "[l1]"], 2, 60.0, -14)
+        joined = ";".join(segs)
+        self.assertIn("[bgmprep][vokey]sidechaincompress", joined,
+                      "BGM 在前=被压缩方，顺序不能反")
+        self.assertIn("[voout][ducked]amix", joined, "VO 必须与压过的 BGM 混进成片")
+        self.assertIn("asplit=2[voout][vokey]", joined, "VO 要 split 成出片+触发两路")
+
+    def test_bgm_end_to_end_audio_has_vo(self):
+        """内容级验证：BGM 版输出的音频里，旁白时段（1.0~2.5s，440Hz）必须有能量。
+        lavfi 造句音频+BGM，跑真实 vo_build 子进程，再 ffmpeg 分段测音量。"""
+        import subprocess as sp
+        from PIL import Image  # noqa: F401（确保 PIL 可用环境一致）
+        import ffmpeg_probe as fpx
+        ff = fpx.find_ffmpeg()
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            (td / "lines").mkdir()
+            # L01 @0.5s 440Hz 2s；BGM 220Hz 4s
+            sp.run([ff, "-y", "-loglevel", "error", "-f", "lavfi",
+                    "-i", "sine=frequency=440:duration=2", "-ar", "48000",
+                    str(td / "lines" / "L01.m4a")], check=True)
+            sp.run([ff, "-y", "-loglevel", "error", "-f", "lavfi",
+                    "-i", "sine=frequency=220:duration=4", "-ar", "48000",
+                    str(td / "bgm.m4a")], check=True)
+            (td / "vo_lines.json").write_text(json.dumps(
+                {"acts": [], "lines": [{"id": "L01", "shot": "S01", "at": 0.5, "text": "x"}]}),
+                encoding="utf-8")
+            vo_build_py = Path(__file__).resolve().parents[1] / "scripts" / "vo_build.py"
+            r = sp.run([sys.executable, str(vo_build_py),
+                        str(td / "vo_lines.json"), "--out", str(td / "vo.m4a"),
+                        "--total", "4.0", "--skip-tts", "--bgm", str(td / "bgm.m4a")],
+                       capture_output=True, text=True, encoding="utf-8",
+                       env={**os.environ, "PYTHONUTF8": "1"})
+            self.assertEqual(r.returncode, 0, r.stderr[-300:])
+            out = td / "vo.m4a"
+            self.assertTrue(out.exists() and out.stat().st_size > 1000)
+
+            def seg_mean(start: str, dur: str) -> float:
+                """分段均方根电平（dB）。注意 -ss 必须在 -i 前（输入侧 seek）：
+                放在 -i 后是输出侧 seek，ffmpeg 只在 mux 层丢帧，volumedetect
+                仍吃全量样本，测出的是整文件均值——静默段会假响（实测差 67dB）。"""
+                q = sp.run([ff, "-ss", start, "-t", dur, "-i", str(out),
+                            "-af", "volumedetect", "-f", "null", "-"],
+                           capture_output=True, text=True, encoding="utf-8",
+                           errors="replace")
+                import re as _re
+                m = _re.search(r"mean_volume:\s*(-?[\d.]+) dB", q.stderr)
+                self.assertIsNotNone(m, q.stderr[-300:])
+                return float(m.group(1))
+
+            # VO 窗口（1.0~2.5s，440Hz 旁白+BGM）必须显著高于纯 BGM 段（3.0~3.9s）。
+            # 只测绝对电平会被"输出里只剩 BGM"骗过——BGM 本身也是 -14dB 级的信号。
+            vo_seg, bgm_only = seg_mean("1.0", "1.5"), seg_mean("3.0", "0.9")
+            self.assertGreater(vo_seg - bgm_only, 6.0,
+                               f"VO 时段 {vo_seg}dB vs 纯BGM段 {bgm_only}dB，差 <6dB"
+                               "——旁白没混进成片（v3.1.16 复盘 bug 复发）")

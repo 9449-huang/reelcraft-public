@@ -470,6 +470,51 @@ def cmd_qcgate(args) -> None:
     sys.exit(rc)
 
 # ─── 跨镜首帧一致性粗检（qcseq，优化⑤）────────────────────
+# ---------- pick：count 选优半自动（A3，纯函数可单测） ----------
+def score_images(paths: list) -> list:
+    """对同镜 N 张候选图算启发式分（清晰度+对比度+亮度合理域），降序返回。
+    **只排序不拍板**——启发式有偏差，最终选哪张必须人看；本命令的价值是把
+    明显度差的沉底，让人只在 top 几张里挑。"""
+    from PIL import Image, ImageFilter, ImageStat
+    rows = []
+    for p in paths:
+        try:
+            with Image.open(p) as im:
+                gray = im.convert("L")
+                # 清晰度：拉普拉斯近似（锐化后差分能量）——高=边缘多=清晰
+                sharp = ImageStat.Stat(
+                    gray.filter(ImageFilter.FIND_EDGES)).stddev[0]
+                # 对比度：灰度标准差
+                contrast = ImageStat.Stat(gray).stddev[0]
+                # 亮度合理域：过暗/过曝扣分（目标 ~128 中值）
+                bright = ImageStat.Stat(gray).mean[0]
+                bright_penalty = abs(bright - 128) / 128
+                score = sharp * 2.0 + contrast - bright_penalty * 30
+            rows.append({"path": str(p), "sharpness": round(sharp, 2),
+                         "contrast": round(contrast, 2),
+                         "brightness": round(bright, 1),
+                         "score": round(score, 2)})
+        except Exception as e:
+            rows.append({"path": str(p), "sharpness": 0, "contrast": 0,
+                         "brightness": 0, "score": -999, "error": str(e)})
+    rows.sort(key=lambda r: r["score"], reverse=True)
+    return rows
+
+
+def cmd_pick(args) -> None:
+    """pick 子命令：shot_XX_{1..N}.png 候选打分排序，人看 top 选优。"""
+    paths = [Path(t) for t in args.images]
+    rows = score_images(paths)
+    print(f"[pick] {len(rows)} 张候选（启发式排序，只做参考——最终你拍板）：")
+    for i, r in enumerate(rows, 1):
+        err = f"  读取失败：{r.get('error', '')[:60]}" if r.get("error") else ""
+        print(f"  #{i}  {Path(r['path']).name:24s} 分 {r['score']:>8.2f}  "
+              f"清晰 {r['sharpness']:>6.2f} 对比 {r['contrast']:>6.2f} "
+              f"亮度 {r['brightness']:>6.1f}{err}")
+    if rows and not rows[0].get("error"):
+        print(f"\n[pick] 建议重点看 #{1}~#3，确认后用它覆盖正式帧名（或 batch --retry-failed 重拍最差的）")
+
+
 def _hsv_features(im) -> tuple:
     """PIL Image → (108 桶归一化 HSV 直方图, 环形均值色相°, 均值 S 0-1, 均值 V 0-1)。
     32x32 缩略足够判色调跳变；H 12 桶 × S 3 桶 × V 3 桶。"""
@@ -593,7 +638,9 @@ def cmd_kenburns(args) -> None:
 def cmd_kenburns_all(args) -> None:
     """stills/hybrid 档批量：目录内图片逐张转缓推片段（纯本地，0 API 调用）。
     输出 clip_NN.mp4 命名对齐 concat 的 glob("clip_*.mp4") 契约；
-    已存在的片段跳过（断点续跑，可反复重跑）。"""
+    注意：NN 是**图片序号**（第几张图），不是 vo_lines.json 里的 shot_id——
+    S01/S02… 与 clip_01/clip_02… 只有在镜序与图序一致时才对应，混剪前用
+    vo_build.py fit 对账确认。已存在的片段跳过（断点续跑，可反复重跑）。"""
     src = Path(args.dir)
     if not src.is_dir():
         die(f"目录不存在: {src}")
@@ -780,6 +827,9 @@ def main() -> None:
     sg.add_argument("--cell", type=int, default=320, help="单格宽 px")
     sg.add_argument("--max", type=int, default=20, help="最多取前 N 张")
 
+    pk = sub.add_parser("pick", help="选优半自动：候选图启发式打分排序（只参考，人拍板）")
+    pk.add_argument("images", nargs="+", help="候选图路径（shot_XX_1.png ... 或通配符展开）")
+
     args = ap.parse_args()
     if args.cmd == "concat":
         cmd_concat(args)
@@ -789,6 +839,8 @@ def main() -> None:
         cmd_qcgate(args)
     elif args.cmd == "qcseq":
         cmd_qcseq(args)
+    elif args.cmd == "pick":
+        cmd_pick(args)
     elif args.cmd == "extract":
         cmd_extract(args)
     elif args.cmd == "kenburns":
