@@ -3,7 +3,7 @@ name: reelcraft
 description: 一句话需求 → 多 provider 生图/视频流水线（主力池可配 + 智谱/魔塔兜底，图批量选优 + 首帧图编辑 + 视频双链兜底）→ 声音设计（VO/TTS/字幕/BGM 混音）→ 规格统一后期 → 自检。Use when user asks to 做个视频/出片/AIGC广告/多 provider 兜底 or 给出平台/赛事规格要求生成达标视频；强调多 key 轮转与**多 key 并行**、熔断、一镜多图选优、xfade/末帧链衔接、抽帧 QC 闭环、断点续跑。When NOT to use: 静态海报用 ppt-master 或 image-master，单帧修图用 buddy-image-processing。
 ---
 
-# ReelCraft — 多 provider 视频流水线（v3.1.11）
+# ReelCraft — 多 provider 视频流水线（v3.1.14）
 
 ### 何时使用
 - 用户给出主题 + 时长 + 风格，要求生成一段演示/参赛用 AIGC 视频
@@ -425,6 +425,11 @@ python scripts/vo_build.py vo/vo_lines.json --out vo/vo.m4a --total 55.94 --skip
 `media_gen.py status` 会显示 TTS 配置行并发极短小样探测链路真通（不走 /models——Edge 系服务返回空列表会误报；探测音色双降级 Cherry→zh-CN-XiaoxiaoNeural，兼容云端与本地 Edge 服务）。
 
 **BGM 版权**：必须无版权或明确可商用；用户提供音源，agent 不替用户担保曲目授权。
+
+**出片听诊（v3.1.12 方案B）**：视频模型音频能力未知——出片后先 `media_gen.py triage clips/` 机器粗筛要不要补朗读：
+- 哑片 → 建议补（tts 档）；自带中文人声 → 不用补（native 档）；英文/环境音 → 建议补；判不了 → 交人听
+- 听诊走硅基 SenseVoice 转写（扫 `MEDIA_TTS_<n>_*` 取第一个可用，零新配置）；`--pool <模型> --update-profile` 把结论写进 `~/.workbuddy/.audio_profiles.json`，**同模型下次免测**（传 `--pool` 即自动查档案命中跳过转录）；换模型版本/结论存疑时 `--refresh` 强制重测
+- `audit` 已带"有声/哑片"列——先看它再决定要不要开 triage。**机器只粗筛，配音风格/补不补永远你拍板**
 
 ## QC 闭环（生成后验收：让 prompt 优化从开环变闭环）
 

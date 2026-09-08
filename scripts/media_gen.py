@@ -17,6 +17,7 @@ from mg_core import (
     _wait_existing_task,
     call_with_failover,
     die,
+    find_existing_product,
     http_call,
     image_to_url_or_path,
     key_mask,
@@ -33,6 +34,7 @@ import json
 import mimetypes
 import os
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -185,7 +187,8 @@ def cmd_video(args) -> None:
                 if args.negative and _info.get("supports_negative"):
                     payload["negative_prompt"] = args.negative
             vpath = k.get("video_task_path") or k.get("task_path") or _info["task_path"]
-            return http_call("POST", f"{k['base']}{vpath}", headers, payload, timeout=300)
+            # 同步阻塞型网关（LTXBridge 风）POST 会阻塞到出片，超时给足（对齐 bridge task_timeout 1800s）
+            return http_call("POST", f"{k['base']}{vpath}", headers, payload, timeout=1800)
 
         try:
             resp, used_key = call_with_failover(pool, call_fn, kind="video", pin_key=args.pin_key)
@@ -204,8 +207,14 @@ def cmd_video(args) -> None:
     video_id = resp.get("video_id") or resp.get("id") or resp.get("task_id")
     # 同步出片 URL 复用统一解析（兼容 video_url/url/data dict/data list，#8）
     du = _abs_url(_extract_video_url(resp), used_key.get("base", ""))
+    os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
+    if isinstance(du, str) and os.path.exists(du) and not du.startswith("http"):
+        # 本地路径（LTXBridge 风同步响应带 local_path）：直接拷贝，不走网络/轮询（#10）
+        out = _final_out(out, du)
+        shutil.copyfile(du, out)
+        print(f"[media_gen] video OK via {provider} key#{used_key['n']}（本地直拷）-> {out}")
+        return
     if isinstance(du, str) and du.startswith("http"):
-        os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
         out = _final_out(out, du)
         _download(du, out)
         print(f"[media_gen] video OK via {provider} key#{used_key['n']} -> {out}")
@@ -319,6 +328,22 @@ def _tts_emotion_prefix(emotion: str) -> str:
     return f"你能用{e}的情感说吗，" if e else ""
 
 
+def _scan_tts_slots(env: dict, max_n: int = 200) -> list:
+    """扫已配 TTS key 序号（纯函数可单测）：起始空号跳过，遇配置后连续 3 空号停。
+    判"已配"用真值（空字符串=未配），与 mg_core.list_keys 口径一致。"""
+    ns, streak, tried = [], 0, False
+    for n in range(1, max_n):
+        has = bool(env.get(f"MEDIA_TTS_{n}_KEY") or env.get(f"MEDIA_TTS_{n}_BASE"))
+        if has:
+            ns.append(n)
+            streak, tried = 0, True
+        else:
+            streak += 1
+            if tried and streak >= 3:
+                break
+    return ns
+
+
 def cmd_tts(args) -> None:
     """OpenAI 兼容 /audio/speech 接口。多把 key 自动 failover（n 从 1 依次试，成功即停）；
     每把 key 可独立 MEDIA_TTS_<n>_VOICE（降级时音色自动切换）；--emotion 走文本引导。
@@ -338,21 +363,20 @@ def cmd_tts(args) -> None:
         text = prefix + text
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
-    # 扫描已配 TTS key 序号：遇第一个配置后连续空号即停（容忍断档与起始空号）
-    last_err, tried = "", False
-    for n in range(1, 20):
+    # 扫描已配 TTS key 序号（遇配置后连续 3 空号停，容忍断档与起始空号；上限动态不封死 19）
+    slots = _scan_tts_slots(os.environ)
+    last_err = ""
+    for n in slots:
         key = os.environ.get(f"MEDIA_TTS_{n}_KEY", "")
         base = os.environ.get(f"MEDIA_TTS_{n}_BASE", "").rstrip("/")
         if not (key or base):
-            if tried:
-                break
-            continue       # 起始空号不算：允许配置从任意序号开始
-        tried = True
+            continue       # 不会发生（slots 已过滤），防御保留
         if not (key and base):
             last_err = f"MEDIA_TTS_{n} 的 KEY/BASE 不完整"
             continue
         model = os.environ.get(f"MEDIA_TTS_{n}_MODEL", "") or "cosyvoice-v1"
-        voice = os.environ.get(f"MEDIA_TTS_{n}_VOICE", "") or args.voice
+        # CLI --voice 显式传入时优先（环境变量只是各 key 的默认值）
+        voice = args.voice or os.environ.get(f"MEDIA_TTS_{n}_VOICE", "")
         headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
         body = {"model": model, "input": text, "voice": voice, "response_format": "mp3"}
         if args.speed and args.speed != 1.0:
@@ -368,10 +392,21 @@ def cmd_tts(args) -> None:
             last_err = f"key#{n} {base}：{e}"
             print(f"[tts] key#{n} {base} 失败（{e}）——降级下一把", file=sys.stderr)
             continue
-        out.write_bytes(audio)
+        if len(audio) < 64:
+            # 200 但空体/极小响应是网关半死状态——落盘会产出 0KB 废 mp3 静默流入下游
+            last_err = f"key#{n} {base}：响应仅 {len(audio)} 字节（疑似空体）"
+            print(f"[tts] {last_err}——降级下一把", file=sys.stderr)
+            continue
+        # 原子写：先 tmp 后 replace，失败/被杀不留半截文件
+        tmp = out.with_suffix(out.suffix + ".tmp")
+        tmp.write_bytes(audio)
+        os.replace(tmp, out)
         print(f"[media_gen] tts OK key#{n} -> {out} ({len(audio)//1024}KB)"
               + (f"  emotion={getattr(args, 'emotion', '')}" if prefix else ""))
         return
+    if out.exists():
+        print(f"[tts] ⚠️ {out} 是上次跑的旧文件，本次全 key 失败未覆盖——下游勿复用",
+              file=sys.stderr)
     die(f"TTS 全部失败：{last_err or 'TTS 未配置（见 SKILL.md 声音设计节）'}", 3)
 def main() -> None:
     ap = argparse.ArgumentParser()
@@ -445,7 +480,7 @@ def main() -> None:
     tt.add_argument("--text-file", default="")
     tt.add_argument("--out", required=True)
     tt.add_argument("--voice", default="",
-                    help="音色名（默认读 MEDIA_TTS_<n>_VOICE，再留空用服务商默认）")
+                    help="音色名（显式传参优先于 env；缺省读 MEDIA_TTS_<n>_VOICE，再留空用服务商默认）")
     tt.add_argument("--emotion", default="",
                     help="情感词（高兴/悲伤/激昂/温柔…）——CosyVoice 系走文本引导，原样拼进正文")
     tt.add_argument("--speed", type=float, default=1.0,
@@ -499,6 +534,14 @@ def main() -> None:
     cn.add_argument("--yes", action="store_true", help="执行清理（移入 .trash/<时间戳>/，可反悔）")
     cn.add_argument("--purge", action="store_true", help="清空 .trash（不可逆）")
 
+    tr = sub.add_parser("triage", help="方案B 出片听诊：每镜要不要补朗读（机器粗筛，拍板留人）")
+    tr.add_argument("clips", nargs="+", help="成片文件或含 clip_*.mp4/webp 的目录")
+    tr.add_argument("--pool", default="", help="模型池名（配合 --update-profile 写档案）")
+    tr.add_argument("--update-profile", action="store_true",
+                    help="把结果写进 ~/.workbuddy/.audio_profiles.json（同模型下次免测）")
+    tr.add_argument("--refresh", action="store_true",
+                    help="忽略档案实测结论强制重测（配合 --pool）")
+
     mg_caps.build_parser(sub)        # caps show / probe / clear
 
     args = ap.parse_args()
@@ -532,6 +575,9 @@ def main() -> None:
         cmd_envcheck(args)
     elif args.cmd == "clean":
         cmd_clean(args)
+    elif args.cmd == "triage":
+        import audio_triage
+        sys.exit(audio_triage.cmd(args))
 
 if __name__ == "__main__":
     main()

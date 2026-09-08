@@ -42,19 +42,20 @@ def scan_key_env(pool: str, env: dict | None = None) -> dict:
     ns, missing_base = [], []
     n, empty_streak = 1, 0
     # 不能在第一个空号就停——断档（#1 #3 有 #2 缺）正是要检测的场景，停了就漏报 #3。
-    # 连续 3 个序号完全无 KEY/BASE 才认为扫到头。
+    # 连续 3 个序号完全无 KEY/BASE 才认为扫到头。判"已配"用真值（空字符串=未配，
+    # 与 mg_core.list_keys 一致——KEY="" 在 in env 口径下会被误计为已配）。
     while empty_streak < 3:
-        has_key = f"{prefix}{n}_KEY" in env
-        has_base = f"{prefix}{n}_BASE" in env
+        has_key = bool(env.get(f"{prefix}{n}_KEY"))
+        has_base = bool(env.get(f"{prefix}{n}_BASE"))
         if has_key:
             ns.append(n)
-            if not env.get(f"{prefix}{n}_BASE"):
+            if not has_base:
                 missing_base.append(n)
         empty_streak = 0 if (has_key or has_base) else empty_streak + 1
         n += 1
-    usable = bool(ns) and not missing_base
     # 断档：已配序号之间缺号（如 [1,3] 缺 2）
     gaps = [i for i in range(min(ns), max(ns) + 1) if i not in ns] if ns else []
+    usable = bool(ns) and not missing_base
     return {"prefix": prefix, "ns": ns, "gaps": gaps, "missing_base": missing_base,
             "usable": usable}
 
@@ -198,7 +199,9 @@ def summarize(results: list) -> tuple[int, str]:
     lines = []
     rc = 0
     for r in results:
-        badge = {"ok": "✅", "warn": "⚠️ ", "fail": "❌"}[r["level"]]
+        # badge 用 ASCII（envcheck 恰是"环境坏了才跑"的工具——裸 cmd 无 PYTHONUTF8 时
+        # emoji 会以 UnicodeEncodeError 替真正的报告炸掉，故不用 ✅⚠️❌）
+        badge = {"ok": "[OK] ", "warn": "[WARN]", "fail": "[FAIL]"}[r["level"]]
         lines.append(f"{badge} [{r['level']:>4}] {r['check']}: {r['detail']}")
         if r["level"] == "fail":
             rc = 1

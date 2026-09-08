@@ -570,8 +570,13 @@ def _insert_suffix(path: str, suffix: str) -> str:
     return str(p.with_name(f"{p.stem}{suffix}{p.suffix}"))
 
 def _abs_url(url: str, base: str) -> str:
-    """相对路径（如 /files/x.webp，本地桥接常见）按 base 的 origin 补全；绝对 URL 原样返回。"""
-    if not url or not isinstance(url, str) or url.startswith(("http://", "https://")):
+    """相对路径（如 /files/x.webp，本地桥接常见）按 base 的 origin 补全；绝对 URL 原样返回。
+    Windows 本地路径（E:\\... / E:/...，盘符含冒号）不是 URL，原样返回（#10）。"""
+    if not url or not isinstance(url, str):
+        return url
+    if url.startswith(("http://", "https://")):
+        return url
+    if len(url) >= 3 and url[0].isalpha() and url[1] == ":" and url[2] in ("\\", "/"):
         return url
     try:
         p = urllib.parse.urlparse(base)
@@ -745,26 +750,32 @@ def _pop_pending_task(task_id: str) -> dict | None:
     return rec
 
 def _extract_video_url(st: dict) -> str | None:
-    """从轮询响应提取视频 URL（兼容智谱/Agnes/网关等字段风格）。"""
+    """从轮询响应提取视频 URL（兼容智谱/Agnes/网关等字段风格）。
+    本地桥接（LTXBridge 风）POST 同步阻塞、响应自带 local_path——直拷本地文件，
+    不走网络、不受 http timeout 约束（#10）。
+    同时接受相对路径 URL（如 /files/x.webp），由调用方 _abs_url 按 base origin 补全。"""
     if not isinstance(st, dict):
         return None
+    lp = st.get("local_path")
+    if isinstance(lp, str) and lp and os.path.exists(lp):
+        return lp
     vr = st.get("video_result")
     if isinstance(vr, list) and vr and isinstance(vr[0], dict):
         u = vr[0].get("url")
-        if isinstance(u, str) and u.startswith("http"):
+        if isinstance(u, str) and u.startswith(("http", "/")):
             return u
     for k_ in ("video_url", "url"):
-        if isinstance(st.get(k_), str) and st[k_].startswith("http"):
+        if isinstance(st.get(k_), str) and st[k_].startswith(("http", "/")):
             return st[k_]
     data = st.get("data")
     if isinstance(data, dict):
         for k_ in ("video_url", "url"):
-            if isinstance(data.get(k_), str) and data[k_].startswith("http"):
+            if isinstance(data.get(k_), str) and data[k_].startswith(("http", "/")):
                 return data[k_]
     elif isinstance(data, list) and data and isinstance(data[0], dict):
         # 部分网关 data 是数组（OpenAI 兼容结构），此前仅认 dict 漏检（#9）
         for k_ in ("video_url", "url"):
-            if isinstance(data[0].get(k_), str) and data[0][k_].startswith("http"):
+            if isinstance(data[0].get(k_), str) and data[0][k_].startswith(("http", "/")):
                 return data[0][k_]
     return None
 
