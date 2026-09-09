@@ -212,6 +212,14 @@ def cmd_batch(args) -> None:
                "--num-frames", str(d.get("num_frames", 121)),
                "--negative", negative_for_shot(d, args.negative),
                "--pin-key", str(pin)]
+        # 过渡镜（首尾帧双条件）：shot JSON 写 last_frame=<图片路径> 即透传。
+        # 图片须已存在（通常是下一镜的关键帧或上镜末帧抽帧）——缺失时提前报，
+        # 别等提交后才发现（提交即扣额度）
+        if d.get("last_frame"):
+            _lf = Path(d["last_frame"])
+            if not _lf.exists():
+                return [], out, f"MISS (last_frame {d['last_frame']} not found)"
+            cmd += ["--last-frame", str(_lf)]
         if getattr(args, "video_size", ""):
             cmd += ["--video-size", args.video_size]
         if getattr(args, "video_duration", ""):

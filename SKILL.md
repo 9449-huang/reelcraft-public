@@ -3,7 +3,7 @@ name: reelcraft
 description: 一句话需求 → 多 provider 生图/视频流水线（主力池可配 + 智谱/魔塔兜底，图批量选优 + 首帧图编辑 + 视频双链兜底）→ 声音设计（VO/TTS/字幕/BGM 混音）→ 规格统一后期 → 自检。Use when user asks to 做个视频/出片/AIGC广告/多 provider 兜底 or 给出平台/赛事规格要求生成达标视频；强调多 key 轮转与**多 key 并行**、熔断、一镜多图选优、xfade/末帧链衔接、抽帧 QC 闭环、断点续跑。When NOT to use: 静态海报用 ppt-master 或 image-master，单帧修图用 buddy-image-processing。
 ---
 
-# ReelCraft — 多 provider 视频流水线（v4.4）
+# ReelCraft — 多 provider 视频流水线（v4.5）
 
 ### 术语速查（新会话先扫这张表，再读正文）
 
@@ -231,6 +231,7 @@ python scripts/media_gen.py edit \
 **衔接方式选择（重要）**：
 - **同场景连续镜头**（同一主体、机位延续，如"人物走近→特写"）→ **末帧链**：上一镜视频最后一帧抽出来当下一镜首帧，画面级一致性
 - **跨物体/跨场景切换**（如砚台→墨锭→毛笔）→ **独立首帧 + Step 6 的 xfade 交叉溶解**：i2v 模型无法完成大幅场景跳变，强行末帧链会导致画面崩坏或几乎不动
+- **想要"画面慢慢演化过去"的自然过渡**（长镜头感）→ **过渡镜（首尾帧双条件，v4.5）**：给 i2v 同时传首帧和尾帧，模型生成中间演化过程——比 xfade 的"后期叠化"自然得多。**半自动设计**：过渡镜就是一个普通 shot JSON（加 `last_frame` 字段指向尾帧图），何时插、插在哪人拍板，编排/时间轴体系零改动
 
 ```bash
 # ① 每镜独立首帧（跨物体切换的主流路径）
@@ -241,6 +242,13 @@ python scripts/media_gen.py video  --provider agnes --prompt "<i2v shotN>" --ima
 #    并把 ledger.transient_state 里上一镜的世界状态写进 prompt
 python scripts/media_gen.py last-frame clips/clip_01.mp4 shots/shot_02_seed.png
 python scripts/media_gen.py video --provider agnes --prompt "<i2v shot2, 据实写>" --image shots/shot_02_seed.png --out clips/clip_02.mp4 --num-frames 121
+
+# ③ 过渡镜（首尾帧双条件）：--last-frame 传尾帧，模型生成 A→B 的演化过程
+#    池需声明支持：custom 池 env 加 MEDIA_CUSTOM_n_LAST_FRAME_PARAM=<字段名>
+#    （各家叫法不同：tail_image / lastFrame / end_frame…；可选 _LAST_FRAME_LIST=1 列表形式）
+python scripts/media_gen.py video --provider <池> --prompt "slow cinematic morph, camera drifts forward" \
+  --image shots/shot_01.png --last-frame shots/shot_02.png --out clips/clip_01to02.mp4
+#    batch 侧：shot JSON 加 "last_frame": "shots/shot_02.png" 即自动透传（缺失时报 MISS 跳过不提交）
 ```
 
 **视频兜底链**（Agnes 不可用时）：

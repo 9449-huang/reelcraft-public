@@ -475,7 +475,11 @@ def list_keys(provider: str, pin: int = 0, required: bool = True, role: str = ""
                  "task_path": os.environ.get(f"{prefix}{n}_TASK_PATH", ""),
                  "image_task_path": os.environ.get(f"{prefix}{n}_IMAGE_TASK_PATH", ""),
                  "video_task_path": os.environ.get(f"{prefix}{n}_VIDEO_TASK_PATH", ""),
-                 "video_prompt_field": os.environ.get(f"{prefix}{n}_VIDEO_PROMPT_FIELD", "")}
+                 "video_prompt_field": os.environ.get(f"{prefix}{n}_VIDEO_PROMPT_FIELD", ""),
+                 # 过渡镜（首尾帧双条件）：key 级覆盖尾帧字段名/列表形（未配置=空串）
+                 "last_frame_param": os.environ.get(f"{prefix}{n}_LAST_FRAME_PARAM", ""),
+                 "last_frame_list": os.environ.get(f"{prefix}{n}_LAST_FRAME_LIST", "").strip().lower()
+                     in ("1", "true", "yes", "list")}
         # 口味档位（卡三四档：ultra/high/mid/low，由用户自选后落 env）；非法值 warn+忽略
         tier_raw = os.environ.get(f"{prefix}{n}_TIER", "").strip().lower()
         if tier_raw and tier_raw not in ("ultra", "high", "mid", "low"):
@@ -811,6 +815,26 @@ def _gen_image_once(pools: list[str], args, size: str, errs: list[str]) -> tuple
     die("所有可用池均失败:\n  " + "\n  ".join(errs), 3)
 
 # ─── 视频 ─────────────────────────────────────────────────
+def build_last_frame_fields(info: dict, key: dict | None = None) -> dict | None:
+    """过渡镜（首尾帧双条件）：解析尾帧 payload 字段名与形式。
+
+    池模板 / key env（MEDIA_<P>_n_LAST_FRAME_PARAM，list_keys 已并入 key dict）声明支持：
+      - last_frame_param + last_frame_list：字段名 + 是否列表（各家叫法不同：
+        tail_image / lastFrame / end_frame…）
+      - last_frame: True 的简写：支持但字段名用默认 "last_frame"
+    未声明支持 → 返回 None（调用方不传，老行为不变）。
+    key 级覆盖优先于池级（同池不同 key 接不同上游时用）。
+    返回 {字段名: None}——值由调用方填 URL/路径（与首帧同一编码方式）。"""
+    key = key or {}
+    param = key.get("last_frame_param") or info.get("last_frame_param")
+    if not param:
+        if info.get("last_frame") or key.get("last_frame"):
+            param = "last_frame"      # 声明支持但未指定名 → 默认名
+        else:
+            return None
+    return {param: None}
+
+
 def image_to_url_or_path(path: str) -> str:
     """本地图片 → data URI 或原样返回。"""
     p = Path(path)

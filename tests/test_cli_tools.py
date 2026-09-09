@@ -585,5 +585,49 @@ class TestListShotFiles(unittest.TestCase):
             self.assertEqual(names, ["S1.json", "shot_02.json"])
 
 
+@unittest.skipUnless(not _slow, 'slow: SLOW=1 启用')
+class TestBatchLastFrame(unittest.TestCase):
+    """过渡镜（半自动方案一）：shot JSON 的 last_frame 字段经 batch --dry-run 透传。
+
+    尾帧缺失时必须报 MISS 跳过（不提交——提交即扣额度）。
+    """
+
+    def _run(self, td: Path):
+        import subprocess as sp
+        mg = Path(__file__).resolve().parents[1] / "scripts" / "media_gen.py"
+        env = {**os.environ, "PYTHONUTF8": "1",
+               "MEDIA_AGNES_1_KEY": "k1", "MEDIA_AGNES_1_BASE": "https://example.invalid/v1"}
+        return sp.run([sys.executable, str(mg), "batch", str(td),
+                       "--phase", "videos", "--provider", "agnes",
+                       "--workers", "1", "--dry-run"],
+                      capture_output=True, text=True, encoding="utf-8", env=env)
+
+    def test_last_frame_passed_through(self):
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            (td / "frames").mkdir()
+            (td / "frames" / "S1.png").write_bytes(b"x")       # 首帧存在
+            (td / "next.png").write_bytes(b"y")                 # 尾帧存在
+            (td / "shot_01.json").write_text(json.dumps({
+                "shot_id": "S1", "t2i_prompt": "x", "i2v_prompt": "y",
+                "last_frame": str(td / "next.png")}), encoding="utf-8")
+            r = self._run(td)
+            self.assertEqual(r.returncode, 0, r.stderr[-300:])
+            self.assertIn("--last-frame", r.stdout)
+            self.assertIn("next.png", r.stdout)
+
+    def test_missing_last_frame_reports_miss(self):
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            (td / "frames").mkdir()
+            (td / "frames" / "S1.png").write_bytes(b"x")
+            (td / "shot_01.json").write_text(json.dumps({
+                "shot_id": "S1", "t2i_prompt": "x", "i2v_prompt": "y",
+                "last_frame": str(td / "ghost.png")}), encoding="utf-8")
+            r = self._run(td)
+            self.assertEqual(r.returncode, 0, r.stderr[-300:])
+            self.assertIn("MISS (last_frame", r.stdout)
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

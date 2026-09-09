@@ -15,6 +15,7 @@ from mg_core import (
     _poll_video_task,
     _resolve_async_task,
     _wait_existing_task,
+    build_last_frame_fields,
     call_with_failover,
     die,
     find_existing_product,
@@ -182,6 +183,18 @@ def cmd_video(args) -> None:
                     _img = image_to_url_or_path(args.image)
                     payload[_info.get("image_param", "image")] = (
                         [_img] if _info.get("image_list") else _img)
+                # 过渡镜（首尾帧双条件）：池/key 声明支持才传尾帧（字段名可配）
+                if getattr(args, "last_frame", ""):
+                    lf = build_last_frame_fields(_info, k)
+                    if lf:
+                        _lfurl = image_to_url_or_path(args.last_frame)
+                        _lfname = next(iter(lf))
+                        payload[_lfname] = (
+                            [_lfurl] if (k.get("last_frame_list")
+                                         or _info.get("last_frame_list")) else _lfurl)
+                    else:
+                        die(f"{pool} 未声明支持首尾帧双条件（last_frame_param）。"
+                            "custom 池在 env 加 MEDIA_<P>_n_LAST_FRAME_PARAM=<字段名> 启用", 2)
                 nf2 = args.num_frames
                 if nf2 and _info.get("supports_num_frames"):
                     payload["num_frames"] = nf2
@@ -470,6 +483,9 @@ def main() -> None:
     v = sub.add_parser("video")
     v.add_argument("--prompt", required=True)
     v.add_argument("--image", default="")
+    v.add_argument("--last-frame", default="",
+                   help="尾帧图（首尾帧双条件/过渡镜）：池声明支持才生效——"
+                        "custom 池配 MEDIA_<P>_n_LAST_FRAME_PARAM=<字段名> 启用")
     v.add_argument("--provider", default="",
                    help="key 池名（留空=按 MEDIA_PRIORITY 自动选池，跨池兜底）")
     v.add_argument("--out", required=True)
