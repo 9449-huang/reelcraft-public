@@ -10,6 +10,10 @@
 
 | 版本 | 日期 | commit | 测试数 | 一句话概括 | 引入了什么隐患（回滚重点） |
 |---|---|---|---|---|---|
+| **v4.4** | 2026-09-09 | bcc45cd | 215 | #5 成本账本（JSONL 调用记录 + `ledger` 报表）+ #6 声音链反向（`vo_build plan` 按 TTS 真实时长反推每镜时长） | 账本挂点在 call_with_failover/cmd_tts/cmd_edit，测试必须 patch LEDGER_FILE+STATE_FILE 到 tmp（真实 state 冷却条目会造"所有 key 失败: None"假故障） |
+| **v4.3** | 2026-09-09 | d537af6 | 203 | B6 SKILL 瘦身：585→551 行，文案方法论外置 copy-guide.md，TTS 细节归 voice-guide，修 audit 重复行 | 纯文档+export 规则清理；被删的口味卡句移除对应替换规则，防回潮靠 grep 自检 |
+| **v4.2** | 2026-09-09 | f723245 | 203 | 字幕链：srt 导入 + 样式预设档案（news/movie/variety）+ 测试拆 5 文件 + SLOW 门控 | drawtext 渲染串曾有空段 `::` 双冒号 bug（首版端到端失败根因，已修并钉死测试）；测试拆文件后跑法变 `python -m unittest discover tests` |
+| **v4.1** | 2026-09-09 | 41c77fe | 194 | 文档质量批（上承 v3.1.16）：实测断言加时间戳 + 水印/能力复述改指针 + 术语速查表 + 中英概念词统一 | 纯文档改动零代码；SKILL.md 头部新增术语表（约 30 行，B6 瘦身时的候选对象） |
 | v3.1.16 | 2026-09-08 | b09f4bf | 194 | 声音链三件套：vo_build fit 声画对账 + pick 选优半自动 + BGM 床闪避混音；双轴复核收尾（测量法 P1 + webp 哨兵） | vo_build 录音查找扩 .m4a；fit/pick 只建议不拍板；export 新增 CHANGELOG 赛事词替换规则 |
 | v3.1.15 | 2026-09-08 | f77cdb9 | 179 | 移除 references/competition-spec.md（赛后脱敏收尾）+ 引用清理 | 文件在 git 历史 f3ed235..e486a2d 可恢复；export SKIP 名保留防将来重建漏脱敏 |
 | v3.1.14 | 2026-09-08 | e486a2d | 179 | 二次复核修复：triage 档案读路径（--pool 命中免转录）+ tts 空体校验 | --pool 现在会跳过听诊直用档案结论（旧行为每次重转录）；响应 <64B 视为失败（某些网关返回极短真音频会被误拦，--refresh 重验） |
@@ -29,6 +33,82 @@
 | v3.1 | 2026-09-06 | 59d570d | — | 本地 Edge TTS 接入 key 池 | TTS 依赖本地服务（localhost:5050）在线 |
 | v3.0 | 2026-09-06 | 8d3a975 | 27 | 通用化中性化（去赛事归属） | 公开仓剔除私有池，私有能力不在公开版 |
 | v2.9 | 2026-09-05 | c37fa8e | — | 公开仓体检修复 | — |
+
+## v4.4（2026-09-09）
+
+两个功能拓展（TDD 红→绿，seam 先定：ledger_append 文件行为 / ledger_summarize 纯函数 / plan_axis 纯函数 / 两个 CLI）：
+
+- **#5 成本账本**：每次真实 API 调用追加一行 JSONL 到 `~/.workbuddy/.media_ledger.jsonl`
+  （`{ts,provider,key,op,ok,ms,err}`）。挂点三处：`call_with_failover`（image/video，含 batch
+  多进程各 subprocess）、`cmd_tts`（成功 + 每把 key 失败降级）、`cmd_edit`（成功）。
+  `media_gen.py ledger` 出汇总：总/成功/失败 + **白烧次数**（失败调用=免费档下被限速吃掉的
+  真时间）+ 按渠道/操作/天分组，`--days N` 过滤、`--json` 机器可读。
+  设计取舍：**append-only JSONL 而非 state 读改写**——追加天然适合并发，坏行只影响自己
+  （summarize 容错跳过，不炸整个 state）。
+- **#6 声音链反向**：`vo_build.py plan <lines> --out plan.json` ——VO 先行，逐句 TTS/录音取
+  真实时长 → `plan_axis` 自动排 `at`（gap 间隔）→ 反推每镜需求时长（+pad 呼吸）→
+  直接给出 `kenburns-all --duration` 逗号串。与 `fit` 互为镜像：**fit 是"镜定时长 → 对账 VO"，
+  plan 是"VO 定时长 → 生成镜时长"**（stills/hybrid 档画面跟着声音走）。
+  落盘 `vo_lines_at.json` 可喂回正向 `vo_build` 合成成片，两个方向闭环。
+- 测试 203 → **215**（+12：账本纯函数 5 + 挂点 2 + plan_axis 4 + plan 端到端 1）。
+- 教训（测试基建）：挂点测试必须**同时** patch `LEDGER_FILE` 和 `STATE_FILE` 到 tmp——
+  真实 state 里残留的 key 冷却条目会让 failover 全跳过，报 "所有 key 失败: None" 的假故障。
+
+## v4.3（2026-09-09）
+
+B6 SKILL 瘦身（纯文档，代码零改动，203 测试不变；方法论：SKILL.md 每次会话全文进 context，行数即持续 token 开销）：
+
+- **文案方法论外置**：第一原则正反例表 + copy.py 七条约束详解 + 筛选必做 → 新建
+  `references/copy-guide.md`（约 55 行），SKILL 留 8 行骨架 + 指针。
+- **TTS 渠道细节归位**：音色名/情感词表/降级提醒压缩为优先级清单，细节指向
+  voice-guide.md（复述=会过期的 cache，v4.1 方法论）。
+- **去重**：audit 命令重复两行（笔误 bug）、kenburns 兜底两处、路由规则与核心设计
+  重复的跨池兜底描述、核心设计 14/15/16 三条收紧。
+- **export_public 规则清理**：被瘦身删掉的"高规格卡（私有池大模型句式）"对应替换规则
+  移除（miss 只 warn 无害，但留着误导）；防私有池名回潮继续靠 grep 自检兜底。
+- 585 → **551 行**（-34，约 6%）；验证：references/ 9 个指针全部对应存在文件、
+  导出零命中无 warn、203 测试全绿。
+
+## v4.2（2026-09-09）
+
+字幕链 + 测试结构批（TDD：红→绿；结构优化 #1 + 功能拓展 #4）：
+
+- **srt 字幕导入（#4 前半）**：`postprocess.py concat --subtitle` 现在直接认 `.srt` 文件
+  （此前只认内部 JSON 格式）。`parse_srt` 纯函数：标准 `HH:MM:SS,mmm --> HH:MM:SS,mmm`
+  时间戳、多行文本合并、块序号容错、非法时间戳块丢弃（TestSrtParse ×4）。
+  utf-8-sig 读取，剪映/Premiere 导出的 srt 拿来即用。
+- **字幕样式预设档案（#4 后半）**：`--subtitle-preset news|movie|variety` 三风格
+  （`scripts/subtitle_presets.json`）——news=新闻条底框白字、movie=电影底幕、
+  variety=综艺黄字黑描边。`apply_preset` 条目级字段优先于预设（单条字幕想特殊，
+  JSON 里写 own 字段即可覆盖），未知预设 ValueError 直接 die（TestSubtitlePreset ×4）。
+- **drawtext 渲染串重构**：修复空 shadow 段产生 `::` 双冒号的 bug（首版端到端测试
+  红的根因——ffmpeg 报 Invalid argument）。改为 extras 列表逐段拼冒号，空段绝不输出。
+  端到端测试：lavfi 造 4s 底片 + srt + news 预设烧录，抽帧验白色像素 >50（真跑 ffmpeg）。
+- **测试拆分（#1，B5）**：test_media_gen.py（2332 行 194 测试 49 类）机械拆为 5 文件——
+  test_mg_core（18 类）/ test_cli_tools（11 类）/ test_postprocess（11 类）/
+  test_vo_build（7 类）/ test_pipeline（2 类）。零逻辑改动，类边界原样搬。
+- **SLOW 门控**：真跑 ffmpeg 的慢测试标 `@unittest.skipUnless(not _slow)`，
+  默认快跑 ~2s（skip 50），`SLOW=1` 全量 ~49s（203 项，skip 4）。
+  日常改码快反馈、提交前全量验，两档节奏。
+- 测试 194 → **203 项**（+9：srt×4 + 预设×4 + 端到端×1）。
+- 验证：快/SLOW 双档全绿、AST 过、导出自检私有词零命中。
+
+## v4.1（2026-09-09）
+
+文档质量批（代码零改动，测试 194 不变；方法论参照 writing-for-agents：环境是 source of truth，文档复述=会过期的 cache）：
+
+- **实测断言加时间戳（④）**：SKILL.md / model-capabilities.md / troubleshooting.md / prompt-styles.md 全量扫
+  "已验证/实测/无限量/带水印"字样逐条补"2026-09"标记；model-capabilities.md 头部加全局快照声明
+  （所有实测结论以 `caps probe --real` 落盘值为权威，7 天过期）。
+- **复述改指针（③）**：SKILL.md Step1 水印确认（原硬编码"智谱带/Agnes 不带"）→ 改查
+  `watermark_profiles.json`（档案自带 probed_at）；Step4 路由段、troubleshooting 水印行同改；
+  "能力白名单已硬编码"段改"以 caps show 实测为准"。
+- **术语速查表（①）**：SKILL.md 头部加 19 行术语表（池/key/六问/三档/末帧链/口味卡/slop/exit 4/
+  harvest/qcgate/单变量重拍/Director's Read/ledger…），新会话 agent 扫一遍表即可上岗；
+  README 加面向外部用户的 9 行简版——黑话门槛从"考古 20 分钟"降到"读表 3 分钟"。
+- **中英统一（⑥）**：概念词首次出现处补中文对译（Director's Read=导演读法、ledger=连续性分类账、
+  harvest=收割、kenburns=缓推）；CLI 命令名/API 名保留英文原文（grep 可检索性优先，rename 是破坏）。
+- 验证：194 测试全绿、caps sync --check 过、导出自检私有词零命中。
 
 ## v3.1.16（2026-09-08）
 

@@ -12,7 +12,7 @@
 | 内容审核拒绝（ProviderFatal） | **不换 key、不降级**——换家也一样拒，应改 prompt |
 | 视频轮询超时 10min | 提示手动用 video_id 查 |
 | Agnes 视频整体不可用 | 切智谱 CogVideoX-Flash（`--provider zhipu`，原生 1080p）；再不行 Ken Burns |
-| 智谱/魔塔返回带水印 | 不入正片，作概念图；正片用 Agnes 出图（魔塔 edit 输出无水印，可直接用） |
+| 返回带水印 | 查 `scripts/watermark_profiles.json`（含日期）：clean 直用 / corner-delogo 抹除 / fatal 换渠道；unknown 先 probe |
 | TTS 报“未配置” | 按指引补 `MEDIA_TTS_1_KEY/_BASE/_MODEL`（见声音设计节）；或改用用户自录 |
 | 成片无声 | 检查 concat 是否走了 xfade 分支且各 clip 自带音轨；`-map` 必须同时映射视频+音频 |
 | 成片只有音轨没画面 | 字幕步骤漏了 `-map 0:v`（显式 map 一旦出现，未列出的流全部丢弃） |

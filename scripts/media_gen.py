@@ -27,6 +27,7 @@ from mg_core import (
 )
 from mg_batch import cmd_batch, cmd_harvest
 from mg_status import cmd_status, cmd_qc, cmd_last_frame, cmd_plan_check
+import mg_core                     # 账本挂点用（ledger_append / LEDGER_FILE）
 import mg_caps                      # 能力单源（#2）：声明=候选，实测=权威
 import argparse
 import base64
@@ -275,6 +276,9 @@ def cmd_edit(args) -> None:
             out = args.out
             os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
             _download(imgs[0], out)
+            mg_core.ledger_append(mg_core.LEDGER_FILE,
+                                  {"provider": provider, "key": k["n"], "op": "edit",
+                                   "ok": True, "ms": 0})
             print(f"[media_gen] edit OK via {provider} -> {out}")
             return
         if status in ("FAILED", "FAIL", "ERROR"):
@@ -319,6 +323,36 @@ def cmd_clean(args) -> None:
     if getattr(args, "purge", False):
         cmd.append("--purge")
     sys.exit(subprocess.call(cmd))
+
+
+def cmd_ledger(args) -> None:
+    """#5 成本账本：读 JSONL 账本出汇总表（调用次数/成败/白烧/耗时）。
+    免费档语境下"成本"= RPM 限速下的调用次数 + 失败白烧的次数。"""
+    path = Path(args.file) if getattr(args, "file", "") else mg_core.LEDGER_FILE
+    rows = mg_core.ledger_read(path)
+    s = mg_core.ledger_summarize(rows, days=args.days)
+    if not s["total"]:
+        print(f"[ledger] 账本为空：{path}\n"
+              "  （调用记录在 image/video/tts/edit 每次真实请求后自动追加）")
+        sys.exit(0)
+    rate = s["ok"] / s["total"] * 100
+    print(f"[ledger] {path}")
+    print(f"  调用 {s['total']} 次：成功 {s['ok']} / 失败 {s['fail']}"
+          f"（成功率 {rate:.0f}%，白烧 {s['wasted']} 次）")
+    print("\n  按渠道：")
+    for k, b in sorted(s["by_provider"].items(), key=lambda x: -x[1]["total"]):
+        print(f"    {k:12s} {b['total']:4d} 次  ok {b['ok']:4d} / fail {b['fail']:3d}"
+              f"   耗时 {b['ms']/1000:6.1f}s")
+    print("\n  按操作：")
+    for k, b in sorted(s["by_op"].items(), key=lambda x: -x[1]["total"]):
+        print(f"    {k:12s} {b['total']:4d} 次  ok {b['ok']:4d} / fail {b['fail']:3d}"
+              f"   均耗时 {(b['ms']/max(b['total'],1)):.0f}ms")
+    print("\n  按天：")
+    for k, b in sorted(s["by_day"].items()):
+        print(f"    {k}  {b['total']:4d} 次  ok {b['ok']:4d} / fail {b['fail']:3d}")
+    if args.json:
+        print("\n" + json.dumps(s, ensure_ascii=False, indent=2))
+    sys.exit(0)
 
 
 def _tts_emotion_prefix(emotion: str) -> str:
@@ -385,22 +419,34 @@ def cmd_tts(args) -> None:
                                      data=json.dumps(body).encode(), method="POST")
         for k, v in headers.items():
             req.add_header(k, v)
+        t0 = time.time()
         try:
             with urllib.request.urlopen(req, timeout=300) as r:
                 audio = r.read()
         except Exception as e:
             last_err = f"key#{n} {base}：{e}"
             print(f"[tts] key#{n} {base} 失败（{e}）——降级下一把", file=sys.stderr)
+            mg_core.ledger_append(mg_core.LEDGER_FILE,
+                                  {"provider": "tts", "key": n, "op": "tts",
+                                   "ok": False, "err": str(e),
+                                   "ms": int((time.time() - t0) * 1000)})
             continue
         if len(audio) < 64:
             # 200 但空体/极小响应是网关半死状态——落盘会产出 0KB 废 mp3 静默流入下游
             last_err = f"key#{n} {base}：响应仅 {len(audio)} 字节（疑似空体）"
             print(f"[tts] {last_err}——降级下一把", file=sys.stderr)
+            mg_core.ledger_append(mg_core.LEDGER_FILE,
+                                  {"provider": "tts", "key": n, "op": "tts",
+                                   "ok": False, "err": last_err,
+                                   "ms": int((time.time() - t0) * 1000)})
             continue
         # 原子写：先 tmp 后 replace，失败/被杀不留半截文件
         tmp = out.with_suffix(out.suffix + ".tmp")
         tmp.write_bytes(audio)
         os.replace(tmp, out)
+        mg_core.ledger_append(mg_core.LEDGER_FILE,
+                              {"provider": "tts", "key": n, "op": "tts", "ok": True,
+                               "ms": int((time.time() - t0) * 1000)})
         print(f"[media_gen] tts OK key#{n} -> {out} ({len(audio)//1024}KB)"
               + (f"  emotion={getattr(args, 'emotion', '')}" if prefix else ""))
         return
@@ -542,6 +588,11 @@ def main() -> None:
     tr.add_argument("--refresh", action="store_true",
                     help="忽略档案实测结论强制重测（配合 --pool）")
 
+    lg = sub.add_parser("ledger", help="#5 成本账本：调用次数/成败/白烧统计（按渠道/操作/天）")
+    lg.add_argument("--days", type=int, default=0, help="只看最近 N 天（0=全部）")
+    lg.add_argument("--file", default="", help="账本路径（默认 ~/.workbuddy/.media_ledger.jsonl）")
+    lg.add_argument("--json", action="store_true", help="额外输出机器可读 JSON")
+
     mg_caps.build_parser(sub)        # caps show / probe / clear
 
     args = ap.parse_args()
@@ -578,6 +629,8 @@ def main() -> None:
     elif args.cmd == "triage":
         import audio_triage
         sys.exit(audio_triage.cmd(args))
+    elif args.cmd == "ledger":
+        cmd_ledger(args)
 
 if __name__ == "__main__":
     main()

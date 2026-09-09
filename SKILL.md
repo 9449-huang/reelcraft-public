@@ -3,7 +3,34 @@ name: reelcraft
 description: 一句话需求 → 多 provider 生图/视频流水线（主力池可配 + 智谱/魔塔兜底，图批量选优 + 首帧图编辑 + 视频双链兜底）→ 声音设计（VO/TTS/字幕/BGM 混音）→ 规格统一后期 → 自检。Use when user asks to 做个视频/出片/AIGC广告/多 provider 兜底 or 给出平台/赛事规格要求生成达标视频；强调多 key 轮转与**多 key 并行**、熔断、一镜多图选优、xfade/末帧链衔接、抽帧 QC 闭环、断点续跑。When NOT to use: 静态海报用 ppt-master 或 image-master，单帧修图用 buddy-image-processing。
 ---
 
-# ReelCraft — 多 provider 视频流水线（v3.1.16）
+# ReelCraft — 多 provider 视频流水线（v4.4）
+
+### 术语速查（新会话先扫这张表，再读正文）
+
+> 本文档是写给 agent 的操作规程，术语是内部黑话——**对用户永远说大白话**（"模型"而不是"池/key"，见 Step 1 话术原则）。
+> 同一概念全文只用下表一个叫法；API 名/参数名/文件名保留英文原文（grep 才能搜到）。
+
+| 术语 | 含义 |
+|---|---|
+| **池（provider/pool）** | 一个生图/视频服务渠道（agnes、zhipu、modelscope、custom…），一个池可配多把 key |
+| **key** | 一把 API 密钥；同池多 key 轮转分摊限速 |
+| **一条龙 / 分工** | 一把 key 包办生图+视频 / 生图视频各用不同家 |
+| **六问** | Step 1 开工前必须问用户的一次性确认（key 搭配/并行数/水印/成片模式/模型顺序/档位） |
+| **三档模式** | 成片模式：full 全真视频 / hybrid 重点镜 i2v+过场缓推 / stills 全缓推（0 视频调用） |
+| **i2v / t2v / t2i** | 图生视频 / 文生视频 / 文生图 |
+| **末帧链 / xfade** | 同场景连续镜头用上镜末帧当首帧 / 跨场景用交叉溶解转场 |
+| **kenburns（缓推）** | 静态图转缓慢推近视频的本地兜底，0 API 调用 |
+| **口味卡 / 骨架** | 每个池的 prompt 写法卡（`prompt-styles.md`）/ 通用的导演思维结构（`prompt-framework.md`）——骨架管"想得对"，口味卡管"喂得对" |
+| **slop 词** | 空洞的评价性形容词（beautiful/大气），不产生画面只产生 AI 味，见反套话词表 |
+| **caps 实测** | `caps probe --real` 真发一次请求落盘的能力结论（7 天过期），区别于 /models 猜测 |
+| **水印档案** | `watermark_profiles.json`：每渠道水印状态（clean/corner-delogo/unknown/fatal）+ 实测日期 |
+| **exit 4** | 视频任务轮询超时的退出码——触发"切池/续等/放弃"三选协议，任务已落盘不浪费 |
+| **harvest（收割）** | 把在途超时任务事后下载回来的命令 |
+| **qcgate / qcseq / qc** | 机器门禁（黑帧/规格）/ 跨镜色调一致性粗检 / 抽首中尾 3 帧人眼验收 |
+| **单变量重拍** | 画面不合格时一次只改一个变量（先改措辞→再调运动→再换首帧→最后换池） |
+| **断点续跑** | 每阶段幂等，有产物即跳过，中断后重跑同命令即可续 |
+| **Director's Read（导演读法）** | 拆镜前每镜先回答"为什么存在"，答不出的砍掉（`prompt-framework.md` 第 0 层） |
+| **ledger（连续性分类账）** | `shots/ledger.json`：immutable 不变量（色板/风格，每镜逐词重复）+ transient_state 世界状态（同场景镜头必须写进 prompt） |
 
 ### 何时使用
 - 用户给出主题 + 时长 + 风格，要求生成一段演示/参赛用 AIGC 视频
@@ -49,7 +76,7 @@ description: 一句话需求 → 多 provider 生图/视频流水线（主力池
 
 0. **Key 方案确认 + 角色路由**：开工前先问用户两件事——key 怎么搭配（**一条龙**一把 key 包办生图+视频，还是**分工**生图/视频用不同家）、开几发并行；每把 key 用 `_ROLES` 声明承担的角色，`MEDIA_PRIORITY` 决定主力池与跨池兜底顺序，`_IMAGE_MODEL/_VIDEO_MODEL` 填模型名即换更强模型（零改码）
 1. **prompt（英文生图/视频提示词）由对话模型直接撰写**（演进原因见 CHANGELOG）
-2. **多 provider 路由**：Agnes 主力（无限量）→ 智谱（一级兜底）→ 魔塔（图编辑），单 provider 内多 key 轮转
+2. **多 provider 路由**：Agnes 主力（2026-09 核对：免费档无总量上限，仅 RPM 限速）→ 智谱（一级兜底）→ 魔塔（图编辑），单 provider 内多 key 轮转，池全挂自动跨池兜底
 3. **熔断**：401→换 key；429→冷却换 key；5xx→退避重试；**审核拒绝不换 key（改 prompt）**
 4. **末帧链一致性**（有适用条件，见 Step 5）：同场景连续镜头用末帧链，跨物体切换用 xfade
 5. **断点续跑**：已完成 clip 跳过，state 持久化跨会话
@@ -62,12 +89,12 @@ description: 一句话需求 → 多 provider 生图/视频流水线（主力池
 12. **QC 闭环**：先 `qcgate` 机器门禁（黑帧/过曝/静帧/规格，FAIL 自动重跑），再 `qc`/`batch --qc` 抽首中尾 3 帧人眼验收，不合格按诊断表单变量重拍
 13. **文案批量出稿**：`copy.py --brief --count` AI 撒网出候选 → 人工筛选改写。
     ⚠️ 注意与第 1 条区分：**prompt 归对话模型写（机器看的技术描述），文案走 AI 批量（人看的创意）**——
-    实测证明约束到位时 agnes-2.5-flash 写中文文案质量很高，前提是给它硬约束
-14. **水印探测-抹除旁线**：档案 `scripts/watermark_profiles.json` 记各渠道水印状态（clean / corner-delogo / unknown / fatal）——命中档案免测直抹；首遇新渠道跑**固定镜头纯色画面** probe 片，抽帧目检定位（agent 自带视觉，0 API）后 `delogo_watermark.py --provider` 抹除并回写档案。只管小而静态的角标水印；动态/大面积记 fatal 换渠道
-15. **通用池 + 能力单源 + 三档模式**：任意 OpenAI 兼容渠道填 4 行 env 即接入（`MEDIA_CUSTOM_1_*`，零改码）。**能力以实测为权威**：`media_gen.py caps probe <pool> --kind image|video --real` 真发一次最小请求，把"能出片 + 实际规格"落盘 `~/.workbuddy/.media_caps.json`；`caps show` 三栏对照（声明=候选 / 实测=权威 / 生效值）；`status` 的 /models 启发式仅作线索、不当结论。新后端接入 = 配 env → `caps probe --real` 验一次，零改码。实测 7 天过期自动回落声明。成片三档 **full 全真视频 / hybrid 按镜混用（重点镜 i2v + 过场镜 kenburns） / stills 全缓推（0 视频调用）**——探测结果报给用户选，绝不自动降级
-16. **prompt 口味卡**：`references/prompt-styles.md` 三张"怎么喂"小卡——轻量卡（agnes/zhipu/qwen-edit 共用，按文生图/图编辑/视频三种活对号）／高规格卡（sora/kling 级大模型逐字段写全）／custom 两档（按模型实力选，判断不了问用户）——通用骨架保证"想得对"，口味卡保证"喂得对"；custom 池踩坑回写沉淀，越用越准
+    实测（2026-09）约束到位时 agnes-2.5-flash 写中文文案质量很高，前提是给它硬约束
+14. **水印探测-抹除旁线**：档案 `scripts/watermark_profiles.json` 记各渠道水印状态（clean/corner-delogo/unknown/fatal）——命中免测直抹；首遇新渠道跑固定镜头纯色 probe 片定位后 `delogo_watermark.py --provider` 抹除并回写档案。只管小而静态角标；动态/大面积记 fatal 换渠道
+15. **通用池 + 能力实测**：任意 OpenAI 兼容渠道填 4 行 env 即接入（`MEDIA_CUSTOM_1_*`，零改码）。能力以 `caps probe --real` 实测落盘为权威（7 天过期自动回落声明），/models 启发式仅作线索；成片三档 full/hybrid/stills 绝不自动降级（见 Step 1 问④）
+16. **prompt 口味卡**：`references/prompt-styles.md` 三张"怎么喂"小卡——轻量卡／高规格卡／custom 两档——通用骨架保证"想得对"，口味卡保证"喂得对"；custom 池踩坑回写沉淀，越用越准
 
-**回归测试**：`python -m unittest discover tests -v`（纯逻辑零网络；改 media_gen.py 后必跑）。
+**回归测试**：`python -m unittest discover tests`（快测试，~2s；改 scripts/ 后必跑）。**提交前**：`SLOW=1 python -m unittest discover tests` 全量 ~45s（含真跑 ffmpeg 的端到端）。测试按模块拆分：mg_core/cli_tools/postprocess/vo_build/pipeline（v4.2）。
 **image 超时协议**：异步图任务轮询超时 exit 4 + task_id 落盘（提交即扣不浪费），`harvest` 收割 video/image 两类 pending。
 **v2.8 工具箱**（详述见 CHANGELOG）：`postprocess.py webp2mp4`（.webp 产物转码）· `batch --retry-failed`（失败镜补跑，PENDING 先 harvest 防重复扣费）· `postprocess.py stylegrid`（混编画风拼图质检）· `plan-check`（plan.json 字段校验）。
 
@@ -86,19 +113,15 @@ description: 一句话需求 → 多 provider 生图/视频流水线（主力池
 
 ## Step 1 — 体检（5 分钟，必做）
 
-不体检直接开工 = 赌。脚本一次跑完四个 provider 的探针：
+不体检直接开工 = 赌。
 
 ```bash
-python scripts/media_gen.py status                                    # key 健康
-python scripts/media_gen.py image --provider agnes --prompt "probe" --size 1024x1024 --out probe_agnes.png
-python scripts/media_gen.py image --provider zhipu --prompt "probe" --size 1024x1024 --out probe_zhipu.png
+python scripts/media_gen.py status    # key 健康 + TTS 探测 + /models 能力线索
 ```
 
-把生成的两张图用 Read 工具查看，**确认两个关键点**：
-1. **水印**：智谱免费档右下角带"AI 生成"水印（已验证 → 成片需先 delogo），Agnes 不带（已验证）
-2. **风格一致性预演**：两张图风格差异显著 → 同一片内不要中途切换 provider
-
-体检报告写入对话日志，下一步决策依据。
+对要用的池各发一张 probe 图（`image --provider <池> --prompt "probe" --size 1024x1024`），用 Read 工具查看，**确认两个关键点**：
+1. **水印**：以 `scripts/watermark_profiles.json` 档案为准（含 `probed_at` 日期，渠道改版可能过期——kind=unknown 或久未复核的先 probe 再信）；档案命中的按 kind 处理（corner-delogo 抹除 / fatal 换渠道）
+2. **风格一致性预演**：各池 probe 图风格差异显著 → 同一片内不要中途切换 provider
 
 ### Key 方案确认（体检后、拆镜前，必问）
 
@@ -151,9 +174,9 @@ python scripts/media_gen.py image --provider zhipu --prompt "probe" --size 1024x
 
 按 `references/prompt-framework.md` 拆镜（60s 建议 10-14 镜，可弹性到 ≤120s）。
 
-**拆镜前先做 Director's Read**（framework 第 0 层）：每镜用一句话回答"这个镜头在故事里为什么存在"，写不出答案的镜头砍掉。把结论写进 shot JSON 的 `dramatic_function` 字段。
+**拆镜前先做 Director's Read（导演读法，framework 第 0 层）**：每镜用一句话回答"这个镜头在故事里为什么存在"，写不出答案的镜头砍掉。把结论写进 shot JSON 的 `dramatic_function` 字段。
 
-**连续性分类账**：拆镜同时建 `shots/ledger.json`（framework §3）——immutable（色板/光源/风格/道具外观，每镜强制重复）+ transient_state（世界状态，同场景镜头必须写入 prompt）。
+**连续性分类账（ledger）**：拆镜同时建 `shots/ledger.json`（framework §3）——immutable 不变量（色板/光源/风格/道具外观，每镜强制重复）+ transient_state 世界状态（同场景镜头必须写入 prompt）。
 
 每镜写到 `shots/shot_NN.json`：{景别, 主体外观锚点, 动作, 运镜, 光影色温, 风格, i2v_prompt, role, dramatic_function}。
 **事件密度防火墙**：每镜最多 1-2 个事件（framework §2），超了拆镜，不要塞。
@@ -197,13 +220,11 @@ python scripts/media_gen.py edit \
 **路由规则**（已写入 `scripts/media_gen.py`）：
 - **主力池由 `MEDIA_PRIORITY` 决定**（默认 agnes 优先；换主力 = 改 env 一行，零改码）
 - 同池内：key 1 失败 → 自动切 key 2（轮转）；401 黑名单 / 429 冷却 / 5xx 退避
-- 单命令池内全部 key 失败 → 按 `MEDIA_PRIORITY` 自动**跨池兜底**（如 agnes → zhipu）
-- 每把 key 的 `_ROLES` 决定它承担生图还是视频（缺省一条龙都干）；分工模式下路由只挑对口的 key
-- `_IMAGE_MODEL/_VIDEO_MODEL` 填模型名即换（payload 层生效，零改码）
-- 智谱带水印 → 用作"风格参考/概念验证"，**不入正片**（除非后期去水印）
+- 每把 key 的 `_ROLES` 决定它承担生图还是视频（缺省一条龙都干）；`_IMAGE_MODEL/_VIDEO_MODEL` 填模型名即换（零改码）
+- 水印状态查 `scripts/watermark_profiles.json`（带水印的 → 用作"风格参考/概念验证"，**不入正片**，除非后期去水印）
 - **开工前定好搭配，中途不换 provider**（会破坏风格一致性 → 全片关键帧需重生成）
 
-**模型能力白名单**已硬编码在脚本：Agnes 支持 1024×1024/1024×576/1344×768/2048×1152；智谱支持 1024×1024/1440×720 等。**注意：Agnes video 输出固定 1088×832（已实测），与首帧分辨率无关**——出图仍用 1344×768（给视频模型更多细节余量），达标交给后期裁切放大（Step 6）。
+**模型能力以实测为准**（`caps show` 三栏对照，`.media_caps.json` 为权威，声明白名单仅候选）：Agnes image 常用 1344×768；Agnes video 输出固定 1088×832（2026-09 实测，与首帧分辨率无关）——出图仍用 1344×768（给视频模型更多细节余量），达标交给后期裁切放大（Step 6）。
 
 ## Step 5 — 图生视频（末帧链 / xfade 按镜头关系二选一）
 
@@ -309,17 +330,18 @@ python scripts/postprocess.py concat clips/ \
 - `pos`：`center`（幕标题）/ `bottom`（对白字幕，默认）/ `left`（中式落版）
 - 幕标题时刻按**实际转场后的时间轴**计算：第 k 镜起点 = 前面所有 clip 时长之和 − 转场时长之和
 
+**srt 直入（v4.2）**：`--subtitles` 也认 `.srt` 文件（剪映/Premiere 导出拿来即用，
+标准 `HH:MM:SS,mmm` 时间戳，多行文本自动合并，坏时间戳块丢弃）；配
+`--subtitle-preset news|movie|variety`（新闻条底框白字/电影底幕/综艺黄字黑描边，
+档案 `scripts/subtitle_presets.json` 可改可加）。JSON 条目自带字段优先于预设。
+
 **踩坑记录（勿重蹈）**：
 - 一旦显式写 `-map`，必须**同时映射视频和音频**，否则输出会变成纯音轨（画面整段丢失）
 - 中文字体路径在 filter 内必须加单引号：`fontfile='C\:/Windows/Fonts/simkai.ttf'`
 - drawtext 表达式内的逗号必须转义为 `\,`，否则被当作 filter 分隔符
 - `volumedetect` 配 `-ss` 做分段电平测量不可靠（seek 误差），要精确就用 PCM 逐窗计算
 
-**兜底**：某镜视频生成失败时，用关键帧出 Ken Burns 缓推片段顶替（已内置，规格与主链一致）：
-
-```bash
-python scripts/postprocess.py kenburns shots/shot_03.png clips/clip_03.mp4 --duration 5
-```
+**兜底**：某镜视频生成失败 → kenburns 缓推顶替（命令见 Step 5 降级路径），规格与主链一致。
 
 **去网关水印**（档案驱动，探测流程见 Step 1 问③；小而静态的角标水印 delogo 边缘插值即可无痕去除）：
 
@@ -368,31 +390,9 @@ python scripts/copy.py --brief "文房四宝公益广告，匠人手艺" \
 # → 20 条候选 → 对话模型筛选改写 → 定稿进 vo/vo_lines.json
 ```
 
-**实测结论：约束 > 模型。** 同一个 agnes-2.5-flash：
-- "随便写" → 全是空话（"传承千年文脉""守护中华文化根魂"，还会混进英文、自加"创作思路"）
-- 加 7 条硬约束 → "笔挂起来，比握在手里活得长""手上有茧，笔下才有根"
-
-`copy.py` 内置的就是那套验证过的约束：① 绝不描述画面 ② 优先具体细节/数字 ③ ≤15 字短句
-④ 空话黑名单 ⑤ "传承/匠心"可用但必须搭配具体细节（不许单独成句）
-⑥ **数字必须可核实**（AI 会编"磨一百二十下""阴干六十天"这类假工艺参数，内行一眼看穿）
-⑦ few-shot 参考语气。
-
-**筛选时必做**：剔除疑似编造数字的句子；保留有反常识细节的（往往比人写的更有味道）。
-
-### ⚠️ 文案第一原则：字幕不做画面解说，只抛主张
-
-**画面负责证明，字幕负责下结论。** 写"一滴水，落进砚池"是废话——观众自己看得见。
-要把"你看见了什么"改写成"**所以呢**"：下判断、给数字、抛态度。
-
-| 画面 | ❌ 描述式（解说画面） | ✅ 主张式（广告文案） |
-|---|---|---|
-| 水入砚池 | 一滴水，落进砚池。 | 慢，是一种功夫。 |
-| 匠人研墨的手 | 一双手，把它磨成了墨。 | 这双手，磨了四十年。 |
-| 捞纸 | 一帘清水，捞起能活千年的纸。 | 一张宣纸，能活一千年。 |
-| 笔尖悬滴 | 最后一滴，悬在笔尖，将落未落。 | 千年的功夫，都在这一滴里。 |
-
-**自检**：写完每句问一句"这是观众已经看见的吗？"——是，就重写。
-**有效手法**：给数字（四十年/百遍/一千年）比堆形容词有说服力；公益片留白 50% 左右，话说满就没余韵。
+**约束 > 模型**（实测 2026-09）：`copy.py` 内置验证过的 7 条硬约束（不描述画面/给数字/短句/空话黑名单/数字可核实…）。
+**字幕第一原则：不做画面解说，只抛主张**——画面负责证明，字幕负责下结论；写完每句自问"这是观众已经看见的吗"。
+方法论与正反例表 → `references/copy-guide.md`。
 
 `vo_lines.json` 结构（`at` = 目标起始秒，按**转场后的实际时间轴**填）：
 ```json
@@ -414,20 +414,27 @@ python scripts/vo_build.py vo/vo_lines.json --out vo/vo.m4a --total 55.94 --skip
 python scripts/vo_build.py vo/vo_lines.json --out vo/vo.m4a --total 55.94 --bgm vo/bgm.m4a
 # 声画对账（TTS 后跑最准）：VO 时间轴 vs 逐镜 clip 时长，哪镜差多少一目了然
 python scripts/vo_build.py fit vo/vo_lines.json clips/
+# 声音链反向（VO 先行）：先合成取真实时长 → 自动排轴 → 反推每镜该多长
+python scripts/vo_build.py plan vo/vo_lines.json --out vo/plan.json --gap 0.5 --pad 0.8
 ```
+
+**声音链两个方向**（v4.4，按素材先后选）：
+- **正向 fit**：镜先拍好 → `fit` 对账 VO 与镜长，差多少要补多少（适合 full 全真视频）
+- **反向 plan**：VO 先定 → `plan` 按 TTS 真实时长自动排 `at`，反推每镜需求时长，
+  直接给 `kenburns-all --duration` 的逗号串（适合 stills/hybrid——画面跟着声音走）。
+  `plan` 输出 `vo/vo_lines_at.json`（带 at 的稿）可直接喂上一条 `vo_build` 合成成片。
 **选优半自动**（count N 张候选图）：`postprocess.py pick shot_01_*.png` 启发式打分排序（清晰度/对比度/亮度合理域），只做参考、人拍板；配合 `batch --count 3` 用。
 脚本会做：越界检查（实际时长 > 到下一句的间隔则警告）→ 静音底铺满总长 → 各句精确落位 →
 输出 `subtitles_final.json` → 报告有声/留白占比（公益片留白 40-50% 较合适）。
 
-**TTS 未配置 key 时**脚本会明确报错并给出配置指引（不是静默失败）。渠道优先级（多 key 自动 failover，`media_gen.py tts` 按 n 依次试、成功即停，**每把 key 连音色一起切**）：
-1. **硅基流动 CosyVoice2-0.5B**（`api.siliconflow.cn/v1`，OpenAI 兼容；中文情感强——`--emotion 高兴/悲伤/激昂…` 走**文本引导**"你能用{情感}的情感说吗"拼进正文，音色用预置 `FunAudioLLM/CosyVoice2-0.5B:<name>` 或用上传的自定义音色）——默认主力
-2. **本地 Edge TTS 服务**（`localhost:5050/v1`，免费无限；音色 zh-CN-XiaoxiaoNeural 女 / YunxiNeural 男——**无情感、平铺直叙，仅作降级兜底**，MEDIA_TTS_2_VOICE 自动切）
-3. **用户自录**（版权零风险，最稳；`--skip-tts` 只拼接打轴）
-4. 情感词表与场景→语速/音色/情感组合见 `references/voice-guide.md`（声音风格卡）
+**TTS 未配置 key 时**脚本会明确报错并给出配置指引（不是静默失败）。渠道优先级（多 key 自动 failover，成功即停，**每把 key 连音色一起切**）：
+1. **硅基流动 CosyVoice2-0.5B**（中文情感强，`--emotion` 走文本引导）——默认主力
+2. **本地 Edge TTS 服务**（localhost:5050，免费；无情感，仅降级兜底）
+3. **用户自录**（版权零风险最稳；`--skip-tts` 只拼接打轴）
 
-**vo_lines.json 逐句声音属性**（情绪节奏靠它，别整篇念经）：每行可带 `voice`(逐句换音色) / `emotion`(高兴/悲伤/激昂/温柔/平稳/俏皮/严肃/沉稳…) / `speed`(语速倍率)，省略则用命令行 `--voice/--speed` 全局值——高潮句用激昂档、情感独白用温柔档、产品介绍用平稳档（组合建议见风格卡）。
+音色/情感词表/场景→声音参数组合、降级提醒 → `references/voice-guide.md`（声音风格卡）。
 
-`media_gen.py status` 会显示 TTS 配置行并发极短小样探测链路真通（不走 /models——Edge 系服务返回空列表会误报；探测音色双降级 Cherry→zh-CN-XiaoxiaoNeural，兼容云端与本地 Edge 服务）。
+**vo_lines.json 逐句声音属性**（情绪节奏靠它，别整篇念经）：每行可带 `voice`(逐句换音色) / `emotion` / `speed`，省略则用命令行全局值——高潮句激昂、独白温柔、产品介绍平稳（组合建议见风格卡）。
 
 **BGM 版权**：必须无版权或明确可商用；用户提供音源，agent 不替用户担保曲目授权。
 
@@ -463,7 +470,7 @@ python scripts/media_gen.py batch shots60/ --phase videos --workers 2 --qc
 1. 首帧是否复现 t2i 关键帧的构图/主体外观（漂移说明 i2v 没吃住首帧）
 2. 中帧是否在执行 i2v_prompt 描述的**那一个**动作（执行了别的 = 运动指令被误读）
 3. 尾帧是否有崩坏（手部畸形、面部扭曲、物体穿模、画面闪断）
-4. 与上一镜的连续性（ledger 里的 immutable 不变量是否保持）
+4. 与上一镜的连续性（ledger 里的 immutable 不变量是否逐词保持）
 
 **单变量重拍**：一次只改一个变量，否则不知道哪改动起效——
 先换 prompt 措辞 → 再调运动幅度 → 再换首帧（`--count` 重出选优）→ 最后才换 provider。
@@ -488,7 +495,6 @@ python scripts/media_gen.py run shots60/ --dry-run          # 统一入口（= p
 python scripts/media_gen.py envcheck                         # #65 开跑前体检：ffmpeg/PIL/字体/key env/本地服务
 python scripts/media_gen.py clean shots60/                   # #66 产物治理：scan-only 清单；--yes 移入 .trash；--purge 真删
 python scripts/media_gen.py audit shots60/                   # 进度审计：每镜状态 + 下一步
-python scripts/media_gen.py audit shots60/                  # 进度盘点：每镜出图/出片/失败 + 下一步
 python scripts/media_gen.py run shots60/ --qcgate           # 视频阶段过机器门禁
 python scripts/media_gen.py run shots60/ --stop-after images# 每阶段人工把关
 python scripts/media_gen.py run shots60/ --watermark <渠道> --watermark-dry-run  # 交付出前只列待抹水印档
@@ -526,6 +532,12 @@ python scripts/media_gen.py run shots60/ --watermark <渠道> --watermark-dry-ru
 实测参考（11 镜公益片）：关键帧 1m56s（全成），视频 19m25s（串行，约 2 分钟/镜），后期 1-2 分钟。12 镜商业片双 key 实测：出图 1m33s、视频 ~15 分钟（含一次 429 隔离重试）。
 
 全程走免费额度，不消耗 WorkBuddy credits。
+
+**成本账本（#5，v4.4）**：每次真实 API 调用（image/video/tts/edit）自动追加一行到
+`~/.workbuddy/.media_ledger.jsonl`，`media_gen.py ledger` 出汇总——调用次数、成功率、
+**白烧次数**（失败调用，免费档下就是被限速吃掉的真金时间）、按渠道/操作/天分组耗时。
+`--days 7` 看最近一周；`--json` 出机器可读。出片量大或怀疑某池不稳时先查它：
+成功率掉到 80% 以下 = 有 key 或池在慢性失败，别闷头重跑。
 
 ## 安全
 
