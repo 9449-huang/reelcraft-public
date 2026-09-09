@@ -6,6 +6,20 @@
 
 面向演示/参赛用 AIGC 视频，强调**多 key 轮转、双 key 并行、熔断、一镜多图选优、xfade/末帧链衔接、抽帧 QC 闭环、断点续跑**。
 
+## 术语表（3 分钟看懂行话）
+
+| 术语 | 含义 |
+|---|---|
+| 池（provider） | 一个生图/视频服务渠道，可配多把 key 轮转分摊限速 |
+| i2v / t2v / t2i | 图生视频 / 文生视频 / 文生图 |
+| 末帧链 / xfade | 同场景连续镜头用上镜末帧当首帧保证连贯 / 跨场景交叉溶解转场 |
+| kenburns（缓推） | 静态图转缓慢推近视频的兜底方案，纯本地零 API 调用 |
+| 口味卡 / 骨架 | 每个渠道的提示词写法卡 / 通用的导演思维结构——骨架管"想得对"，口味卡管"喂得对" |
+| 三档模式 | full 全真视频 / hybrid 重点镜视频+过场缓推 / stills 全缓推 |
+| exit 4 + harvest | 视频任务超时的退出码与事后收割命令——任务已提交不浪费，随时可收回结果 |
+| qcgate / qc | 机器门禁（黑帧/规格检查）/ 抽首中尾 3 帧人工验收 |
+| 单变量重拍 | 画面不合格时一次只改一个变量，定位是哪个改动起效 |
+
 ## 特性
 
 - 多 provider 路由：主力池可配（`MEDIA_PRIORITY`，默认 Agnes）→ 智谱 CogView/CogVideoX（一级兜底）→ 魔塔 Qwen-Image-Edit（首帧小改）；单命令失败自动跨池兜底
@@ -38,7 +52,7 @@ reelcraft/
 │   ├── copy.py              # 文案批量出稿
 │   ├── export_public.py     # 导出公开版（仅维护者用，剔除私有渠道痕迹）
 │   └── ffmpeg_probe.py      # 跨平台定位 ffmpeg
-├── tests/                   # 单元测试（python -m unittest discover tests，零网络）
+├── tests/                   # 单元测试（按模块拆分；快跑 ~2s，SLOW=1 全量含 ffmpeg 端到端 ~45s，零网络）
 ├── references/              # prompt 框架 / 口味卡 / 模型能力 / 反套话词表 / 规格参考 / 变更日志
 └── media_keys.env.example   # 密钥模板（复制改名填真实 key）
 ```

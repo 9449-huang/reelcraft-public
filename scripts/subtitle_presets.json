@@ -1,0 +1,27 @@
+{
+  "_readme": "字幕样式预设档案：postprocess.py concat --subtitle-preset <名> 自动读取。条目级字段优先于预设（只有字幕条目缺的样式字段才用预设填）。新增风格=加一个键，零改码。",
+  "news": {
+    "pos": "bottom",
+    "size": 44,
+    "fade": 0.3,
+    "fontcolor": "white",
+    "box": "box=1:boxcolor=black@0.55:boxborderw=14",
+    "note": "新闻条风格：底框+快切换，信息字幕首选"
+  },
+  "movie": {
+    "pos": "bottom",
+    "size": 40,
+    "fade": 0.8,
+    "fontcolor": "white",
+    "box": "",
+    "note": "电影底幕风格：无框+慢淡入淡出，叙事片旁白字幕"
+  },
+  "variety": {
+    "pos": "center",
+    "size": 56,
+    "fade": 0.5,
+    "fontcolor": "yellow",
+    "box": "borderw=4:bordercolor=black",
+    "note": "综艺描边风格：黄字黑边居中，强调卡点/标题句"
+  }
+}

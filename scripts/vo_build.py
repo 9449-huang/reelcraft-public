@@ -66,7 +66,251 @@ def tts_line(text: str, out: Path, voice: str, speed: float, emotion: str = "") 
         die(f"TTS 失败：{out.name}（rc={rc}）。若已自录，加 --skip-tts 跳过合成", 3)
 
 
+# ---------- fit：VO 轴 vs 镜头时长对账（A1'，纯函数可单测） ----------
+def fit_report(vo_data: dict, clip_durs: dict, gap: float = 0.3,
+               tol: float = 0.5) -> list:
+    """每镜对账：VO 需求时长（末句 at+dur+gap - 首句 at）vs clip 实际时长。
+    verdict：ok（差 ≤ tol）/ warn（VO 比镜长）/ info（镜无 VO，空镜合法）/ missing（镜缺成片）。
+    clip_durs 值为 -1.0 表示静态图片镜（.webp 探不出时长，时长由 concat/kenburns 决定）——
+    报 info 不报 missing，VO 需求照常算出来给参考。
+    句长未知（无 _dur，未合成）时按 0 计——对账应在 TTS 后跑才精确，但提前跑也能查结构。"""
+    lines = [ln for ln in vo_data.get("lines", []) if ln.get("shot")]
+    # 每镜 VO 段：首句 at → 末句 at+dur+gap
+    spans: dict = {}
+    for ln in lines:
+        s = ln["shot"]
+        end = ln.get("at", 0) + ln.get("_dur", 0) + gap
+        if s not in spans:
+            spans[s] = [ln.get("at", 0), end, 1]
+        else:
+            spans[s][1] = max(spans[s][1], end)
+            spans[s][2] += 1
+    all_shots = sorted(set(spans) | set(clip_durs), key=str)
+    rows = []
+    for s in all_shots:
+        has_vo, has_clip = s in spans, s in clip_durs
+        if not has_clip:
+            rows.append({"shot": s, "n_lines": spans.get(s, [0, 0, 0])[2],
+                         "vo": round(spans[s][1] - spans[s][0], 2) if has_vo else 0.0,
+                         "clip": None, "diff": None, "verdict": "missing",
+                         "advice": "成片缺失——先 batch/harvest 补齐"})
+            continue
+        clip = float(clip_durs[s])
+        if clip < 0:
+            # 静态图片镜：probe 不到时长（哨兵 -1.0），不是缺成片
+            vo_need = round(spans[s][1] - spans[s][0], 2) if has_vo else 0.0
+            rows.append({"shot": s, "n_lines": spans[s][2] if has_vo else 0,
+                         "vo": vo_need, "clip": None, "diff": None,
+                         "verdict": "info",
+                         "advice": "静态图片镜（webp），时长由 concat/kenburns 决定——"
+                                   "kenburns 生成时按此 VO 需求配 --duration"})
+            continue
+        if not has_vo:
+            rows.append({"shot": s, "n_lines": 0, "vo": 0.0, "clip": round(clip, 2),
+                         "diff": None, "verdict": "info",
+                         "advice": "此镜无旁白（空镜/纯音乐合法），无需对齐"})
+            continue
+        vo_need = spans[s][1] - spans[s][0]
+        diff = round(clip - vo_need, 2)
+        if diff >= -tol:
+            verdict, advice = "ok", ("" if abs(diff) <= tol else
+                                      f"镜比 VO 长 {diff}s——可留给转场呼吸，或 trim 镜")
+        else:
+            verdict = "warn"
+            advice = (f"VO 比镜长 {-diff:.2f}s——建议：镜延长（hybrid 用 kenburns 补长）"
+                      f"或该镜 VO speed≈{min(1.4, 1 + (-diff) / max(vo_need, 0.1)):.2f} 提速")
+        rows.append({"shot": s, "n_lines": spans[s][2], "vo": round(vo_need, 2),
+                     "clip": round(clip, 2), "diff": diff, "verdict": verdict,
+                     "advice": advice})
+    return rows
+
+
+# ---------- plan：VO 先行反推每镜时长（#6，与 fit_report 互为镜像） ----------
+def plan_axis(items: list, gap: float = 0.5, pad: float = 0.8) -> dict:
+    """声音链反向：句子按序自动排轴（at = 上一句 at+dur+gap），按 shot 聚合出
+    每镜需求时长（末句 at+dur − 首句 at + pad）。无 shot 的句子照常排轴但不进镜聚合。
+    items: [{"id","text","dur"(TTS 真实秒),"shot"?}]
+    返回 {"lines":[...每句带 at...], "shots":{sid:{"need","n_lines","first_at","last_end"}},
+          "total": 末句收尾+pad}"""
+    lines = []
+    at = 0.0
+    for it in items:
+        dur = float(it.get("dur", 0))
+        rec = {"id": it.get("id", "?"), "text": it.get("text", ""),
+               "at": round(at, 2), "dur": round(dur, 2)}
+        if it.get("shot"):
+            rec["shot"] = it["shot"]
+        lines.append(rec)
+        at += dur + gap
+    spans: dict = {}
+    for rec in lines:
+        s = rec.get("shot")
+        if not s:
+            continue
+        end = rec["at"] + rec["dur"]
+        if s not in spans:
+            spans[s] = [rec["at"], end, 1]
+        else:
+            spans[s][1] = max(spans[s][1], end)
+            spans[s][2] += 1
+    shots = {s: {"need": round(spans[s][1] - spans[s][0] + pad, 2),
+                 "n_lines": spans[s][2],
+                 "first_at": spans[s][0], "last_end": round(spans[s][1], 2)}
+             for s in spans}
+    total = round((lines[-1]["at"] + lines[-1]["dur"] + pad) if lines else pad, 2)
+    return {"lines": lines, "shots": shots, "total": total}
+
+
+def bgm_filter_chain(total: float, duck_db: int = -14) -> str:
+    """BGM 侧准备链：循环补齐到成片长 + 全程基础音量。
+    duck_db 是 BGM 的**全程音量**（VO 出现时 sidechaincompress 在此基础上进一步压低），
+    不是"仅非 VO 时段"的音量——BGM 任何时刻都不该盖过人声。"""
+    return (f"aloop=loop=-1:size=2e+09,atrim=0:{total:.3f},"
+            f"aresample=48000,volume={duck_db}dB[bgm]")
+
+
+def bgm_assembly(labels: list, bgm_idx: int, total: float, duck: int = -14) -> list:
+    """BGM 闪避混音的 fc 片段（纯函数可单测）：
+    ① BGM 输入 → 循环裁齐压基准音量 → [bgmprep]
+    ② VO 总线（静音底+各句 amix）asplit 两路：出片 [voout] + 闪避 key [vokey]
+    ③ [bgmprep] 主输入 + [vokey] 触发 → sidechaincompress → [ducked]
+       （**顺序不能反**：主输入是被压缩方——BGM 被压，VO 只当触发器）
+    ④ [voout]+[ducked] amix → [mix]——VO 必须在成片里，只输出 BGM 是 bug
+    """
+    return [
+        f"[{bgm_idx}:a]" + bgm_filter_chain(total, duck).replace("[bgm]", "[bgmprep]"),
+        "".join(labels) +
+        f"amix=inputs={len(labels)}:normalize=0:duration=first[voax0]",
+        "[voax0]asplit=2[voout][vokey]",
+        "[bgmprep][vokey]sidechaincompress=threshold=0.03:ratio=8:"
+        "attack=200:release=1000[ducked]",
+        f"[voout][ducked]amix=inputs=2:normalize=0:duration=first[mix]",
+    ]
+
+
+def _existing_recording(lines_dir: Path, lid: str) -> Path | None:
+    """找已有录音（.mp3/.m4a/.wav 任一），没有返回 None。"""
+    for ext in (".mp3", ".m4a", ".wav"):
+        cand = lines_dir / f"{lid}{ext}"
+        if cand.exists():
+            return cand
+    return None
+
+
+def cmd_plan(args) -> None:
+    """#6 声音链反向：VO 先行 → TTS/录音取真实时长 → 自动排轴 → 反推每镜该多长。
+    与 fit 互为镜像：fit 是"镜定时长 → 对账 VO"，plan 是"VO 定时长 → 生成镜时长计划"。
+    plan 输出的 vo_lines_at.json 可直接喂正向 vo_build（--out 合成成片）。"""
+    src = Path(args.lines)
+    if not src.exists():
+        die(f"找不到 {src}")
+    data = json.loads(src.read_text(encoding="utf-8"))
+    lines = data.get("lines", [])
+    if not lines:
+        die("vo_lines.json 的 lines 为空")
+
+    lines_dir = Path(args.dir) if args.dir else src.parent / "lines"
+    out = Path(args.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    # ① 逐句取真实时长：已有录音直接 probe，否则 TTS 合成
+    items = []
+    for ln in lines:
+        lid = ln["id"]
+        f = _existing_recording(lines_dir, lid)
+        if f is None:
+            if args.skip_tts:
+                die(f"--skip-tts 但缺少录音 {lines_dir}/{lid}.mp3|m4a|wav", 2)
+            voice = ln.get("voice") or args.voice
+            tts_line(ln["text"], lines_dir / f"{lid}.mp3", voice,
+                     float(ln.get("speed") or args.speed), ln.get("emotion", ""))
+            f = lines_dir / f"{lid}.mp3"
+        d = probe(f)
+        if d <= 0:
+            die(f"{f.name} 时长为 0，文件可能损坏", 4)
+        items.append({"id": lid, "text": ln["text"], "dur": d, "shot": ln.get("shot", "")})
+        print(f"  {lid} {d:.2f}s  {ln['text']}")
+
+    # ② 排轴 + 反推每镜需求
+    res = plan_axis(items, gap=args.gap, pad=args.pad)
+
+    # ③ 落盘：带 at 的 vo_lines（喂正向 vo_build）+ 计划表（喂 kenburns/出片）
+    at_path = out.parent / "vo_lines_at.json"
+    at_path.write_text(json.dumps(
+        {"acts": data.get("acts", []),
+         "lines": [{"id": r["id"], "text": r["text"], "at": r["at"],
+                    "shot": r.get("shot", "")} for r in res["lines"]]},
+        ensure_ascii=False, indent=2), encoding="utf-8")
+    out.write_text(json.dumps(res, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    print(f"\n{'句':6s} {'起':6s} {'时长':6s} {'镜':6s}")
+    for r in res["lines"]:
+        print(f"{r['id']:6s} {r['at']:5.2f}s {r['dur']:5.2f}s {r.get('shot','—'):6s}")
+    print(f"\n每镜需求时长（VO 长度 + pad {args.pad}s 呼吸）：")
+    for sid, b in sorted(res["shots"].items()):
+        print(f"  {sid}  {b['need']:.2f}s  （{b['n_lines']} 句）")
+    dur_csv = ",".join(
+        f"{b['need']:.2f}" for _, b in sorted(res["shots"].items()))
+    print(f"\n[plan] 成片参考总长 {res['total']:.2f}s（末句收尾 + pad）")
+    print(f"[plan] 全缓推可这样跑（按镜序）：")
+    print(f"  python postprocess.py kenburns-all shots/ --outdir clips/ --duration \"{dur_csv}\"")
+    print(f"[plan] -> {at_path.name}（喂 vo_build 合成成片）+ {out.name}（计划表）")
+    sys.exit(0)
+
+
+def cmd_fit(args) -> None:
+    """fit 子命令：读 vo_lines.json + clips/ 目录逐镜 probe，打印对账表。"""
+    data = json.loads(Path(args.lines).read_text(encoding="utf-8"))
+    clips_dir = Path(args.clips)
+    if not clips_dir.is_dir():
+        die(f"clips 目录不存在：{clips_dir}", 2)
+    clip_durs = {}
+    for ext in (".mp4", ".webp"):
+        for f in clips_dir.glob(f"clip_*{ext}"):
+            sid = f.stem.replace("clip_", "")
+            d = probe(f)
+            # 静态 webp 探不出时长（probe=0）→ 哨兵 -1.0，fit_report 里报 info
+            # （图片镜不缺成片，时长由 concat/kenburns 决定，不能误报 missing）
+            clip_durs[sid] = d if d > 0 else -1.0
+    rows = fit_report(data, clip_durs, gap=args.gap)
+    badge = {"ok": "✓", "warn": "⚠", "info": "·", "missing": "✗"}
+    n_warn = sum(1 for r in rows if r["verdict"] == "warn")
+    n_miss = sum(1 for r in rows if r["verdict"] == "missing")
+    print(f"{'镜':6s} {'VO句':4s} {'VO需求':7s} {'镜长':7s} {'差':7s} 判定  建议")
+    for r in rows:
+        clip_s = f"{r['clip']:.2f}" if r["clip"] is not None else "—"
+        diff_s = f"{r['diff']:+.2f}" if r["diff"] is not None else "—"
+        print(f"{r['shot']:6s} {r['n_lines']:<4d} {r['vo']:>6.2f}s {clip_s:>7s} {diff_s:>7s} "
+              f"{badge[r['verdict']]} {r['advice']}")
+    print(f"\n[fit] {len(rows)} 镜：warn {n_warn} / missing {n_miss}"
+          + ("——warn 镜先处理再进 concat" if n_warn else "，声画时长对齐 ✓"))
+    sys.exit(0)
+
+
 def main() -> None:
+    # 双模式：首参 fit/plan → 子命令；否则走原 VO 构建流程（向后兼容）
+    if len(sys.argv) > 1 and sys.argv[1] == "fit":
+        ap = argparse.ArgumentParser(prog="vo_build.py fit",
+                                     description="VO 时间轴 vs 镜头时长对账（TTS 后跑最精确）")
+        ap.add_argument("lines", help="vo_lines.json")
+        ap.add_argument("clips", help="clips/ 目录（clip_*.mp4/webp）")
+        ap.add_argument("--gap", type=float, default=0.3)
+        cmd_fit(ap.parse_args(sys.argv[2:]))
+        return
+    if len(sys.argv) > 1 and sys.argv[1] == "plan":
+        ap = argparse.ArgumentParser(
+            prog="vo_build.py plan",
+            description="声音链反向：VO 先行，按 TTS 真实时长自动排轴并反推每镜该多长")
+        ap.add_argument("lines", help="vo_lines.json（可不含 at——由本命令自动排）")
+        ap.add_argument("--out", required=True, help="计划表输出路径（如 vo/plan.json）")
+        ap.add_argument("--dir", default="", help="分句音频目录（默认 vo_lines 同级的 lines/）")
+        ap.add_argument("--gap", type=float, default=0.5, help="句间间隔秒（默认 0.5）")
+        ap.add_argument("--pad", type=float, default=0.8, help="每镜尾部呼吸秒（默认 0.8）")
+        ap.add_argument("--skip-tts", action="store_true", help="不合成，用已有录音")
+        ap.add_argument("--voice", default="", help="音色名")
+        ap.add_argument("--speed", type=float, default=1.0, help="语速倍率")
+        cmd_plan(ap.parse_args(sys.argv[2:]))
+        return
     ap = argparse.ArgumentParser()
     ap.add_argument("lines", help="vo_lines.json（含 acts 与 lines）")
     ap.add_argument("--out", required=True, help="输出旁白音频 vo.mp3")
@@ -80,6 +324,9 @@ def main() -> None:
                     help="某句超长时自动顺延后续句子（gap 用 --gap）")
     ap.add_argument("--gap", type=float, default=0.3, help="句间最小间隔秒（auto-shift 用）")
     ap.add_argument("--subs-out", default="", help="字幕输出路径（默认与 --out 同级 subtitles_final.json）")
+    ap.add_argument("--bgm", default="", help="BGM 音频文件（循环补齐到成片长，VO 出现自动闪避压低）")
+    ap.add_argument("--bgm-duck", type=int, default=-14,
+                    help="BGM 基础音量 dB（默认 -14；负得越多 BGM 越安静）")
     args = ap.parse_args()
 
     src = Path(args.lines)
@@ -106,12 +353,15 @@ def main() -> None:
     print(f"[vo_build] 共 {len(lines)} 句，目录 {lines_dir}", file=sys.stderr)
     for ln in lines:
         lid = ln["id"]
-        f = lines_dir / f"{lid}.mp3"
-        if not f.exists():
-            f = lines_dir / f"{lid}.wav"
+        f = None
+        for ext in (".mp3", ".m4a", ".wav"):
+            cand = lines_dir / f"{lid}{ext}"
+            if cand.exists():
+                f = cand
+                break
         if args.skip_tts:
-            if not f.exists():
-                die(f"--skip-tts 但缺少录音 {lines_dir}/{lid}.mp3|wav", 2)
+            if f is None:
+                die(f"--skip-tts 但缺少录音 {lines_dir}/{lid}.mp3|m4a|wav", 2)
         else:
             if not f.exists():
                 # per-line 声音属性覆盖全局（感情/音色/语速逐句可换：高潮句用激昂档）
@@ -147,10 +397,13 @@ def main() -> None:
             if lines[i + 1]["at"] < need:
                 lines[i + 1]["at"] = round(need, 2)
 
-    # ③ 精确拼接：静音底(总长) + 各句 adelay 落位 + amix
+    # ③ 精确拼接：静音底(总长) + 各句 adelay 落位 + amix；可选 BGM 床（VO 为 key 闪避）
     inputs: list[str] = ["-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo"]
     for ln in lines:
         inputs += ["-i", ln["_file"]]
+    bgm_path = getattr(args, "bgm", "")
+    if bgm_path:
+        inputs += ["-stream_loop", "-1", "-i", bgm_path]
     fc = [f"[0:a]atrim=0:{total:.3f},asetpts=PTS-STARTPTS[base]"]
     labels = ["[base]"]
     for i, ln in enumerate(lines, start=1):
@@ -159,8 +412,14 @@ def main() -> None:
         fc.append(f"[{i}:a]aresample=48000,adelay={ms}|{ms},apad,"
                   f"atrim=0:{total:.3f},asetpts=PTS-STARTPTS[{lab}]")
         labels.append(f"[{lab}]")
-    fc.append("".join(labels) +
-              f"amix=inputs={len(labels)}:normalize=0:duration=first[mix]")
+    if bgm_path:
+        # BGM 输入是最后一个（idx = 句数+1）；闪避链见 bgm_assembly 注释
+        bgm_idx = len(lines) + 1
+        duck = int(getattr(args, "bgm_duck", -14))
+        fc.extend(bgm_assembly(labels, bgm_idx, total, duck))
+    else:
+        fc.append("".join(labels) +
+                  f"amix=inputs={len(labels)}:normalize=0:duration=first[mix]")
     run = [_ffmpeg(), "-y", "-loglevel", "error", *inputs,
            "-filter_complex", ";".join(fc), "-map", "[mix]",
            "-c:a", "aac", "-b:a", "192k", "-ac", "2", str(out)]

@@ -29,6 +29,7 @@ KEY_ENV_FILE = Path.home() / ".workbuddy" / "media_keys.env"
 LEGACY_KEY_ENV_FILE = Path.home() / ".workbuddy" / "agnes_key.env"
 STATE_FILE = Path.home() / ".workbuddy" / ".media_state.json"
 THROTTLE_FILE = Path.home() / ".workbuddy" / ".media_throttle.json"
+LEDGER_FILE = Path.home() / ".workbuddy" / ".media_ledger.jsonl"
 PROVIDERS: dict[str, dict[str, Any]] = {
     "agnes": {
         "label": "Agnes",
@@ -271,6 +272,80 @@ def _cooldown_update(provider: str, kn: str, until: float | None) -> None:
         else:
             cd[kn] = until
     _update_state(_fn)
+
+# ─── 成本账本（#5）：每次真实 API 调用记一条 JSONL ──────────
+# 设计：append-only JSONL 而非 state 读改写——追加天然适合 batch 多进程并发，
+# 且坏行只影响自己（summarize 容错跳过），不会炸整个 state。
+# "成本"在免费档语境 = 调用次数（RPM 限速）与失败白烧的次数。
+
+def ledger_append(path: Path, entry: dict) -> None:
+    """锁内追加一行 JSON（ts/ms 缺省自动补）。path 父目录不存在则建。"""
+    e = dict(entry)
+    e.setdefault("ts", time.strftime("%Y-%m-%dT%H:%M:%S"))
+    e.setdefault("ms", 0)
+    e["err"] = str(e.get("err", ""))[:80]      # 防长堆栈撑爆文件
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with _FileLock(path):
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(e, ensure_ascii=False) + "\n")
+
+def ledger_read(path: Path) -> list:
+    """读 JSONL → 行列表（坏行/非 dict/缺 ts 跳过，不炸）。"""
+    p = Path(path)
+    if not p.exists():
+        return []
+    try:
+        raw = p.read_text(encoding="utf-8").splitlines()
+    except Exception:
+        return []
+    rows = []
+    for ln in raw:
+        ln = ln.strip()
+        if not ln:
+            continue
+        try:
+            r = json.loads(ln)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if isinstance(r, dict) and r.get("ts"):
+            rows.append(r)
+    return rows
+
+def ledger_summarize(rows: list, days: int = 0) -> dict:
+    """聚合报表（纯函数）：总/成功/失败/白烧 + 按池/操作/天分组。
+    days>0 只统计最近 N 天（按 ts 前缀比较，与 ledger_append 的 ts 格式一致）；
+    坏行（None/非 dict/缺 ts）直接跳过——调用方喂原始行也不炸。"""
+    import datetime as _dt
+    cutoff = (_dt.datetime.now() - _dt.timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%S") \
+        if days > 0 else ""
+
+    def _bucket(d, key, ok, ms):
+        b = d.setdefault(key, {"total": 0, "ok": 0, "fail": 0, "ms": 0})
+        b["total"] += 1
+        b["ok" if ok else "fail"] += 1
+        b["ms"] += int(ms or 0)
+    out = {"total": 0, "ok": 0, "fail": 0, "wasted": 0,
+           "by_provider": {}, "by_op": {}, "by_day": {}}
+    for r in rows:
+        if not isinstance(r, dict) or not r.get("ts"):
+            continue
+        try:    # ts 必须是可解析的日期形状（YYYY-MM-DD...），非法历史脏行跳过
+            _dt.datetime.strptime(str(r["ts"])[:10], "%Y-%m-%d")
+        except ValueError:
+            continue
+        if cutoff and str(r["ts"]) < cutoff:
+            continue
+        ok = bool(r.get("ok"))
+        ms = r.get("ms") or 0
+        out["total"] += 1
+        out["ok" if ok else "fail"] += 1
+        if not ok:
+            out["wasted"] += 1
+        _bucket(out["by_provider"], str(r.get("provider", "?")), ok, ms)
+        _bucket(out["by_op"], str(r.get("op", "?")), ok, ms)
+        _bucket(out["by_day"], str(r.get("ts", ""))[:10], ok, ms)
+    return out
 
 # 产物扩展名白名单：有的池（LTX Bridge 等）出的是 .webp 动图而非 .mp4。
 # 凡是"这镜算不算已经出片了"的判断（断点续跑、拼接收集）都必须遍历这个常量，
@@ -515,23 +590,39 @@ def call_with_failover(
         if cooldown.get(kn, 0) > time.time():
             print(f"[media_gen] {provider} key #{kn} 冷却中，跳过", file=sys.stderr)
             continue
+        t0 = time.time()
         try:
             resp = call_fn(k)
             _cooldown_update(provider, kn, None)    # 成功 → 清除冷却（跨进程安全）
+            ledger_append(LEDGER_FILE, {"provider": provider, "key": k["n"],
+                                        "op": kind, "ok": True,
+                                        "ms": int((time.time() - t0) * 1000)})
             return resp, k
-        except ProviderFatal:
+        except ProviderFatal as e:
+            ledger_append(LEDGER_FILE, {"provider": provider, "key": k["n"],
+                                        "op": kind, "ok": False, "err": str(e),
+                                        "ms": int((time.time() - t0) * 1000)})
             raise
         except PermissionError as e:
             print(f"[media_gen] {provider} key #{kn} 鉴权失败，记入黑名单: {e}", file=sys.stderr)
             _cooldown_update(provider, kn, time.time() + 86400)
             cooldown[kn] = time.time() + 86400      # 内存镜像同步，避免同轮重复打
+            ledger_append(LEDGER_FILE, {"provider": provider, "key": k["n"],
+                                        "op": kind, "ok": False, "err": str(e),
+                                        "ms": int((time.time() - t0) * 1000)})
             last_err = e
         except RateLimitedError as e:
             _cooldown_update(provider, kn, time.time() + cooldown_default)
             cooldown[kn] = time.time() + cooldown_default   # 内存镜像同步
             print(f"[media_gen] {provider} key #{kn} 限流，冷却 {cooldown_default}s: {e}", file=sys.stderr)
+            ledger_append(LEDGER_FILE, {"provider": provider, "key": k["n"],
+                                        "op": kind, "ok": False, "err": str(e),
+                                        "ms": int((time.time() - t0) * 1000)})
             last_err = e
         except Exception as e:
+            ledger_append(LEDGER_FILE, {"provider": provider, "key": k["n"],
+                                        "op": kind, "ok": False, "err": str(e),
+                                        "ms": int((time.time() - t0) * 1000)})
             last_err = e
             continue
     raise AllKeysFailed(f"{provider} 所有 key 失败: {last_err}")

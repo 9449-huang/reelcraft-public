@@ -2,6 +2,8 @@
 
 各 provider 模型参数白名单与限速。`scripts/media_gen.py` 中的 `PROVIDERS` 字典是权威定义；本文件仅供阅读与选型参考。
 
+> ⚠️ 本表所有"实测/已验证"结论均为 **2026-09 快照**，provider 改版后可能失效——以 `caps probe --real` 落盘的实测值为权威（7 天过期机制），水印以 `watermark_profiles.json` 为准。
+
 ## Agnes（主力 · 速度限制型，无总量上限）
 - Base URL: `https://apihub.agnes-ai.com/v1`（key A）/ `https://api.agnes-ai.cn/v1`（key B，独立 endpoint）
 - 鉴权：Bearer KEY
@@ -16,7 +18,7 @@
 | 2048×1152 | 10 | 2K 16:9 |
 | 3K / 4K | ≈1 | 极慢，慎用 |
 
-返回：JSON `data[0].url`（cos-platform-outputs.agnes-ai.cn）。**经实测无水印**。
+返回：JSON `data[0].url`（cos-platform-outputs.agnes-ai.cn）。**实测无水印（2026-09）**。
 
 ### 视频 `agnes-video-v2.0`
 | 项 | 值 |
@@ -27,7 +29,7 @@
 | negative_prompt | 支持 |
 | image（I2V 首帧） | 接受本地路径 / URL / data URI |
 | RPM | **1**（视频硬瓶颈） |
-| **输出分辨率（实测）** | **固定 1088×832（约 4:3）**，与首帧分辨率/比例无关（1312×736 首帧 → 1088×832 输出，已实测） |
+| **输出分辨率（实测 2026-09）** | **固定 1088×832（约 4:3）**，与首帧分辨率/比例无关（1312×736 首帧 → 1088×832 输出） |
 | 实测耗时 | 121 帧 5s 视频全程 **2m15s**（含轮询），远好于 10min 上限 |
 
 ⚠️ **分辨率不达标（已实测确认）**：1088×832 < 1280×720 硬指标，且 4:3 比例偏方。
@@ -50,7 +52,7 @@
 - **首个能可靠生成汉字的开源文生图模型**
 - 适合需要中文标语/书法的镜头
 
-⚠️ **已确认问题**：免费档出图右下角带"AI 生成"水印（URL 域名 `maas-watermark-prod-new`，文件名含 `_watermark.png`）。**不能直接用于成片**——只能作概念图/风格参考，或后期去水印。
+⚠️ **已确认问题（2026-09）**：免费档出图右下角带"AI 生成"水印（URL 域名 `maas-watermark-prod-new`，文件名含 `_watermark.png`）。**不能直接用于成片**——只能作概念图/风格参考，或后期去水印。
 
 ### 视频 `CogVideoX-Flash`（免费 · v2.1 已接入）
 | 项 | 值 |
@@ -79,7 +81,7 @@
 | 请求体 | `{model, prompt, image_url: [data URI 或 URL]}`（列表，支持多图编辑） |
 | 轮询端点 | GET `{base}/tasks/{task_id}`，header `X-ModelScope-Task-Type: image_generation` |
 | 状态值 | `SUCCEED`（注意与智谱 `SUCCESS` 拼写不同）/ `FAILED` |
-| 输出 | `output_images[0]`（URL），**无水印，可直接入正片** |
+| 输出 | `output_images[0]`（URL），**实测无水印可直接入正片（2026-09）** |
 | 典型用途 | 首帧小改：移物/调光/局部重绘，避免整图重 roll 破坏已选好的画面 |
 | 耗时预期 | 约 30-120s（模型较大，轮询上限 5 分钟） |
 
@@ -87,7 +89,7 @@
 
 ```
 图片链：
-1. Agnes image-2.1-flash    主力（无限量，1344×768，--count 3 选优）
+1. Agnes image-2.1-flash    主力（免费档无总量上限·2026-09 核对，1344×768，--count 3 选优）
 2. Agnes image-2.1-flash    key B（不同 endpoint，轮转）
 3. 智谱 CogView-3-Flash     一级兜底（**带水印，作概念图**）
 4. 智谱 CogView-4           特殊镜头（要中文字时）

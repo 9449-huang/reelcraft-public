@@ -64,6 +64,76 @@ def _escape_drawtext(text: str) -> str:
     字幕含 \"100%\" 不转义会解析异常，#11）。顺序必须先 \\ 再 ' 最后 %。"""
     return str(text).replace("\\", "\\\\").replace("'", "\\'").replace("%", "\\%")
 
+
+
+# ─── 字幕：srt 导入 + 样式预设（v4.2） ─────────────────────
+_SRT_TS = re.compile(r"^(\d{2,}):(\d{2}):(\d{2}),(\d{3})\s*-->\s*(\d{2,}):(\d{2}):(\d{2}),(\d{3})$")
+
+
+def parse_srt(text: str) -> list:
+    """标准 srt 文本 → 内部字幕轴 [{at, dur, text}]（纯函数可单测）。
+
+    规则：时间戳行必须是 HH:MM:SS,mmm --> HH:MM:SS,mmm（毫秒逗号，标准 srt）；
+    块序号行可有可无（容错）；多行文本用空格拼一句；非法时间戳块整块丢弃。
+    """
+    subs = []
+    cur_lines: list = []
+    cur_span = None
+    for raw in text.splitlines() + [""]:
+        line = raw.strip()
+        m = _SRT_TS.match(line) if line else None
+        if m:
+            g = [int(x) for x in m.groups()]
+            start = g[0] * 3600 + g[1] * 60 + g[2] + g[3] / 1000.0
+            end = g[4] * 3600 + g[5] * 60 + g[6] + g[7] / 1000.0
+            if cur_span is not None and cur_lines:      # 上一块收尾
+                subs.append({"at": cur_span[0], "dur": round(cur_span[1] - cur_span[0], 3),
+                             "text": " ".join(cur_lines)})
+            cur_span, cur_lines = (start, end), []
+            continue
+        if cur_span is None:
+            continue                    # 时间戳出现前的行（序号/头部垃圾）忽略
+        if not line:                    # 空行 = 块结束
+            if cur_lines:
+                subs.append({"at": cur_span[0], "dur": round(cur_span[1] - cur_span[0], 3),
+                             "text": " ".join(cur_lines)})
+            cur_span, cur_lines = None, []
+            continue
+        if line.isdigit() and not cur_lines:
+            continue                    # 纯数字首行 = 块序号，容错跳过
+        cur_lines.append(line)
+    return subs
+
+
+_PRESETS_PATH = Path(__file__).resolve().parent / "subtitle_presets.json"
+
+
+def load_presets() -> dict:
+    return json.loads(_PRESETS_PATH.read_text(encoding="utf-8"))
+
+
+def apply_preset(subs: list, preset: str) -> list:
+    """字幕条目缺的样式字段按预设填充；条目自带字段优先（纯函数可单测）。
+
+    预设键：pos/size/fade/fontcolor/box（box 为 drawtext 附加参数串，空=无）。
+    预设不存在 → ValueError（CLI 层转 die）。
+    """
+    presets = load_presets()
+    if preset not in presets:
+        raise ValueError(f"未知字幕预设: {preset}（可用: "
+                         f"{[k for k in presets if not k.startswith('_')]}）")
+    p = presets[preset]
+    out = []
+    for s in subs:
+        d = dict(s)
+        for k in ("pos", "size", "fade", "fontcolor", "box"):
+            if k not in d and k in p:
+                d[k] = p[k]
+        out.append(d)
+    return out
+
+
+
 _PROBE_CACHE: dict = {}   # path -> info（同进程内 probe 结果复用：audit/triage 不重复起 ffmpeg）
 
 
@@ -287,9 +357,21 @@ def cmd_concat(args) -> None:
         sp = Path(args.subtitles)
         if not sp.exists():
             die(f"字幕文件不存在: {sp}")
-        subs = json.loads(sp.read_text(encoding="utf-8"))
-        if not isinstance(subs, list):
-            die("字幕 JSON 需为数组 [{at,dur,text,...}]")
+        if sp.suffix.lower() == ".srt":
+            # srt 导入（v4.2）：剪映/PR 导出的标准 srt 直接用
+            subs = parse_srt(sp.read_text(encoding="utf-8-sig"))
+            if not subs:
+                die(f"srt 无有效字幕块（时间戳需为 HH:MM:SS,mmm --> 标准格式）: {sp}", 2)
+        else:
+            subs = json.loads(sp.read_text(encoding="utf-8"))
+            if not isinstance(subs, list):
+                die("字幕 JSON 需为数组 [{at,dur,text,...}]")
+    preset = getattr(args, "subtitle_preset", "")
+    if subs and preset:
+        try:
+            subs = apply_preset(subs, preset)
+        except ValueError as e:
+            die(str(e), 2)
     if args.slogan:
         total = probe(str(norm)).get("duration", 0) or 0
         at = args.slogan_at if args.slogan_at >= 0 else max(0.0, total - 4.0)
@@ -309,12 +391,22 @@ def cmd_concat(args) -> None:
             fade = float(s.get("fade", 0.6))
             size = int(s.get("size", 48))
             pos = s.get("pos", "bottom")
+            fontcolor = s.get("fontcolor", "white")
+            box_extra = str(s.get("box", "") or "")   # 预设附加参数（底框/描边），空=无
             if pos == "center":
                 xy = "x=(w-text_w)/2:y=(h-text_h)/2"
             elif pos == "left":
                 xy = "x=70:y=(h-text_h)/2"
             else:
                 xy = f"x=(w-text_w)/2:y=h-{80 + size}"
+            # 有底框/描边时阴影会让字发糊，二选一；无框才带默认阴影。
+            # 拼接时逐段补冒号，绝不输出空段，避免产生 "::" 双冒号（ffmpeg 报 Invalid argument）
+            extras = []
+            if box_extra:
+                extras.append(box_extra)
+            else:
+                extras.append("shadowcolor=black@0.7:shadowx=3:shadowy=3")
+            extra_str = ":" + ":".join(extras)
             if dur > 0:
                 end = at + dur
                 if fade > 0:
@@ -334,8 +426,7 @@ def cmd_concat(args) -> None:
                     alpha = f"gte(t\\,{at:.2f})"
             draws.append(
                 f"drawtext=text='{text}':fontfile='{font_escaped}':"
-                f"fontcolor=white:fontsize={size}:{xy}:"
-                f"shadowcolor=black@0.7:shadowx=3:shadowy=3:alpha='{alpha}'"
+                f"fontcolor={fontcolor}:fontsize={size}:{xy}{extra_str}:alpha='{alpha}'"
             )
         txt_cmd = [_ffmpeg(), "-y", "-loglevel", "error", "-i", str(norm),
                    "-vf", ",".join(draws),
@@ -470,6 +561,51 @@ def cmd_qcgate(args) -> None:
     sys.exit(rc)
 
 # ─── 跨镜首帧一致性粗检（qcseq，优化⑤）────────────────────
+# ---------- pick：count 选优半自动（A3，纯函数可单测） ----------
+def score_images(paths: list) -> list:
+    """对同镜 N 张候选图算启发式分（清晰度+对比度+亮度合理域），降序返回。
+    **只排序不拍板**——启发式有偏差，最终选哪张必须人看；本命令的价值是把
+    明显度差的沉底，让人只在 top 几张里挑。"""
+    from PIL import Image, ImageFilter, ImageStat
+    rows = []
+    for p in paths:
+        try:
+            with Image.open(p) as im:
+                gray = im.convert("L")
+                # 清晰度：拉普拉斯近似（锐化后差分能量）——高=边缘多=清晰
+                sharp = ImageStat.Stat(
+                    gray.filter(ImageFilter.FIND_EDGES)).stddev[0]
+                # 对比度：灰度标准差
+                contrast = ImageStat.Stat(gray).stddev[0]
+                # 亮度合理域：过暗/过曝扣分（目标 ~128 中值）
+                bright = ImageStat.Stat(gray).mean[0]
+                bright_penalty = abs(bright - 128) / 128
+                score = sharp * 2.0 + contrast - bright_penalty * 30
+            rows.append({"path": str(p), "sharpness": round(sharp, 2),
+                         "contrast": round(contrast, 2),
+                         "brightness": round(bright, 1),
+                         "score": round(score, 2)})
+        except Exception as e:
+            rows.append({"path": str(p), "sharpness": 0, "contrast": 0,
+                         "brightness": 0, "score": -999, "error": str(e)})
+    rows.sort(key=lambda r: r["score"], reverse=True)
+    return rows
+
+
+def cmd_pick(args) -> None:
+    """pick 子命令：shot_XX_{1..N}.png 候选打分排序，人看 top 选优。"""
+    paths = [Path(t) for t in args.images]
+    rows = score_images(paths)
+    print(f"[pick] {len(rows)} 张候选（启发式排序，只做参考——最终你拍板）：")
+    for i, r in enumerate(rows, 1):
+        err = f"  读取失败：{r.get('error', '')[:60]}" if r.get("error") else ""
+        print(f"  #{i}  {Path(r['path']).name:24s} 分 {r['score']:>8.2f}  "
+              f"清晰 {r['sharpness']:>6.2f} 对比 {r['contrast']:>6.2f} "
+              f"亮度 {r['brightness']:>6.1f}{err}")
+    if rows and not rows[0].get("error"):
+        print(f"\n[pick] 建议重点看 #{1}~#3，确认后用它覆盖正式帧名（或 batch --retry-failed 重拍最差的）")
+
+
 def _hsv_features(im) -> tuple:
     """PIL Image → (108 桶归一化 HSV 直方图, 环形均值色相°, 均值 S 0-1, 均值 V 0-1)。
     32x32 缩略足够判色调跳变；H 12 桶 × S 3 桶 × V 3 桶。"""
@@ -593,7 +729,9 @@ def cmd_kenburns(args) -> None:
 def cmd_kenburns_all(args) -> None:
     """stills/hybrid 档批量：目录内图片逐张转缓推片段（纯本地，0 API 调用）。
     输出 clip_NN.mp4 命名对齐 concat 的 glob("clip_*.mp4") 契约；
-    已存在的片段跳过（断点续跑，可反复重跑）。"""
+    注意：NN 是**图片序号**（第几张图），不是 vo_lines.json 里的 shot_id——
+    S01/S02… 与 clip_01/clip_02… 只有在镜序与图序一致时才对应，混剪前用
+    vo_build.py fit 对账确认。已存在的片段跳过（断点续跑，可反复重跑）。"""
     src = Path(args.dir)
     if not src.is_dir():
         die(f"目录不存在: {src}")
@@ -715,7 +853,10 @@ def main() -> None:
     c.add_argument("--ambient-db", type=float, default=-10.0,
                    help="原片环境音音量 dB（有人声时压低，默认 -10）")
     c.add_argument("--subtitles", default="",
-                   help="字幕 JSON：[{at,dur,text,pos:bottom|center|left,size,fade}]")
+                   help="字幕 JSON [{at,dur,text,...}] 或 .srt（v4.2 起剪映/PR 导出的标准 srt 直接用）")
+    c.add_argument("--subtitle-preset", default="",
+                   help="字幕样式预设（v4.2）：news 新闻底框 / movie 电影底幕 / variety 综艺描边，"
+                        "见 scripts/subtitle_presets.json；条目自带字段优先于预设")
     c.add_argument("--slogan", default="", help="可选烧字幕 slogan（等价于追加一条末段字幕）")
     c.add_argument("--slogan-position", default="left", choices=["left", "bottom"],
                    help="left=左侧负空间垂直居中（中式落版默认）；bottom=底部居中")
@@ -780,6 +921,9 @@ def main() -> None:
     sg.add_argument("--cell", type=int, default=320, help="单格宽 px")
     sg.add_argument("--max", type=int, default=20, help="最多取前 N 张")
 
+    pk = sub.add_parser("pick", help="选优半自动：候选图启发式打分排序（只参考，人拍板）")
+    pk.add_argument("images", nargs="+", help="候选图路径（shot_XX_1.png ... 或通配符展开）")
+
     args = ap.parse_args()
     if args.cmd == "concat":
         cmd_concat(args)
@@ -789,6 +933,8 @@ def main() -> None:
         cmd_qcgate(args)
     elif args.cmd == "qcseq":
         cmd_qcseq(args)
+    elif args.cmd == "pick":
+        cmd_pick(args)
     elif args.cmd == "extract":
         cmd_extract(args)
     elif args.cmd == "kenburns":
