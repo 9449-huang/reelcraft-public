@@ -780,5 +780,43 @@ class TestLedgerHook(unittest.TestCase):
         self.assertEqual(rows[0]["op"], "video")
 
 
+class TestLastFrameFields(unittest.TestCase):
+    """过渡镜（半自动方案一）：build_last_frame_fields 从池配置+key env 解析尾帧字段。
+
+    哲学沿用 image_param/image_list：字段名可配（各家叫 tail_image/lastFrame/…），
+    未配置 = 该池不支持首尾帧双条件（返回 None，调用方不传）。
+    """
+
+    def test_no_config_returns_none(self):
+        import mg_core
+        self.assertIsNone(mg_core.build_last_frame_fields({}, {}))
+
+    def test_pool_level_config(self):
+        import mg_core
+        info = {"last_frame_param": "tail_image", "last_frame_list": False}
+        out = mg_core.build_last_frame_fields(info, {})
+        self.assertEqual(out, {"tail_image": None})   # 字段名确定，值由调用方填
+
+    def test_list_style(self):
+        import mg_core
+        info = {"last_frame_param": "last_frame_urls", "last_frame_list": True}
+        out = mg_core.build_last_frame_fields(info, {})
+        self.assertEqual(out, {"last_frame_urls": None})
+
+    def test_key_env_override(self):
+        """同一池不同 key 支持不同字段名（key 级覆盖，env MEDIA_<P>_n_LAST_FRAME_PARAM）。"""
+        import mg_core
+        info = {"last_frame_param": "tail_image"}
+        key = {"n": 2, "last_frame_param": "endFrame"}    # key 级覆盖
+        out = mg_core.build_last_frame_fields(info, key)
+        self.assertEqual(out, {"endFrame": None})
+
+    def test_default_field_name(self):
+        """只声明支持不指定名 → 默认 last_frame（common naming，可被覆盖）。"""
+        import mg_core
+        out = mg_core.build_last_frame_fields({"last_frame": True}, {})
+        self.assertEqual(out, {"last_frame": None})
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

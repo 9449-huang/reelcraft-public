@@ -10,6 +10,7 @@
 
 | 版本 | 日期 | commit | 测试数 | 一句话概括 | 引入了什么隐患（回滚重点） |
 |---|---|---|---|---|---|
+| **v4.5** | 2026-09-10 | 48a8a06 | 222 | 过渡镜（首尾帧双条件）：`video --last-frame` + batch 透传 + 池/key 级字段名配置 | 免费池（agnes/zhipu）不支持双条件——功能就绪但需接支持的池才能真跑；`last_frame` 图缺失时 batch 报 MISS 跳过不提交 |
 | **v4.4** | 2026-09-09 | bcc45cd | 215 | #5 成本账本（JSONL 调用记录 + `ledger` 报表）+ #6 声音链反向（`vo_build plan` 按 TTS 真实时长反推每镜时长） | 账本挂点在 call_with_failover/cmd_tts/cmd_edit，测试必须 patch LEDGER_FILE+STATE_FILE 到 tmp（真实 state 冷却条目会造"所有 key 失败: None"假故障） |
 | **v4.3** | 2026-09-09 | d537af6 | 203 | B6 SKILL 瘦身：585→551 行，文案方法论外置 copy-guide.md，TTS 细节归 voice-guide，修 audit 重复行 | 纯文档+export 规则清理；被删的口味卡句移除对应替换规则，防回潮靠 grep 自检 |
 | **v4.2** | 2026-09-09 | f723245 | 203 | 字幕链：srt 导入 + 样式预设档案（news/movie/variety）+ 测试拆 5 文件 + SLOW 门控 | drawtext 渲染串曾有空段 `::` 双冒号 bug（首版端到端失败根因，已修并钉死测试）；测试拆文件后跑法变 `python -m unittest discover tests` |
@@ -33,6 +34,27 @@
 | v3.1 | 2026-09-06 | 59d570d | — | 本地 Edge TTS 接入 key 池 | TTS 依赖本地服务（localhost:5050）在线 |
 | v3.0 | 2026-09-06 | 8d3a975 | 27 | 通用化中性化（去赛事归属） | 公开仓剔除私有池，私有能力不在公开版 |
 | v2.9 | 2026-09-05 | c37fa8e | — | 公开仓体检修复 | — |
+
+## v4.5（2026-09-10）
+
+过渡镜（首尾帧双条件，讨论定案的"半自动方案一"）：解决"镜头之间非常独立和分割"的
+结构性短板——xfade 是后期叠化的假过渡，首尾帧双条件让模型**生成中间演化过程**，才是
+长镜头感的正解。
+
+- **设计原则（半自动）**：过渡镜就是一个普通 shot JSON（加 `last_frame` 字段），
+  何时插、插在哪人拍板——编排/时间轴/断点续跑体系**零改动**（爆炸半径缩 80%，
+  这正是全量方案 3 的高风险区，先绕开）。
+- **`mg_core.build_last_frame_fields(info, key)`**（纯函数）：解析尾帧字段名/列表形。
+  哲学沿用 image_param/image_list——池模板或 key env（`MEDIA_<P>_n_LAST_FRAME_PARAM`，
+  可选 `_LAST_FRAME_LIST=1`）声明支持才传，未声明返回 None 老行为不变；
+  key 级覆盖优先（同池不同 key 接不同上游）。
+- **CLI**：`video --last-frame <图>` 进 payload（与首帧同一 data-URI/URL 编码）；
+  池未声明支持时 die 带配置指引（不静默丢弃）。
+- **batch 透传**：shot JSON 的 `last_frame` → `--last-frame`；尾帧图缺失时报
+  `MISS (last_frame ... not found)` 跳过**不提交**（提交即扣额度）。
+- **现状边界**：免费池（agnes/zhipu）不支持双条件——功能就绪，真跑需 custom 池
+  接支持首尾帧的服务（可灵/Vidu 级）。轻量模型 morph 能力弱，过渡质量强依赖模型档次。
+- 测试 215 → **222**（+7：build_last_frame_fields 纯函数 5 + batch 透传/MISS 2）。
 
 ## v4.4（2026-09-09）
 
