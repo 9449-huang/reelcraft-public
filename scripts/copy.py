@@ -24,22 +24,14 @@ import urllib.request
 from pathlib import Path
 
 
-# 自动加载统一密钥文件（与 media_gen.py 一致），无需手动 source
-_KEY_ENV_FILE = Path.home() / ".workbuddy" / "media_keys.env"
-_LEGACY_KEY_ENV_FILE = Path.home() / ".workbuddy" / "agnes_key.env"
-
-
-def _load_env_file(path: Path) -> None:
-    if not path.exists():
-        return
-    for raw in path.read_text(encoding="utf-8").splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#"):
-            continue
-        m = re.match(r'export\s+([A-Za-z_][A-Za-z0-9_]*)="(.*)"$', line)
-        if m and not os.environ.get(m.group(1)):
-            os.environ[m.group(1)] = m.group(2)
-
+# 密钥文件与加载实现收归 mg_core（单源）。
+# v4.7.9：本地副本的正则是 `="(.*)"$`（要求行尾收引号），带行内注释的 key 行
+# 会被**静默跳过**——而 mg_core 的 `="([^"]*)"` 容忍行内注释，两处已漂移。
+from mg_core import (  # noqa: E402
+    KEY_ENV_FILE as _KEY_ENV_FILE,
+    LEGACY_KEY_ENV_FILE as _LEGACY_KEY_ENV_FILE,
+    _load_env_file,
+)
 
 _load_env_file(_KEY_ENV_FILE)
 _load_env_file(_LEGACY_KEY_ENV_FILE)

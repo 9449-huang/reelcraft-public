@@ -140,7 +140,8 @@ def lint_shot(shot: dict, kind: str, hard: list[str], mood: list[str]) -> list[d
         # （首帧已锁定）。shot 里若有这些字段值，其显著 token 出现在 i2v_prompt → 提示。
         low = str(text).lower()
         for field in ("subject", "scene", "style", "color", "material"):
-            val = shot.get(field) or shot.get(f"_atomic", {}).get(field)
+            # _atomic 可能是 null（手写 shot / 生成器留空）→ 用 or {} 兜底（v4.8.0 修 None.get 崩）
+            val = shot.get(field) or (shot.get("_atomic") or {}).get(field)
             if not val:
                 continue
             hits = [t for t in _significant_tokens(val) if t in low]

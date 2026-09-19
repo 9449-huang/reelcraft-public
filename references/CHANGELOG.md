@@ -8,8 +8,25 @@
 > 或在 `git log` 里 `git show <commit>` 逐项核对。**回滚 = `git checkout <commit>^ -- scripts/ tests/` 拿回上一版文件**。
 > 测试数 = 该版本全量 unittest 通项（skipped 不计）。
 
+| **v4.7.2** | 2026-09-11 | 41a2bcc | 262 | **全库复测（code-review 五路并行 + 逐条核验）**：修 4 个 P0 静默失败——concat 混编丢音轨、静帧+仅旁白 ffmpeg 无限挂起、batch 的 MISS/STALE 被当成功吞掉、导出脱敏自检三处绕过 | 详见 `reelcraft复测审计报告.md`；`audio_plan` 三态（none/all/mixed）语义别退回 all()；blocked 镜现在会非零退出码（旧脚本若忽略退出码需适配） |
 | 版本 | 日期 | commit | 测试数 | 一句话概括 | 引入了什么隐患（回滚重点） |
 |---|---|---|---|---|---|
+| **v4.10.2** | 2026-09-19 | 5763f82 | 484 | **门禁接线（把做好的能力真正接进一键流程）**：①`audio-qc`(v4.10.0) 与 `faces`(v4.10.1) 此前只在 `media_gen` 里能手动调，在 `pipeline` 里出现 **0 次**——跑 `media_gen run` **根本不执行**（"功能存在 ≠ 功能生效"，与 v4.7.9~v4.9.0 那批"决策零生效"同族，只是这次在输出侧）。现在 concat **前**依次自动跑 `audio-qc` → `faces` → `qcseq`，结果写进 `pipeline_run.json`、`audit` 会读出来；②新增 `qc_gate_action()` 统一消化**两族退出码**（报告族 qcseq/faces：1=WARN；门禁族 qcgate/audio-qc：非 strict 时 WARN 也返 0）——共同硬判据只有 `rc>=2`；③开关 `--no-audio-qc` / `--audio-qc-strict` / `--no-faces`，`media_gen run` 同步转发；④faces 缺 cv2/模型 → **跳过并说明**（不因可选依赖拦流程，也不假装通过）；⑤顺手修：`test_days_filter_drops_old` 是颗**时间炸弹**（硬编码 `2026-09-09` 又断言"7 天内"→ 到 2026-09-16 之后必红）改成相对时间 | ⚠️ **默认行为有变**：以前 `run` 不跑这两道门禁，现在会跑（这正是本版目的；想回到旧行为用 `--no-audio-qc --no-faces`）。手搓 `pipeline` Namespace 的调用方需补三个属性 `no_audio_qc` / `audio_qc_strict` / `no_faces`（test_postprocess 两处已补）。`audio_qc.py` 的 WARN 仍返 0（与 qcgate 同族，**未改**其契约） |
+| **v4.10.1** | 2026-09-15 | 90a7eac | 473 | **跨镜人脸身份一致性（补 qcseq 只比色调的错配）**：新旁线 `scripts/face_consistency.py`——YuNet 检测（227KB）+ SFace 128 维嵌入（37.8MB）+ 余弦比对，判"**是不是同一个人**"；`media_gen.py faces <path\|dir>` 直达，`--ref 设定图` 以角色圣经基准比对。判定全是**纯函数**（`cosine`/`filter_faces`/`pick_primary`/`pairwise_similarity`/`mean_similarity`/`outliers`/`consistency_verdict`），检测/嵌入是薄 IO 壳。三态退出码 0/1/2（与 qcseq 同口味）。**另：`_MANIFEST` 结构快照从 7 个核心脚本扩展到全部 17 个**，并加"新脚本必须登记"守卫 | 新增子命令 `faces`；**依赖 `opencv-python-headless` + 两个 ONNX 模型**（放 `~/.workbuddy/models/`），缺任一则打安装指引 + rc=1（**不假装通过**）；⚠️ **本仓 `scripts/copy.py` 会遮蔽标准库 `copy`**，故 cv2 一律经 `_import_cv2()` 助手（导入期摘掉 `scripts/`）——否则真机 CLI 静默降级而测试全绿；判定阈值 0.363 是 SFace 官方 LFW 标定值，改它等于改松紧；新增脚本未登记 `_MANIFEST` 会让结构测试红灯（**这是有意的**） |
+| **v4.10.0** | 2026-09-15 | 6f3c956 | 427 | **音频侧 QC + 语音判定（补 qcgate 只查画面的盲区）**：①新旁线 `scripts/audio_qc.py`——静音占比 / 采样削波 / 平均响度 / 长静音段四类机器可判项（`silencedetect`+`volumedetect`+`astats`，**纯 ffmpeg 零依赖**），`media_gen.py audio-qc <path\|dir>` 直达；②**语音判定 VAD**：优先 **silero-vad ONNX**（onnxruntime，CPU 秒级），缺依赖/推理失败**如实回退** ffmpeg 能量法并在 `backend` 字段标注（不假装）；③`triage` 加 **VAD 前置**——本地判"根本没语音"时直接给"补旁白"结论，**省掉一次远端 ASR 额度**；④可选重依赖机制：onnxruntime/numpy 一律**函数内延迟 import**，模型放 `~/.workbuddy/models/` | 新增子命令 `audio-qc`；`triage_decision()` 新增**可选**参数 `speech`（默认 None → 行为与旧版逐字一致）；triage 每镜输出新增 `vad` 字段；**语义提醒：silero 对纯音乐/正弦会判"非语音"，而能量法会判"有语音"——这是升级不是 bug**（它识的是语音而非能量）；AST 守卫「可选重依赖不得顶层 import」+「silero 必须有 InferenceSession 调用（反空壳）」 |
+| **v4.9.0** | 2026-09-14 | 5596911 | 388 | **成本门禁 + 角色圣经（漫剧第一步）**：①**事前调用门禁**——批量前预估 `镜数 × (1+重试)` 上限并在超限时**拒跑**（`--max-calls` / plan.json 的 `max_calls`），补上 ledger 只有事后记账的缺口；②**角色圣经** `<shots>/characters.json`——角色设定图定义一次、shot 写 `characters:["hero"]` 引用，与自带 `ref_image` 合并去重；id 查不到报 MISS（不静默丢一致性）；无该文件时行为与旧版完全一致 | `--max-calls` 默认 0 = 不设门禁（旧调用零影响）；plan.json 的 `max_calls` 非正整数会被忽略；角色圣经缺失/损坏/非 dict 一律当空（不炸 batch）；`mock` 掉的 `make_cmd` 调用方需多传一个可选参数 `bible`（有默认值，位置参数不变） |
+| **v4.8.0** | 2026-09-14 | b59d7c7 | 376 | **补齐决策链 + 单源收编 + 五处崩溃/误判**：①`video_pool_order` 接入（问⑤落盘的池顺序此前**无任何代码消费**，只在 PLAN_KNOWN_KEYS 里"合法"）→ 新增 `resolve_pool_order`，转成 batch 的 `--provider a,b,c`；②`_ffmpeg` 收单源（postprocess/vo_build 各带 `_ffmpeg_cache` 副本、audio_triage 那份**漏了缓存**每次重探测）→ 统一 `mg_core._ffmpeg`；③TTS 槽位枚举单源（audio_triage 本地副本与 mg_core 口径漂移：status 报已配、triage 报未配）；④qcgate 抽帧 `duration` 兜底 5.0 → **时长未知只抽首帧**（原 30s 片只测开头 5s，后半段黑帧/静帧漏检却打 PASS）；⑤delogo：`probe_size` 逐行跳过 mjpeg（带封面图的 mp4 原取首个匹配 → 拿 320x240 算框位）+ `clamp_box` 每维独立钳制（原 OR 一刀切，框比画面大时钳完仍越界却打印"已钳制"）；⑥envcheck `runner` 返回 None → `r.stdout` 崩；⑦prompt_lint `_atomic: null` → `None.get` 崩 | CLI 未变；`_ffmpeg` 现在从 mg_core 懒加载缓存（首次调用即探测，行为不变）；qcgate 在时长未知时**帧数变少**（只 1 帧，靠 duration_verdict 的 WARN 提示人工复核）；delogo 遇"框 ≥ 画面"现在**直接 die**（原来静默钳制成越界框）；新增守卫「非 mg_core 不得定义 `_ffmpeg`/`_load_env_file`」 |
+| **v4.7.9** | 2026-09-14 | 8d5dda1 | 357 | **脱敏绕过 + 决策零生效 + 单源收编**：①export 遇非 UTF-8 文件原直接 `continue`（跳过标记块删除）→ 私有内容原样进公开仓且自检命中不了；改为**拒绝导出**（`non_utf8_marker_error`，拒绝 > 泄漏）；②pipeline 声称"workers/池顺序/水印读自 plan.json"实际只读 CLI 默认值 → 问⑤落盘的 `workers_image/workers_video/watermark` **零生效**；新增 `resolve_workers`/`resolve_watermark` + CLI 默认改 `None`（`media_gen run` 的转发链同步，否则恒真默认值覆盖 plan）；③单源收编：`copy.py` 的 env 加载（本地副本正则 `="(.*)"$` 要求行尾收引号 → **带行内注释的 key 行静默读不到**，与 mg_core 已漂移）、`PRODUCT_EXTS` 三处复刻（pipeline×2 + vo_build，守卫新抓到 vo_build 那处）+ 三条新守卫（产物白名单字面量/env 加载实现/workers 默认值） | CLI `--workers-image/--workers-video` 默认值由 3 改 **None**（不给则读 plan.json，再缺省 3）——手搓 Namespace 的旧脚本若依赖"未给=3"需显式传；非 UTF-8 文件现在会让导出**非零退出**（先转 UTF-8）；`video_pool_order` 仍未接（本轮只解决 workers/watermark） |
+| **v4.7.8** | 2026-09-12 | 8632ae4 | 342 | **三项 P1（静默丢钱/死循环）**：①caps 探针加内层 `--poll-timeout`——外层 `run_capture` 到点会**杀进程**，任务来不及落盘 → 已受理（已扣费）任务永久丢失，且提示的 harvest 无记录可收；②`_save_pending_task` 记 `key_n`，`--wait-task` 续等改用**提交时那把 key**——多 key 池（agnes 跨域名）用 `keys[0]` 会 401/404 空转到 deadline；③`list_keys` 补读 `_REF_IMAGE_STYLE/_REF_IMAGE_MAX/_KEYFRAMES_STYLE` + 新增 `ref_image_candidates()`（池或任一 key 声明即可作候选）——此前报错提示让用户配这些 env 却无人读，是**自指死循环**，key 级覆盖分支也从不触发 | 探针内层超时 = 外层 - 60s（下限 60）：外层配得过小时内层仍是 60s；续等记录里的 key 已从 env 移除时退回 `keys[0]`（旧记录兼容）；`ref_image_candidates` 会枚举 key（多一次 env 扫描，仅在有参考图时触发） |
+| **v4.7.7** | 2026-09-12 | b4bb94c | 333 | **三个 P0 修复（全库复测实证发现）**：①`mg_batch` 补 `import mg_core`——harvest 一跑 `NameError`（v4.7.6 引入，328 测试全绿没抓到：harvest 零行为测试）；②`vo_build` 首次 TTS 判空——`f=None` 时 `f.exists()` AttributeError，且崩在**调用 TTS 之前**；③concat 单路音频改 `apad=whole_dur=<成片时长>`——原单路无 apad，`-shortest` 把画面截到旁白长度（实证 10s 画面+3s 旁白 → 4.02s 成片，rc=0） | ⚠️ **apad 必须带 `whole_dur`**：无参 apad 造无限音频流、本 ffmpeg 版本 `-shortest` 不终止它 → 整个 concat **挂起**（实证 40s 未结束）；多路分支的 pad 也随之从 `,apad` 改为 `,apad=whole_dur=X`（语义等价、更精确）；新增 AST 守卫「用了本仓模块名却没 import」；harvest / concat 单路 / vo_build 首次三条路径**首次有行为测试** |
+| **v4.7.6** | 2026-09-11 | 5879399 | 328 | **批四（查询入口 + 轮询单源）**：①mg_status 新增能力档案汇总段（声明/实测✅/实测❌/过期/声明未测，延迟 import mg_caps 防循环，caps 损坏不拖垮 status）；②轮询循环收归 mg_core 单源——`build_poll_url`（path/query URL 构造）+ `fetch_task_state`（收割单查）+ `poll_tasks`（生成器骨架），`_resolve_async_task`/`_poll_video_task`/`cmd_edit`/harvest 双函数五处调用方改造，网络语义（interval/headers/终态/超时动作）原样留在调用方 | `build_poll_url` 缺省 style 为 query（与旧 `_poll_video_task` else 分支一致，agnes 依赖——改默认会坏 agnes 轮询）；新增 AST 守卫"while 内 urlopen 只许在 mg_core"；harvest 视频侧现在按池 poll_style 构造 URL（旧版硬编码 path 拼接，custom query 池的旧落盘任务受影响——记录里 poll_path 优先缓解） |
+| **v4.7.5** | 2026-09-11 | 6600194 | 313 | **批三（P1 清尾 + 两项核验为误报）**：轮询路径支持 local_path 直拷（取产物统一入口）、vo_build 缺 at 字段前置校验（TTS 前拦）、pipeline 透传 --negative/--video-size/--video-duration/--qc、clean 纳入 _norm/_mixed/_with_text 中间文件 | pipeline 新增四个可选参数（默认不追加，旧调用零影响）；字体冒号转义与 cmd_edit 无 key 两项审计 P1 经真机核验为**误报**，不修（详见正文） |
+| **v4.7.4** | 2026-09-11 | c22d26b | 305 | **批二（结构 + 能力）**：caps 能力级真探针（ref_image/keyframes 真跑落档）、--only × 过渡桥兼容（hybrid 核心场景）、概念收敛（is_transition/find_product 收归 mg_core + 三道单源守卫）、探针执行器去重 | 过渡镜在 --only 下的语义变了（邻居可接就跑）——只想跑纯普通镜的老脚本不受影响；caps 记录新增 `<kind>:cap:<cap>` 键（旧读取逻辑不受影响） |
+| **v4.7.3** | 2026-09-11 | 237e16a | 294 | **批一修复（钱 + 假合格）**：POST 读超时不再重试/换 key（防重复扣费）、zhipu payload 并入统一构造器（--last-frame 显式报错 / --negative 显式警告）、时长未知改 WARN 不再假 PASS、TTS 槽位扫描收归单源、--ref-image 可变默认值修复 | `http_call` 的重试语义变了：POST"发出后失败"现在抛 RequestUncertain（exit 4），**不再自动重试 3 次**——依赖旧行为盲重试的脚本要适配；zhipu + --last-frame 从"静默忽略"变"报错退出码 2" |
+|---|---|---|---|---|---|
+| **v4.7.1** | 2026-09-11 | 4db3de1 | 253 | **收口 v4.7 尾巴 + 上结构性防线**：`ref_image` 进 batch（角色一致性可用于主流程）；过渡镜与普通镜共用执行器 `run_shot_once`（补回 qcgate/qc、消除 70 行重复）；**新增 `tests/test_structure.py`**（顶层函数清单快照 + 子进程入口守卫 + CLI --help 冒烟） | 结构快照 `_MANIFEST` 变更需**先核对结构再更新**（否则防线失效）；`--help` 冒烟走 SLOW 门控；pass2 仍单线程（过渡镜多时慢） |
+| **v4.7** | 2026-09-11 | 149c6c4 | 242 | **实测驱动的能力解锁**：Agnes 免费池原生支持多图参考（`--ref-image`，角色一致性）与首尾帧 keyframes（过渡镜不再需付费池）；大图自动转 JPEG 防上传超时；video payload 提为纯函数 | 参考图**必须走 extra_body**（顶层会被静默忽略、退化成 t2i，无报错）；`image_to_uri_shrunk` 仅在 >450KB 时改编码（小图行为不变）；keyframes 需首尾帧齐全，只给尾帧会 die |
+| **v4.6** | 2026-09-11 | 339803b | 229 | 过渡镜一等公民（方案二）：`transition` 字段 + batch 两趟调度（pass1 普通镜→抽 from 末帧→pass2 过渡镜）+ STALE 失效链 + audit 待邻出片；**顺带修 P0：make_cmd worker 子命令曾指向无 `__main__` 的 mg_batch.py（真实 batch 静默空跑记 OK）** | 过渡镜 seed（frames/<sid>_seed.png）mtime 比 from clip 旧判 STALE——系统时间回拨会误判；hybrid `--only` 不含过渡镜时需手工跑 batch（两趟调度只在全量 videos 阶段触发）；仍需接支持双条件的池才能真跑 |
 | **v4.5** | 2026-09-10 | 48a8a06 | 222 | 过渡镜（首尾帧双条件）：`video --last-frame` + batch 透传 + 池/key 级字段名配置 | 免费池（agnes/zhipu）不支持双条件——功能就绪但需接支持的池才能真跑；`last_frame` 图缺失时 batch 报 MISS 跳过不提交 |
 | **v4.4** | 2026-09-09 | bcc45cd | 215 | #5 成本账本（JSONL 调用记录 + `ledger` 报表）+ #6 声音链反向（`vo_build plan` 按 TTS 真实时长反推每镜时长） | 账本挂点在 call_with_failover/cmd_tts/cmd_edit，测试必须 patch LEDGER_FILE+STATE_FILE 到 tmp（真实 state 冷却条目会造"所有 key 失败: None"假故障） |
 | **v4.3** | 2026-09-09 | d537af6 | 203 | B6 SKILL 瘦身：585→551 行，文案方法论外置 copy-guide.md，TTS 细节归 voice-guide，修 audit 重复行 | 纯文档+export 规则清理；被删的口味卡句移除对应替换规则，防回潮靠 grep 自检 |
@@ -34,6 +51,216 @@
 | v3.1 | 2026-09-06 | 59d570d | — | 本地 Edge TTS 接入 key 池 | TTS 依赖本地服务（localhost:5050）在线 |
 | v3.0 | 2026-09-06 | 8d3a975 | 27 | 通用化中性化（去赛事归属） | 公开仓剔除私有池，私有能力不在公开版 |
 | v2.9 | 2026-09-05 | c37fa8e | — | 公开仓体检修复 | — |
+
+## v4.7.5（2026-09-11）
+
+**批三：清掉审计报告"已核验未修"里的 P1 剩余项**（TDD 红→绿 + 真机核验）。
+本轮亮点是**两项审计 P1 被真机核验推翻**——先验证再动手的老规矩又救了一次。
+
+**① 轮询路径支持 local_path（P1-1，钱+失败类）**
+`_extract_video_url` 认得 local_path 并原样返回，但 `_download` 对它 urlopen →
+ValueError（urlopen 不吃 Windows 盘符路径）。同步路径（cmd_video 的 LTXBridge
+分支）有 shutil.copyfile 保护，轮询路径没有——同一条链路两种行为。
+现在 `_download` 是**取产物的统一入口**：非 http(s) 一律本地直拷（copyfile +
+原子替换 + 失败清残骸），URL 走原带超时下载。受控破坏验证过（禁用本地分支 → 红灯）。
+
+**② vo_build 缺 at 字段前置校验（P1-5）**
+`lines[i]["at"]` 直下标——手写 vo_lines_at.json 少个 at 就 KeyError 裸奔 exit 1。
+校验放在 TTS/录音检查**之前**：错误的数据不该开始烧合成额度。报错指认到行 id。
+
+**③ pipeline 透传（P1-6）**
+视频阶段 batch 命令只透传了 provider/only/qcgate——`--negative/--video-size/
+--video-duration/--qc` 被静默丢弃（"以为用了自定义 negative，实际是默认值"）。
+现在四个参数全透传；**未给参数不追加**（batch 各池默认行为不变）；getattr 防御
+旧调用方手工构造的 Namespace。
+
+**④ clean 纳入 concat/字幕中间文件（P2）**
+`_norm.mp4 / _mixed.mp4 / _with_text.mp4` 散落在 clips/ 里，clean 治理面扫不到，
+越积越多。加入 `_CLEAN_FILES`（trash not delete 语义不变）。
+
+**⑤ 两项审计 P1 核验为误报（不修，记档防复发）**
+- **字幕冒号转义**：真机 ffmpeg 实测——单引号 fontfile 内**不转义反而失败**
+  （rc=4294967274 filter 解析错），现有 `C\:/...` 转义才是正确做法。审计
+  报告自己标了"需真机验证"，这条标救了一命——不验证就把好代码改坏了。
+- **cmd_edit 无 key 裸奔**：key 从 `~/.workbuddy/media_keys.env` **文件**加载
+  （非进程 env），`list_keys(required=True)` 已 die(2) 带指引。真机复现的
+  HTTP 400 是测试图格式错（b"x" 不是图），不是校验缺失。
+
+测试 305 → **313**（+8：local_path 2 + at 校验 2 + 透传 2 + clean 1 + 文档性 1）；
+快测 13s 全绿。
+## v4.7.4（2026-09-11）
+
+**批二：结构性防线 + 能力制度化**（改代码 skills，TDD 红→绿；三件事全落在"同一类问题"上——
+概念没有单一真相源）。
+
+**① caps 能力级真探针（把"实测过"制度化）**
+池级冒烟只证"能出片"，不证"参考图真锁脸 / 首尾帧真插值"——v4.7 踩过的坑（顶层 image 被静默忽略、
+大图直传超时）只有真跑才知道。新增：
+- `caps probe <pool> --kind <k> --cap ref_image|keyframes --real`：64px fixture 图现场生成，
+  真跑一次，结果落 `.media_caps.json` 的 `<kind>:cap:<cap>` 键（不覆盖池级冒烟）
+- `caps show` 显示能力行：`实测✅ / 实测❌ / 声明未测（附可执行命令）`
+- 未声明就拒绝探测（白烧一次额度）；`_execute_smoke` 从 `_real_smoke` 抽出共用
+  （探针执行器写两遍必漂移——本批主题的自我实践）
+- 真机验证：agnes/ref_image 探针 35.6s 出片落档 ✅
+
+**② --only × 过渡桥兼容（hybrid 核心场景）**
+过渡镜**不按 --only 硬滤**：邻居在本次运行 → pass2 接上；from 镜不在运行但有历史 clip →
+seed 照抽；from 完全带不动 → 排除并提示（不留在计划里刷 MISS）。
+hybrid 流程从此能直接出"重点镜 + 过渡镜"，不用再手工全量 batch。
+
+**③ 概念收敛（单一真相源）**
+- `is_transition` / `find_product` 收归 mg_core：此前过渡镜判定 mg_batch 一份 + pipeline 内联两处、
+  clip 查找两份实现（`_find_clip` / `_find_dep_clip`）
+- 三道新守卫（test_structure）：共享概念禁止本地重定义 / 旧内联名禁止复活 /
+  （承 v4.7.3）可变默认值与裸编码器
+- 受控破坏验证守卫有效性（假 def → 红灯）
+
+测试 294 → **305**（+11：能力探针 6 + only×过渡 3 + 单源守卫 2）；快测 15s / SLOW 全绿。
+
+## v4.7.3（2026-09-11）
+
+**批一：把审计报告里"还在冒烟"的高价值项清掉**（改代码 skills TDD 红→绿，真机验证）。
+
+**① POST 读超时 → 不再重试/换 key（重复扣费，最贵的一条）**
+旧 `http_call` 的通用 `except` 对读超时也照常重试 3 次——但 POST 可能已被服务端受理，
+每次重提都是一笔新任务。新增 `classify_network_error()`（纯函数）+ `RequestUncertain` 异常：
+- `uncertain`（POST/PUT/PATCH 已发出后超时/被掐断）→ **不重试、不换 key、不跨池**，直接抛出；
+  `call_with_failover` 落账（这可能是一笔已产生的费用）后 raise；上层 `die(..., 4)` 走超时在途协议。
+- `retry`（连接被拒 / DNS 失败 / GET 一切）→ 照旧重试，不误伤可用性。
+URLError 会把真实原因包在 `.reason` 里，必须拆开判——否则读超时被误判成普通连接错误。
+
+**② zhipu payload 并入 `build_video_payload`（消灭分池分支漂移）**
+cmd_video 里 zhipu 另起一份 payload 构造 → `--last-frame` / `--negative` 被**无声丢弃**、
+`image_url` 走未压缩编码（大图直传会读超时）。现在所有池走唯一入口：
+zhipu + `--last-frame` 显式 die(2)；不支持的 `--negative` 显式 warn（每池一次，batch 不刷屏）。
+
+**③ 时长未知 ≠ 合规（假合格）**
+`probe` 拿不到 Duration 时旧逻辑兜底成 0 → `0 <= max` 恒真 → check/qcgate 的时长校验**恒 PASS**。
+新增 `duration_verdict()` 三态（ok/warn/fail）：warn 显式打出"时长无法判定"，
+qcgate `--strict` 下升级为 FAIL。**webp 动图合法地没有 Duration，所以默认不拦只喊。**
+
+**④ TTS 槽位扫描收归单源**：`scan_tts_slots` 移入 mg_core，media_gen 保留别名、mg_status 改用共享实现
+——修复 status 在 key#1 空缺时误报"tts 未配置"（口径漂移）。
+
+**⑤ `--ref-image` 可变默认值**：`default=[]` → `default=None`（消费侧 `or []`）；
+新增 AST 守卫 `TestNoMutableArgparseDefaults` 防全库复发。
+
+**⑥ 新守卫**：`TestShrunkEncoderCoverage` —— 输入图编码必须走压缩版
+（裸编码器只允许在 mg_core 内部出现），防止"大图超时"这类覆盖缺口再冒出来。
+
+测试 262 → **294**（+32）；快测 12s / SLOW 全绿；真机验证：agnes 出图 29s 正常（新分类不伤正常路径）。
+
+## v4.7.2（2026-09-11）
+
+**全库复测审计**（用户要求"把整个生视频 skills 复测核实一遍"）。方法：改代码 skills 的
+code-review 双轴精神 → 适配为全库审查：5 路并行只读子代理分域审（带 Fowler 坏味道基线）
++ **逐条核验后才采信** + 真机复现。完整报告见工作区 `reelcraft复测审计报告.md`。
+
+修掉 4 个 P0（全部是"rc=0 但结果是错的"这类静默失败）：
+
+- **concat 混编音轨被静默丢弃**：`all(audio)` 判定下，只要有任一分片无音轨（hybrid 模式
+  的常态：真视频带环境音 + kenburns 静帧片段）整卷音轨被丢。→ 新增 `audio_plan()`
+  三态判定 + `audio_src()` 给无音轨片补等长静音；`-c copy` 快路径在音轨不一致时改走重编码。
+- **静帧成片 + 仅加旁白 → ffmpeg 无限挂起**：`amix=inputs=1`（amix 要求 ≥2 输入）不报错、
+  不退出，永久挂起。→ 单路直通（acopy），单路时不再 apad。
+  **修的过程二次踩坑**：首版把 `run()` 留在 elif 分支内 → rc=0 但旁白被静默丢弃，
+  靠 ffprobe 内容级检查才发现。
+- **batch 的 MISS/STALE 被当成功吞掉**：缺帧/缺依赖的镜不进账单、不算失败、退出码 0
+  → 成片静默缺段且 `--retry-failed` 抓不到。→ 新增 `skip_kind()`/`record_skip()`，
+  blocked 进结果与账单并计入退出码；pipeline 分开报 blocked/failed；修 audit 标签切片乱码。
+- **导出脱敏自检三处静默绕过**：只扫内容不扫文件名、非 UTF-8 文件直接 continue、
+  标记块删除遇非 UTF-8 静默跳过。→ 文件名一并扫描、非 UTF-8 用 replace 继续扫并列出待转码。
+
+测试 253 → **262**（+9：audio_plan/audio_src 3 + 混编与单路旁白端到端 3 + blocked 分类 3）。
+另修 `probe` 重复调用（每片 2 次 → 1 次）。
+
+报告同时列出**已核验但本轮未修**的 P1/P2 清单（轮询 local_path、大图压缩未全覆盖、
+响应超时重试可能重复扣费、status 与 cmd_tts 的 TTS 槽位漂移、probe 时长假 PASS、
+pipeline 未透传 --video-size/--negative 等）。
+
+## v4.7.1（2026-09-11）
+
+收口 v4.7 的尾巴 + 把反复出事故的两类问题变成防线。
+
+- **`ref_image` 进 batch（补 v4.7 尾巴）**：v4.7 只加了单命令 `image --ref-image`，
+  批量主流程用不了。现在 shot JSON 写 `ref_image`（字符串或列表）即自动透传，
+  相对路径按 shots 根解析；参考图缺失 → MISS 不提交。
+  真机验证：batch images 带角色参考出片成功，角色特征完整保留。
+- **过渡镜与普通镜共用执行器 `run_shot_once`**：pass2（过渡镜串行）原先手写了一份
+  与 worker 重复约 70 行的重试/记结果逻辑，且**漏掉 qcgate/qc 质量门禁**。
+  现抽为单一实现，两处共用 → 门禁补回、重复消除、以后加镜头级能力只需改一处
+  （locality 修复）。
+- **新增结构性防线 `tests/test_structure.py`**（对 AST 校验与 dry-run 盲区的补位）：
+  1. **顶层函数清单快照**（7 个核心模块）：def 被插进别的函数体中间时，它会从
+     top-level 清单消失/多出 → 立刻红灯。用受控破坏验证过能抓到。
+  2. **子进程入口守卫**：扫 `parent / "X.py"` 引用，目标必须存在且带 `__main__`
+     ——正是 mg_batch 静默空跑那次事故的形状。同样用受控破坏验证过。
+  3. **CLI `--help` 冒烟**（SLOW 门控）：带 argparse 的脚本真跑一遍帮助。
+- 测试 242 → **253**（+11：batch 参考图 3 + run_shot_once 3 + 结构防线 5）。
+
+## v4.7（2026-09-11）
+
+**实测驱动的能力解锁**：调研 GitHub 开源漫剧项目时，从 `vvlife/agnes-comic-drama` 的源码
+发现 Agnes 免费池可能支持多图参考与首尾帧，遂写探针实测（`_probe_agnes/`）——**两条都被证实**，
+且顺带发现一个静默坑。v4.5/v4.6 的"免费池不支持双条件"边界**被推翻**。
+
+- **实测结论（零成本）**：
+  - `extra_body.image=[...]`（≤4 张）→ 走 `/images/i2i/`，**角色特征完整保留**（真图生图）
+  - 顶层 `image` → 走 `/images/t2i/`，**静默忽略无报错**（退化成文生图）——最坑的一条
+  - 视频 `extra_body={"image":[首,尾],"mode":"keyframes"}` → **真插值**（末帧≈第二关键帧）
+  - 大图直传会超时：960KB PNG → 2m23s 读超时；同图缩至 220KB → 18s 成功
+- **新增 `image --ref-image`**（可重复）：参考图生图，用于角色/风格一致性。池能力声明
+  `ref_image_style: extra_body` + `ref_image_max`（Agnes = 4）。
+- **新增 `video --last-frame` 的 keyframes 分支**：`keyframes_style == "extra_body"` 的池
+  （Agnes）自动走 `extra_body` 双帧插值，**不传顶层首帧**（双帧必须成组）；custom 池的
+  `last_frame_param` 路径老行为不变。
+- **新增 `mg_core.image_to_uri_shrunk`**：本地图 >450KB 时先转 JPEG（保尺寸、必要时缩边）
+  再编码；小文件走原路径（零回归）。修的是"大图上传超时"这个真机才暴露的问题。
+- **重构 `media_gen.build_video_payload`**：payload 构造提为纯函数（与 zhipu 分支解耦），
+  三种首尾帧承载方式的差异第一次可被单测钉死。
+- 测试 229 → **242**（+13：池声明/`keyframes_supported`/`ref_image_supported`/
+  `build_image_body` 共 5 + `image_to_uri_shrunk` 4 + `build_video_payload` 分支 4，含 keyframes 无首帧 die）。
+- **端到端真机验证**（非 dry-run，v4.6 的教训）：`--ref-image` 用 960KB 原图出片成功（17s）；
+  `--last-frame` keyframes 出片成功（2m19s，抽帧确认末帧=第二关键帧）。
+- 教训沉淀：**dry-run 和单元测试都覆盖不了"上游对参数/体积的真实反应"**——API 行为类改动
+  必须真跑一发；第三方 repo 的源码是**可验证线索**而非结论，值得写探针去证。
+
+## v4.6（2026-09-11）
+
+过渡镜一等公民（讨论定案的"方案二：分镜 Schema + 编排依赖"）：v4.5 半自动方案里
+"过渡镜何时能跑"靠人判断，本版升级为**编排自动理解 DAG 依赖**——过渡镜必须等
+from 镜出片 + to 镜出图才能跑，batch 自动排两趟。
+
+- **Schema**：过渡镜 = 独立 shot JSON（如 `S01T`），写
+  `transition: {"from": "S01", "to": "S02"}`，无需 t2i_prompt（首帧来自邻居）。
+  **natkey 排序天然把 `S01T` 落在 S01 与 S02 之间**（`['s',1,'t']` 恰在
+  `['s',1]` 与 `['s',2]` 之间，已实测验证）——concat/qcseq 的 clip 排序
+  **零改动**，这是方案二最大的雷区（时间轴连锁）被绕开的根因。
+- **两趟调度（mg_batch.cmd_batch）**：videos 阶段 pass1 只跑普通镜（原 worker
+  机制不动）→ 每个过渡镜用 `media_gen last-frame` 抽 from clip 末帧落
+  `frames/<sid>_seed.png` → pass2 单线程逐镜跑过渡镜（`--image seed
+  --last-frame frames/<to>.png`）。缺依赖报 MISS 跳过不提交。
+- **失效链（STALE）**：from 镜重拍后 clip 比 seed 新 → make_cmd 报
+  `STALE` 提示，pass2 的抽帧逻辑自动重抽（mtime 比较）。邻居重拍不会带着
+  旧 seed 出"接不上"的过渡片。
+- **孤儿校验**：transition 的 from/to 指向不存在的镜 → 提前 die 列出全部
+  缺失依赖（否则静默 MISS 死循环，用户无从排查）。
+- **pipeline 联动**：kenburns 阶段跳过过渡镜（hybrid 模式下过场镜缓推，
+  但过渡镜等邻居出片走 batch pass2 出真过渡——缓推会破坏首尾帧衔接语义）；
+  audit 视图对未出片过渡镜显示 `待邻出片（S1→S1T→S2）`。
+- **顺带修 P0（历史潜伏）**：make_cmd 的 worker 子命令曾用 `Path(__file__)`
+  构造——mg_batch.py 从 media_gen 拆出后无 `__main__` 入口，**真实 batch
+  （非 dry-run）每镜子进程静默空跑 exit 0，全队记 OK 但零生成**。现有测试全
+  是 dry-run 一直没抓到（本次手测 `python mg_batch.py video ...` 复现确认）。
+  修：子命令一律指向 `parent / "media_gen.py"`（image/video/qc 三处 + pass2）。
+  教训：**dry-run 测试覆盖不了子进程入口正确性，改子命令构造必须真跑一发**。
+- **边界**：hybrid `--only hero` 场景下两趟调度不触发（plan 里只有 hero 列表），
+  过渡镜需用户手工跑全量 `batch --phase videos`；真跑仍需接支持双条件的池。
+- 测试 222 → **229**（+7：过渡镜 images 排除/MISS/两趟/孤儿/STALE 5 +
+  pipeline kenburns 跳过 + --only 语义钉死 2）。
+- 落地过程抓到自己的编辑事故：把模块级函数插进 cmd_batch 函数体中间把函数
+  切成两半（AST 合法但语义死代码，batch 静默结束）——**AST 校验只能保语法
+  不能保结构，函数插入后必须核对 top-level 函数清单 + 端到端跑一发**。
 
 ## v4.5（2026-09-10）
 

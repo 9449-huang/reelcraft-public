@@ -3,7 +3,7 @@ name: reelcraft
 description: 一句话需求 → 多 provider 生图/视频流水线（主力池可配 + 智谱/魔塔兜底，图批量选优 + 首帧图编辑 + 视频双链兜底）→ 声音设计（VO/TTS/字幕/BGM 混音）→ 规格统一后期 → 自检。Use when user asks to 做个视频/出片/AIGC广告/多 provider 兜底 or 给出平台/赛事规格要求生成达标视频；强调多 key 轮转与**多 key 并行**、熔断、一镜多图选优、xfade/末帧链衔接、抽帧 QC 闭环、断点续跑。When NOT to use: 静态海报用 ppt-master 或 image-master，单帧修图用 buddy-image-processing。
 ---
 
-# ReelCraft — 多 provider 视频流水线（v4.5）
+# ReelCraft — 多 provider 视频流水线（v4.10.2）
 
 ### 术语速查（新会话先扫这张表，再读正文）
 
@@ -19,14 +19,21 @@ description: 一句话需求 → 多 provider 生图/视频流水线（主力池
 | **三档模式** | 成片模式：full 全真视频 / hybrid 重点镜 i2v+过场缓推 / stills 全缓推（0 视频调用） |
 | **i2v / t2v / t2i** | 图生视频 / 文生视频 / 文生图 |
 | **末帧链 / xfade** | 同场景连续镜头用上镜末帧当首帧 / 跨场景用交叉溶解转场 |
+| **过渡镜（transition）** | 带首尾帧双条件的一等公民 shot（如 S01T）：首帧=from 镜 clip 末帧（编排自动抽）、尾帧=to 镜首帧，生成 A→B 演化过程；natkey 排序天然落在两镜之间。Agnes 免费池原生支持；zhipu **不支持**（显式报错，绝不静默产出没插值的片）。hybrid `--only` 不再丢过渡镜（邻居可接就跑 pass2） |
+| **ref-image（参考图）** | 多图参考生图（角色一致性）：传角色设定图 → 跨镜锁脸/服装。**必须走 extra_body**（顶层会被静默忽略）。shot JSON 写 `ref_image` 即批量自动透传；多镜/漫剧场景改用**角色圣经**（见下） |
+| **角色圣经（characters.json）** | `<shots>/characters.json`：角色设定图定义一次，shot 写 `characters:["hero"]` 引用（v4.9）。跨镜引用同一角色不必手抄路径；id 查不到 → 该镜报 MISS |
+| **调用门禁（max_calls）** | `--max-calls N` 或 plan.json 的 `max_calls`：批量前预估调用上限（镜数 × (1+重试)），超限**拒跑**（v4.9）。配合 `--dry-run` 先看预估 |
+| **caps 能力探针** | `caps probe <pool> --kind <k> --cap ref_image|keyframes --real`：用 64px fixture 图真跑一次，实测落档；`caps show` 显示 实测✅/声明未测。声明≠能用，真测才算数 |
 | **kenburns（缓推）** | 静态图转缓慢推近视频的本地兜底，0 API 调用 |
 | **口味卡 / 骨架** | 每个池的 prompt 写法卡（`prompt-styles.md`）/ 通用的导演思维结构（`prompt-framework.md`）——骨架管"想得对"，口味卡管"喂得对" |
 | **slop 词** | 空洞的评价性形容词（beautiful/大气），不产生画面只产生 AI 味，见反套话词表 |
-| **caps 实测** | `caps probe --real` 真发一次请求落盘的能力结论（7 天过期），区别于 /models 猜测 |
+| **caps 实测** | `caps probe --real` 真发一次请求落盘的能力结论（7 天过期），区别于 /models 猜测；`status` 尾部有每池 声明/实测 汇总行（v4.7.6 起） |
 | **水印档案** | `watermark_profiles.json`：每渠道水印状态（clean/corner-delogo/unknown/fatal）+ 实测日期 |
 | **exit 4** | 视频任务轮询超时的退出码——触发"切池/续等/放弃"三选协议，任务已落盘不浪费 |
 | **harvest（收割）** | 把在途超时任务事后下载回来的命令 |
-| **qcgate / qcseq / qc** | 机器门禁（黑帧/规格）/ 跨镜色调一致性粗检 / 抽首中尾 3 帧人眼验收 |
+| **qcgate / qcseq / qc** | 机器门禁（黑帧/规格）/ 跨镜**色调**一致性粗检（HSV 直方图）/ 抽首中尾 3 帧人眼验收 |
+| **audio-qc** | 音频侧门禁（v4.10）：静音占比 / 采样削波 / 平均响度 / 长静音段 + 语音判定。补 `qcgate` 只查**画面**的盲区——"旁白整段丢、音轨没接上"都是 rc=0 但成片坏掉。**v4.10.2 起 concat 前自动跑**，`--no-audio-qc` 关 |
+| **faces（人脸一致性）** | 跨镜**身份**一致性门禁（v4.10.1）：YuNet 检测 + SFace 128 维嵌入 + 余弦，判"**是不是同一个人**"。补 `qcseq` 只比**颜色**的错配——换了张脸但色调一致时，直方图看不出来。**v4.10.2 起 concat 前自动跑**（缺 cv2/模型则跳过并说明），`--no-faces` 关 |
 | **单变量重拍** | 画面不合格时一次只改一个变量（先改措辞→再调运动→再换首帧→最后换池） |
 | **断点续跑** | 每阶段幂等，有产物即跳过，中断后重跑同命令即可续 |
 | **Director's Read（导演读法）** | 拆镜前每镜先回答"为什么存在"，答不出的砍掉（`prompt-framework.md` 第 0 层） |
@@ -204,6 +211,18 @@ python scripts/media_gen.py image \
   --count 3 \
   --out shots/shot_01.png        # 产出 shot_01_1.png ~ shot_01_3.png
 # --provider 留空 = 按 MEDIA_PRIORITY 自动选池（默认 agnes 优先），失败自动跨池兜底
+
+# 角色一致性（v4.7）：--ref-image 传角色设定图（可重复，Agnes 最多 4 张）→ 图生图锁角色
+python scripts/media_gen.py image --provider agnes \
+  --ref-image shots/char_hero.png --prompt "<同一角色的新场景>" \
+  --size 1024x1024 --out shots/shot_03.png
+```
+
+**批量出图带角色参考**（v4.7.1）：shot JSON 里写 `ref_image`（字符串或列表）即自动透传——
+相对路径按 shots 根解析（写 `"char_hero.png"` 即可），参考图缺失报 MISS 不提交。
+```json
+{"shot_id": "S03", "t2i_prompt": "...", "ref_image": ["char_hero.png"], "size": "1024x1024"}
+```
 ```
 
 选优后把选中的那张改名为/复制为 `shots/shot_01.png`（i2v 入口），其余候选保留备查。
@@ -231,7 +250,7 @@ python scripts/media_gen.py edit \
 **衔接方式选择（重要）**：
 - **同场景连续镜头**（同一主体、机位延续，如"人物走近→特写"）→ **末帧链**：上一镜视频最后一帧抽出来当下一镜首帧，画面级一致性
 - **跨物体/跨场景切换**（如砚台→墨锭→毛笔）→ **独立首帧 + Step 6 的 xfade 交叉溶解**：i2v 模型无法完成大幅场景跳变，强行末帧链会导致画面崩坏或几乎不动
-- **想要"画面慢慢演化过去"的自然过渡**（长镜头感）→ **过渡镜（首尾帧双条件，v4.5）**：给 i2v 同时传首帧和尾帧，模型生成中间演化过程——比 xfade 的"后期叠化"自然得多。**半自动设计**：过渡镜就是一个普通 shot JSON（加 `last_frame` 字段指向尾帧图），何时插、插在哪人拍板，编排/时间轴体系零改动
+- **想要"画面慢慢演化过去"的自然过渡**（长镜头感）→ **过渡镜（首尾帧双条件，v4.7 免费池原生可用）**：给 i2v 同时传首帧和尾帧，模型生成中间演化过程——比 xfade 的"后期叠化"自然得多。**schema**：过渡镜 = 独立 shot JSON（如 `S01T`，natkey 排序天然落在 S01 与 S02 之间，concat/qcseq 零改动），写 `transition: {"from": "S01", "to": "S02"}`，无需 t2i_prompt。**编排自动理解依赖**：batch videos 两趟调度（pass1 普通镜 → 自动抽 from 末帧 → pass2 过渡镜），缺依赖 MISS 不提交；邻居重拍后 seed 自动判 STALE 重抽；hybrid 的 kenburns 阶段自动跳过过渡镜。**Agnes 免费池实测原生支持**（2026-09），无需接付费池
 
 ```bash
 # ① 每镜独立首帧（跨物体切换的主流路径）
@@ -243,12 +262,53 @@ python scripts/media_gen.py video  --provider agnes --prompt "<i2v shotN>" --ima
 python scripts/media_gen.py last-frame clips/clip_01.mp4 shots/shot_02_seed.png
 python scripts/media_gen.py video --provider agnes --prompt "<i2v shot2, 据实写>" --image shots/shot_02_seed.png --out clips/clip_02.mp4 --num-frames 121
 
-# ③ 过渡镜（首尾帧双条件）：--last-frame 传尾帧，模型生成 A→B 的演化过程
-#    池需声明支持：custom 池 env 加 MEDIA_CUSTOM_n_LAST_FRAME_PARAM=<字段名>
-#    （各家叫法不同：tail_image / lastFrame / end_frame…；可选 _LAST_FRAME_LIST=1 列表形式）
-python scripts/media_gen.py video --provider <池> --prompt "slow cinematic morph, camera drifts forward" \
+# ③ 过渡镜（首尾帧双条件，v4.7 起免费池原生支持）：shot JSON 写 transition 字段，编排自动跑两趟
+#    schema：{"shot_id": "S01T", "transition": {"from": "S01", "to": "S02"}, "i2v_prompt": "slow cinematic morph"}
+#    池支持情况（2026-09 实测）：Agnes 免费池**原生支持**（自动走 extra_body keyframes 插值，不传顶层首帧）
+#    custom 池：env 加 MEDIA_CUSTOM_n_LAST_FRAME_PARAM=<字段名>（tail_image / lastFrame / end_frame…）
+#    zhipu 不支持 → 给 --last-frame 会直接报错（v4.7.3 起；被静默忽略过，那是坑）
+#    batch --phase videos 自动：pass1 跑普通镜 → 抽 from clip 末帧为 frames/S01T_seed.png
+#    → pass2 跑过渡镜（--image seed --last-frame frames/S02.png）；缺依赖 MISS 不提交
+#    手动单发（想先试一发效果）：
+python scripts/media_gen.py video --provider agnes --prompt "slow cinematic morph, camera drifts forward" \
   --image shots/shot_01.png --last-frame shots/shot_02.png --out clips/clip_01to02.mp4
-#    batch 侧：shot JSON 加 "last_frame": "shots/shot_02.png" 即自动透传（缺失时报 MISS 跳过不提交）
+```
+
+**角色一致性（v4.7，Agnes 免费池原生）**：
+```bash
+# --ref-image 可重复（Agnes 最多 4 张）：传角色设定图 → 图生图，跨镜锁脸/服装/发型
+python scripts/media_gen.py image --provider agnes \
+  --ref-image shots/char_hero.png \
+  --prompt "the same character standing in a bamboo forest at dusk" \
+  --size 1024x1024 --out shots/shot_03.png
+```
+> ⚠️ **踩坑警告**：参考图必须走 `extra_body`。如果自己写请求发现"参考图没效果"，检查是不是放在了顶层——
+> 顶层 `image` 会被上游**静默忽略**（返回 URL 从 `/images/i2i/` 变 `/images/t2i/`），不报错，极难排查。
+> 另：本地大图（>450KB）直传会超时，脚本已自动转 JPEG 压体积（小图行为不变）。
+
+**角色圣经（v4.9，多镜/漫剧场景首选）**：角色设定图定义一次，shot 只写角色 id——
+跨几十镜引用同一角色时不必每镜手抄图片路径（改设定图只需改一处）。
+
+```jsonc
+// shots/characters.json —— 角色圣经（与 shot JSON 同目录）
+{"characters": {
+  "hero":  {"name": "阿仓", "ref_images": ["char_hero.png", "char_hero_side.png"]},
+  "rival": {"name": "老鸦", "ref_images": ["char_rival.png"]}
+}}
+```
+```jsonc
+// shots/shot_03.json —— 只写 id（可与自带 ref_image 共存，自动合并去重）
+{"shot_id": "S03", "t2i_prompt": "...", "characters": ["hero", "rival"]}
+```
+> 角色 id 在圣经里查不到 → 该镜报 **MISS**（不静默丢一致性）；没有 `characters.json` 时行为与旧版完全一致。
+> 参考图总数上限按池的能力走（Agnes 免费池 4 张），超限会明确报错。
+
+**跑之前先看要烧多少额度（v4.9）**：
+```bash
+python scripts/media_gen.py batch shots/ --phase images --dry-run   # 会打印：N 镜 → 调用上限 M 次
+python scripts/media_gen.py batch shots/ --phase images --max-calls 40   # 超限直接拒跑
+```
+或写进 plan.json：`{"max_calls": 40}`（pipeline 自动读并透传给两个生成阶段）。
 ```
 
 **视频兜底链**（Agnes 不可用时）：
@@ -451,6 +511,18 @@ python scripts/vo_build.py plan vo/vo_lines.json --out vo/plan.json --gap 0.5 --
 - 听诊走硅基 SenseVoice 转写（扫 `MEDIA_TTS_<n>_*` 取第一个可用，零新配置）；`--pool <模型> --update-profile` 把结论写进 `~/.workbuddy/.audio_profiles.json`，**同模型下次免测**（传 `--pool` 即自动查档案命中跳过转录）；换模型版本/结论存疑时 `--refresh` 强制重测
 - `audit` 已带"有声/哑片"列——先看它再决定要不要开 triage。**机器只粗筛，配音风格/补不补永远你拍板**
 
+**音频侧门禁（v4.10）：`audio-qc`** —— `qcgate` 只看**画面**；这一条看**声音**（"旁白整段丢 / 音轨没接上"都是 rc=0 但成片坏掉）：
+
+```bash
+python scripts/media_gen.py audio-qc clips/                 # 批量：QC + 语音判定
+python scripts/media_gen.py audio-qc clips/S01.mp4 --json   # 机器可读
+python scripts/media_gen.py audio-qc clips/ --strict        # WARN 也算失败（exit 2）
+```
+
+- **四类判定**：静音占比（≥85% FAIL＝音轨没接上/旁白丢失；≥50% WARN）、采样削波（取 `astats` 的 **Overall** 段，大量触顶→FAIL）、平均响度（≤-45dB 近乎无声 / ≥-6dB 可能爆音）、单段长静音（≥5s）
+- **语音判定 VAD**：有 `onnxruntime` + `~/.workbuddy/models/silero_vad.onnx` → **神经 VAD**；缺任一项 → **如实回退** ffmpeg 能量法，输出里的「后端 silero/ffmpeg」会讲清用了哪条（不假装）
+- ⚠️ **两者语义不同**：能量法会把纯音乐/环境音算成"有语音"，**silero 会正确判"非语音"**——这个差别正是升级的意义（`triage` 因此不再为纯音乐白花一次远端 ASR 额度）
+
 ## QC 闭环（生成后验收：让 prompt 优化从开环变闭环）
 
 只写不验 = 抽卡。每段视频生成后必须验收，不合格按诊断表**单变量重拍**。
@@ -464,10 +536,23 @@ python scripts/vo_build.py plan vo/vo_lines.json --out vo/plan.json --gap 0.5 --
 python scripts/postprocess.py qcgate clips/clip_05.mp4
 # 批量生成时就地过门禁（推荐，#4）：FAIL 的镜记为 FAIL，配合 --retry-failed 重跑
 python scripts/media_gen.py batch shots60/ --phase videos --workers 2 --qcgate
-# 跨镜首帧一致性粗检（v3.1.8）：HSV 直方图相邻对比，抓"某镜风格跑偏"（混编画风跳变）
-# WARN 报告不拦流程：跑偏镜单独重拍，或整体统一调色；concat 阶段自动跑（--no-qcseq 关）
+# ── concat 前三道门禁（v4.10.2 起**自动跑**，不必记着手动补）──
+# ① audio-qc 声音（静音占比/削波/响度）② faces 人脸身份 ③ qcseq 跨镜色调
+python scripts/media_gen.py run shots60/ --stop-after concat   # 三条都在 concat 前依次执行
+# 单独跑 / 调参时：
+# 跨镜色调粗检（v3.1.8）：HSV 直方图相邻对比，抓"某镜风格跑偏"（混编画风跳变）
 python scripts/postprocess.py qcseq clips/
-python scripts/media_gen.py run shots60/ --stop-after concat   # 内含 qcseq 粗检
+python scripts/media_gen.py audio-qc clips/                   # 声音体检（--strict 让 WARN 也算失败）
+python scripts/media_gen.py audio-qc clips/ --json            # 机器可读
+# 关掉某条：--no-audio-qc / --no-faces / --no-qcseq；audio-qc 的 WARN 想升级为拦 → --audio-qc-strict
+# 语义统一：三条都是"**WARN 报告不拦、硬失败(rc>=2)才拦**"；faces 缺 cv2/模型时自动跳过**并说明**
+# 跨镜人脸身份一致性（v4.10.1）：YuNet 检测 + SFace 128 维嵌入 + 余弦，判"**是不是同一个人**"
+# qcseq 只比色调——换了张脸但色调一致时它看不出来（漫剧锁脸就靠这条）
+python scripts/media_gen.py faces clips/                     # 批量（每镜取中段帧）
+python scripts/media_gen.py faces clips/ --ref hero.png      # 以角色设定图为基准一并比对
+python scripts/media_gen.py faces clips/ --json              # 机器可读
+# 退出码 0=一致 / 1=WARN（报性质）/ 2=FAIL；缺 cv2 或模型 → 打安装指引 + rc=1（**不假装通过**）
+# 阈值 0.363 是 SFace 官方 LFW 标定值；调高更严（如 0.5）能抓更细的漂移，但误报会涨
 # 单段抽首/中/尾 3 帧（人眼/视觉模型验收）
 python scripts/media_gen.py qc clips/clip_05.mp4 qc_frames/
 # 或批量生成时自动抽（推荐）
@@ -508,7 +593,7 @@ python scripts/media_gen.py run shots60/ --stop-after images# 每阶段人工把
 python scripts/media_gen.py run shots60/ --watermark <渠道> --watermark-dry-run  # 交付出前只列待抹水印档
 ```
 
-**阶段**（顺序固定，`--stop-after` 提前停）：`images`（全镜出图）→ `videos`（full 全镜 / hybrid 只 `hero_shots`，靠 batch `--only`）→ `harvest` → `kenburns`（只补缺失 clip 的镜）→ `sound`（有 `shots/vo_lines.json` 才跑 vo_build 出旁白+字幕，自动带进 concat）→ `concat`（后期+声音三件套+xfade+自检→final）→ `watermark`（可选：`--watermark <provider>` 走 delogo，`--watermark-dry-run` 只出红框自检图不真抹）。
+**阶段**（顺序固定，`--stop-after` 提前停）：`images`（全镜出图）→ `videos`（full 全镜 / hybrid 只 `hero_shots`，靠 batch `--only`）→ `harvest` → `kenburns`（只补缺失 clip 的镜）→ `sound`（有 `shots/vo_lines.json` 才跑 vo_build 出旁白+字幕，自动带进 concat）→ `concat`（**前**自动跑 audio-qc → faces → qcseq 三道门禁；后期+声音三件套+xfade+自检→final）→ `watermark`（可选：`--watermark <provider>` 走 delogo，`--watermark-dry-run` 只出红框自检图不真抹）。
 
 **编排边界（硬规则）**：
 - **只做编排，不做审美决策**——mode / 重点镜 / 池顺序 / 水印全读 `plan.json`（那是问过用户的结果）。
@@ -518,6 +603,8 @@ python scripts/media_gen.py run shots60/ --watermark <渠道> --watermark-dry-ru
 - **超时交还 agent**：videos 有镜超时在途（提交已扣）→ pipeline 以 **exit 4** 停，按「视频超时询问协议」
   问用户三选（切池/续等/放弃），不自动重试防重复扣费；出片后 `harvest` 收割、`--retry-failed` 补跑。
 - **停在 QC 门前**：concat 一完即停——视觉验收（抽帧美学）必须人看，机器门禁可先 `qcgate final.mp4`。
+  concat **前**已自动跑三道门禁（`audio-qc` 声音 → `faces` 人脸 → `qcseq` 色调），结果记进
+  `shots/pipeline_run.json`，`audit` 会把上次结果读出来（v4.10.2 起）。
 
 **断点续跑**：每阶段都幂等（images/videos 有产物即跳过，kenburns 只补缺失镜），中途失败重跑即可续。
 执行清单落 `shots/pipeline_run.json` 可追溯。命令行脚本入口记不住没关系：`media_gen.py run`（编排）/ `audit`（盘点）是统一门面，
@@ -565,7 +652,7 @@ python scripts/media_gen.py run shots60/ --watermark <渠道> --watermark-dry-ru
 
 **改完 scripts/ 下任何文件，提交前必须做完这三步**——它们各自真实拦下过一次事故：
 
-1. **AST 结构校验**：抽取/移动函数时，`def` 缩进错位会把函数体拦腰截断，Python 不报错、语法完全合法，只是后半段变成不可达死代码。已发生两次（v3.1 postprocess `_escape_drawtext`、v3.1.2 copy.py `clean_text`）。用 `ast.parse` 打印各函数起止行、确认 `main()` 实际调用了它该调的东西。
+1. **AST 结构校验**：抽取/移动函数时，`def` 缩进错位会把函数体拦腰截断，Python 不报错、语法完全合法，只是后半段变成不可达死代码。**已发生 6 次**（v3.1 postprocess `_escape_drawtext`、v3.1.2 copy.py `clean_text`、v4.6、v4.7.7 附近两次、v4.10.1 face_consistency `_detect_and_embed`）——这是本仓最高频的事故类型。**改完不要只靠 `ast.parse`**（它只保语法）：跑 `tests/test_structure.py` 的 `_MANIFEST` 快照（v4.10.1 起覆盖**全部**脚本，且有"新脚本必须登记"守卫），它会报"消失/新增"，再用 `python -c` 打印各函数起止行核对。
 2. **CLI 冒烟**：至少跑一次真实入口（`python scripts/copy.py --help` 级别也行），确认不是静默 exit 0。
 3. **测试要覆盖 main 层**：只测被抽出的纯函数会掩盖第 1 类事故（46 项全绿却没发现 copy.py 根本不落盘）。新增 CLI 能力时，端到端测试与单函数测试同等必要。
 4. **跨平台 glob 要警惕大小写**：Windows 的文件 glob 大小写不敏感——`glob("S*.json")` 与 `glob("shot_*.json")` 都会匹配 `shot_01.json`，两 pattern 拼接不去重就每镜双跑（Linux/macOS 不复现，只在 Windows 静默出错）。已发生一次（v3.1.5 抓出，mg_batch/pipeline 共用 `mg_core.list_shot_files` 单源去重）。新写"多 pattern 收集"时一律走它或按解析路径去重。

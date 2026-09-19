@@ -11,12 +11,14 @@
 决策链（机器只粗筛，永远给人拍板）：
     probe has_audio?
       ├─ 无 → yes（哑片，旁白/音乐都需后期配）
-      └─ 有 → 抽 8-10s 中段 → 硅基 SenseVoiceSmall 转写（/audio/transcriptions，
-             OpenAI 兼容；通道扫 MEDIA_TTS_<n>_* 取第一个可用的 base/key）
-           ├─ 转录中文文本 ≥2 字 → no（自带中文人声）
-           ├─ 转录英文 → yes（非中文人声，建议补中文旁白）
-           ├─ 转录空 → listen（纯音乐/环境音/噪声？机器不硬判）
-           └─ API/抽帧失败 → listen（交人听）
+      └─ 有 → **本地 VAD 前置**（audio_qc：silero ONNX，缺依赖则 ffmpeg 能量法回退）
+            ├─ 未检出语音 → yes（纯音乐/环境音）**直接出结论，不花远端 ASR 额度**
+            └─ 检出语音 → 抽 8-10s 中段 → 硅基 SenseVoiceSmall 转写
+                 （/audio/transcriptions，OpenAI 兼容；通道扫 MEDIA_TTS_<n>_* 取第一个可用的 base/key）
+                 ├─ 转录中文文本 ≥2 字 → no（自带中文人声）
+                 ├─ 转录英文 → yes（非中文人声，建议补中文旁白）
+                 ├─ 转录空 → listen（纯音乐/环境音/噪声？机器不硬判）
+                 └─ API/抽帧失败 → listen（交人听）
     转录通道扫 MEDIA_TTS_<n>_*（起始空号跳过，配置后连续 3 空号停，与 cmd_tts 同口径）——
     key 不在 TTS_1 时不再误报"未配置"。
     拍板结果若 --pool --update-profile → 写 ~/.workbuddy/.audio_profiles.json
@@ -37,28 +39,23 @@ import time
 import urllib.request
 from pathlib import Path
 
-from ffmpeg_probe import find_ffmpeg
+from mg_core import _ffmpeg, scan_tts_slots   # ffmpeg 路径 + TTS 槽位枚举双单源（v4.8.0）
 from postprocess import probe
 
 
 def _scan_tts_slot(env: dict | None = None) -> tuple:
-    """扫第一个可用的 MEDIA_TTS_<n>_BASE/KEY（纯函数可单测）。
-    与 envcheck/cmd_tts 同口径：真值判断，起始空号跳过，配置后连续 3 空号停。
+    """扫第一个**可用**的 MEDIA_TTS_<n>_BASE/KEY（纯函数可单测）。
+
+    枚举单源（v4.8.0）：槽位表用 mg_core.scan_tts_slots（同一口径，含"起始空号
+    跳过 + 配置后连续 3 空号停"），本地只加"KEY/BASE 齐全才算可用"这一层。
+    此前本地另写一份枚举 → 与 mg_core 口径漂移（status 报已配、triage 报未配）。
     返回 (n, base, key)；无可用通道返回 (0, "", "")。"""
     env = os.environ if env is None else env
-    streak, tried = 0, False
-    for n in range(1, 200):
-        has = bool(env.get(f"MEDIA_TTS_{n}_KEY") or env.get(f"MEDIA_TTS_{n}_BASE"))
-        if has:
-            base = env.get(f"MEDIA_TTS_{n}_BASE", "").rstrip("/")
-            key = env.get(f"MEDIA_TTS_{n}_KEY", "")
-            if base and key:
-                return n, base, key
-            streak, tried = 0, True
-        else:
-            streak += 1
-            if tried and streak >= 3:
-                break
+    for n in scan_tts_slots(env):
+        base = env.get(f"MEDIA_TTS_{n}_BASE", "").rstrip("/")
+        key = env.get(f"MEDIA_TTS_{n}_KEY", "")
+        if base and key:
+            return n, base, key
     return 0, "", ""
 
 PROFILE_FILE = Path.home() / ".workbuddy" / ".audio_profiles.json"
@@ -67,17 +64,23 @@ SAMPLE_SECONDS = 9.0        # 抽音频中段时长（SenseVoice 建议 8-10s）
 MIN_ZH_CHARS = 2            # 转录中文 ≥2 字才算"有人声"（单字可能是背景噪音/广播误录）
 
 
-def _ffmpeg() -> str:
-    return find_ffmpeg()
-
-
 # ─── 决策（纯函数，测试的 seam）─────────────────────────
-def triage_decision(has_audio: bool, transcript: str = "") -> dict:
+def triage_decision(has_audio: bool, transcript: str = "", speech: dict | None = None) -> dict:
     """听诊决策：{"verdict": "yes|no|listen", "reason": str}。
-    yes=建议补朗读 / no=自带人声不用补 / listen=判不了给人听。"""
+    yes=建议补朗读 / no=自带人声不用补 / listen=判不了给人听。
+
+    `speech`：本地 VAD 结果（`audio_qc.detect_speech()` 的返回，至少含
+    `has_speech`）。判"无语音"时**直接给 yes 并跳过远端转写**——纯音乐/环境音
+    不必花一次 ASR 额度去证明它没人声。不传 `speech` 时行为与旧版完全一致。
+    """
     if not has_audio:
         return {"verdict": "yes",
                 "reason": "无音轨（哑片）——旁白/音乐都需后期配（tts 档）"}
+    if speech is not None and speech.get("has_speech") is False:
+        return {"verdict": "yes",
+                "reason": f"本地 VAD 未检出语音（占比 {speech.get('ratio', 0):.0%}，"
+                          f"后端 {speech.get('backend', '?')}）——纯音乐/环境音，"
+                          f"建议补旁白（已省一次远端 ASR 调用）"}
     t = (transcript or "").strip()
     zh = re.findall(r"[\u4e00-\u9fff]", t)
     en = re.findall(r"[A-Za-z]+", t)
@@ -165,6 +168,22 @@ def _transcribe(wav: Path, base: str, key: str, model: str = STT_MODEL,
         return ""
 
 
+def _local_vad(clip: Path) -> dict | None:
+    """本地语音判定（audio_qc），用于**省掉不必要的远端转写**。
+
+    不可用或失败一律返回 None 并降级走原路——VAD 是增强项，不该拦流程。
+    依赖形态：有 onnxruntime + silero 模型走神经 VAD，否则 ffmpeg 能量法回退
+    （`backend` 字段会说明实际用了哪条，不假装）。
+    """
+    try:
+        import audio_qc
+        return audio_qc.detect_speech(clip)
+    except Exception as e:
+        print(f"[triage] 本地 VAD 不可用（{type(e).__name__}: {e}）"
+              f"——按原路走远端转写", file=sys.stderr)
+        return None
+
+
 def triage_one(clip: Path, pool: str = "", update: bool = False,
               refresh: bool = False) -> dict:
     """对单个成片跑完整听诊，返回决策 dict。pool+update → 写档案。
@@ -180,19 +199,26 @@ def triage_one(clip: Path, pool: str = "", update: bool = False,
     has_audio = bool(info.get("audio"))
     res = {"file": clip.name, "has_audio": has_audio}
     if has_audio:
-        with tempfile.TemporaryDirectory(prefix="triage_") as td:
-            wav = Path(td) / "sample.wav"
-            if not _extract_sample(clip, wav):
-                res.update({"verdict": "listen", "reason": "音频样段抽取失败（文件损坏？），交人听"})
-            else:
-                slot_n, base, key = _scan_tts_slot()
-                model = os.environ.get("MEDIA_STT_MODEL", "") or STT_MODEL
-                text = _transcribe(wav, base, key, model) if (base and key) else ""
-                if not (base and key):
-                    print(f"[triage] 未配置可用的 MEDIA_TTS_<n> 转录通道（硅基 key，当前扫到第 {slot_n} 号）"
-                          "——无法自动听诊，全部交人听", file=sys.stderr)
-                res["transcript"] = text[:80]
-                res.update(triage_decision(True, text))
+        # 本地 VAD 前置（v4.10）：判"根本没语音"直接给结论，**不花远端 ASR 额度**。
+        speech = _local_vad(clip)
+        if speech is not None:
+            res["vad"] = {k: speech[k] for k in ("has_speech", "ratio", "backend")}
+        if speech is not None and not speech.get("has_speech"):
+            res.update(triage_decision(True, "", speech=speech))
+        else:
+            with tempfile.TemporaryDirectory(prefix="triage_") as td:
+                wav = Path(td) / "sample.wav"
+                if not _extract_sample(clip, wav):
+                    res.update({"verdict": "listen", "reason": "音频样段抽取失败（文件损坏？），交人听"})
+                else:
+                    slot_n, base, key = _scan_tts_slot()
+                    model = os.environ.get("MEDIA_STT_MODEL", "") or STT_MODEL
+                    text = _transcribe(wav, base, key, model) if (base and key) else ""
+                    if not (base and key):
+                        print(f"[triage] 未配置可用的 MEDIA_TTS_<n> 转录通道（硅基 key，当前扫到第 {slot_n} 号）"
+                              "——无法自动听诊，全部交人听", file=sys.stderr)
+                    res["transcript"] = text[:80]
+                    res.update(triage_decision(True, text, speech=speech))
     else:
         res.update(triage_decision(False))
     if pool and update:

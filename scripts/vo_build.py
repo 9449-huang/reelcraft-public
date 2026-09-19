@@ -28,13 +28,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from ffmpeg_probe import find_ffmpeg
-
-_ffmpeg_cache: dict[str, str] = {}
-def _ffmpeg() -> str:
-    if "exe" not in _ffmpeg_cache:
-        _ffmpeg_cache["exe"] = find_ffmpeg()
-    return _ffmpeg_cache["exe"]
+from mg_core import PRODUCT_EXTS, _ffmpeg   # 产物白名单 + ffmpeg 路径双单源（v4.7.9/v4.8.0）
 MEDIA_GEN = str(Path(__file__).resolve().parent / "media_gen.py")
 
 
@@ -265,7 +259,7 @@ def cmd_fit(args) -> None:
     if not clips_dir.is_dir():
         die(f"clips 目录不存在：{clips_dir}", 2)
     clip_durs = {}
-    for ext in (".mp4", ".webp"):
+    for ext in PRODUCT_EXTS:      # 单源（v4.7.9）：加产物后缀时不会漏掉这里
         for f in clips_dir.glob(f"clip_*{ext}"):
             sid = f.stem.replace("clip_", "")
             d = probe(f)
@@ -338,6 +332,13 @@ def main() -> None:
     if not lines:
         die("vo_lines.json 的 lines 为空")
 
+    # at 字段校验（v4.7 审计 P1）：lines[i]["at"] 直下标会 KeyError 裸奔 exit 1。
+    # 必须发生在 TTS/录音检查**之前**——错误的数据不该开始烧合成额度。
+    for i, ln in enumerate(lines):
+        if "at" not in ln or not isinstance(ln.get("at"), (int, float)):
+            die(f"第 {i+1} 句（{ln.get('id', '?')}）缺 at 字段（起读秒数）——"
+                f"vo_lines_at.json 由 plan 子命令生成；手工新写请补 at 值", 2)
+
     out = Path(args.out)
     if out.suffix.lower() == ".mp3":
         # imageio_ffmpeg 自带的 ffmpeg 无可用 MP3 编码器（"Exactly one MP3 audio stream
@@ -363,7 +364,10 @@ def main() -> None:
             if f is None:
                 die(f"--skip-tts 但缺少录音 {lines_dir}/{lid}.mp3|m4a|wav", 2)
         else:
-            if not f.exists():
+            # f 为 None = 无既有录音 → 走 TTS 合成。
+            # v4.7.7 修 P0：旧版直接 `f.exists()`，f=None 时 AttributeError，
+            # 且崩在**调用 TTS 之前**（连合成请求都没发出去）。
+            if f is None or not f.exists():
                 # per-line 声音属性覆盖全局（感情/音色/语速逐句可换：高潮句用激昂档）
                 voice = ln.get("voice") or args.voice
                 emotion = ln.get("emotion", "")

@@ -3,6 +3,7 @@
 from __future__ import annotations
 from mg_core import (
     AllKeysFailed,
+    RequestUncertain,
     PROVIDERS,
     _abs_url,
     _download,
@@ -20,7 +21,7 @@ from mg_core import (
     die,
     find_existing_product,
     http_call,
-    image_to_url_or_path,
+    image_to_uri_shrunk,
     key_mask,
     list_keys,
     pools_for_role,
@@ -83,6 +84,92 @@ def cmd_image(args) -> None:
         outs.append(out)
     if count > 1:
         print(f"[media_gen] 共 {len(outs)} 张候选，人工选优后进 i2v：\n  " + "\n  ".join(outs))
+_IGNORED_WARNED: set = set()
+
+
+def _warn_ignored_params(info: dict, args, pool: str) -> None:
+    """池不支持、但用户**显式给了**的参数必须留痕。
+
+    本项目最高危的 bug 形态就是"参数被静默忽略"（v4.7：agnes 顶层 image 无声退化成
+    文生图）。每池只警告一次——batch 逐镜调用，否则刷屏反而看不见真错误。
+    """
+    tag = f"{pool}:negative"
+    if (getattr(args, "negative", "") and not info.get("supports_negative")
+            and tag not in _IGNORED_WARNED):
+        _IGNORED_WARNED.add(tag)
+        print(f"[media_gen] [warn] {pool or '该池'} 不支持 negative_prompt，"
+              f"--negative 已忽略（去掉该参数或换池）", file=sys.stderr)
+
+
+def build_video_payload(info: dict, key: dict, args, size, dur, model: str,
+                        pool: str = "", key_prefix: str = "") -> dict:
+    """构造 video payload —— **所有池的唯一入口**（分池另起一份 = 静默漂移的源头）。
+
+    payload_style == "zhipu"：字段面窄（with_audio / fps / image_url），**不支持首尾帧**：
+      显式给 --last-frame 会 die 而不是无声丢弃（v4.7 在 agnes 顶层 image 上踩过同款坑）。
+    其余池：通用风格，首尾帧有两种承载方式（见下）。
+
+    首尾帧双条件有**两种承载方式**，由池能力声明决定（v4.7 实测梳理）：
+      - keyframes_style == "extra_body"（Agnes 风）：extra_body={"image":[首,尾],
+        "mode":"keyframes"}，**不传顶层首帧**（双帧必须成组，顶层单帧会被上游忽略）
+      - last_frame_param（custom 池风，各家字段名不同）：首帧走 image_param，
+        尾帧走独立字段——老行为，不变
+    纯函数：不碰网络，便于单测钉死 payload 结构。
+    """
+    if info.get("payload_style") == "zhipu":
+        if getattr(args, "last_frame", ""):
+            die(f"{pool or 'zhipu 风格池'}不支持首尾帧双条件（--last-frame）——"
+                f"去掉该参数，或换支持 keyframes 的池（如 agnes）", 2)
+        _warn_ignored_params(info, args, pool)
+        zpayload: dict = {"model": model, "prompt": args.prompt, "with_audio": False,
+                          "fps": 30, "size": size, "duration": dur}
+        if getattr(args, "image", ""):
+            zpayload["image_url"] = image_to_uri_shrunk(args.image)
+        return zpayload
+
+    pfield = key.get("video_prompt_field") or "prompt"
+    payload: dict = {"model": model, pfield: args.prompt}
+    if size:
+        payload["size"] = size
+    if dur:
+        payload["duration"] = dur
+
+    last_frame = getattr(args, "last_frame", "")
+    use_kf = bool(last_frame) and bool(args.image) and mg_core.keyframes_supported(info, key)
+    if use_kf:
+        payload["extra_body"] = {
+            "image": [image_to_uri_shrunk(args.image),
+                      image_to_uri_shrunk(last_frame)],
+            "mode": "keyframes",
+        }
+    else:
+        if args.image:
+            _img = image_to_uri_shrunk(args.image)
+            payload[info.get("image_param", "image")] = (
+                [_img] if info.get("image_list") else _img)
+        if last_frame:
+            if mg_core.keyframes_supported(info, key):
+                die(f"{pool} 的 keyframes 模式需要同时给首帧（--image）与尾帧"
+                    f"（--last-frame）——只给尾帧无法插值", 2)
+            lf = build_last_frame_fields(info, key)
+            if lf:
+                _lfurl = image_to_uri_shrunk(last_frame)
+                _lfname = next(iter(lf))
+                payload[_lfname] = (
+                    [_lfurl] if (key.get("last_frame_list")
+                                 or info.get("last_frame_list")) else _lfurl)
+            else:
+                die(f"{pool} 未声明支持首尾帧双条件。Agnes 原生支持（keyframes）；"
+                    f"custom 池在 env 加 {key_prefix}1_LAST_FRAME_PARAM=<字段名> 启用", 2)
+    nf = args.num_frames
+    if nf and info.get("supports_num_frames"):
+        payload["num_frames"] = nf
+    _warn_ignored_params(info, args, pool)
+    if args.negative and info.get("supports_negative"):
+        payload["negative_prompt"] = args.negative
+    return payload
+
+
 def cmd_video(args) -> None:
     if args.wait_task:
         return _wait_existing_task(args)
@@ -158,48 +245,12 @@ def cmd_video(args) -> None:
         def call_fn(k: dict, _info=info, _prefix=PROVIDERS[pool]["key_env_prefix"],
                     _size=eff_size, _dur=eff_dur) -> dict:
             headers = {"Authorization": f"Bearer {k['key']}", "Content-Type": "application/json"}
-            if _info.get("payload_style") == "zhipu":
-                payload: dict[str, Any] = {
-                    "model": k.get("video_model") or _info["default"],
-                    "prompt": args.prompt,
-                    "with_audio": False,
-                    "fps": 30,
-                    "size": _size,
-                    "duration": _dur,
-                }
-                if args.image:
-                    payload["image_url"] = image_to_url_or_path(args.image)
-            else:
-                model = k.get("video_model") or _info["default"]
-                if not model:
-                    die(f"该池未配置模型名（模板无默认值）。请在 env 加 {_prefix}{k['n']}_VIDEO_MODEL=模型名", 2)
-                pfield = k.get("video_prompt_field") or "prompt"
-                payload = {"model": model, pfield: args.prompt}
-                if _size:
-                    payload["size"] = _size
-                if _dur:
-                    payload["duration"] = _dur
-                if args.image:
-                    _img = image_to_url_or_path(args.image)
-                    payload[_info.get("image_param", "image")] = (
-                        [_img] if _info.get("image_list") else _img)
-                # 过渡镜（首尾帧双条件）：池/key 声明支持才传尾帧（字段名可配）
-                if getattr(args, "last_frame", ""):
-                    lf = build_last_frame_fields(_info, k)
-                    if lf:
-                        _lfurl = image_to_url_or_path(args.last_frame)
-                        _lfname = next(iter(lf))
-                        payload[_lfname] = (
-                            [_lfurl] if (k.get("last_frame_list")
-                                         or _info.get("last_frame_list")) else _lfurl)
-                    else:
-                        die(f"{pool} 未声明支持首尾帧双条件（last_frame_param）。"
-                            "custom 池在 env 加 MEDIA_<P>_n_LAST_FRAME_PARAM=<字段名> 启用", 2)
-                nf2 = args.num_frames
-                if nf2 and _info.get("supports_num_frames"):
-                    payload["num_frames"] = nf2
-                if args.negative and _info.get("supports_negative"):
-                    payload["negative_prompt"] = args.negative
+            model = k.get("video_model") or _info["default"]
+            if not model:
+                die(f"该池未配置模型名（模板无默认值）。请在 env 加 {_prefix}{k['n']}_VIDEO_MODEL=模型名", 2)
+            payload = build_video_payload(
+                _info, k, args, _size, _dur, model=model,
+                pool=pool, key_prefix=f"{_prefix}{k['n']}_")
             vpath = k.get("video_task_path") or k.get("task_path") or _info["task_path"]
             # 同步阻塞型网关（LTXBridge 风）POST 会阻塞到出片，超时给足（对齐 bridge task_timeout 1800s）
             return http_call("POST", f"{k['base']}{vpath}", headers, payload, timeout=1800)
@@ -208,6 +259,9 @@ def cmd_video(args) -> None:
             resp, used_key = call_with_failover(pool, call_fn, kind="video", pin_key=args.pin_key)
             used_key["pool"] = pool
             break
+        except RequestUncertain as e:
+            # 同图片链：不换池不重提，按超时在途协议退出（exit 4）
+            die(str(e), 4)
         except AllKeysFailed as e:
             errs.append(str(e))
             if args.provider:
@@ -260,7 +314,8 @@ def cmd_edit(args) -> None:
         body = {
             "model": args.model or info["default"],
             "prompt": args.prompt,
-            "image_url": [image_to_url_or_path(args.image)],   # 列表：支持多图编辑扩展
+            # 用压缩版编码：大图直传会读超时（v4.7 实测 960KB→2m23s 失败）
+            "image_url": [image_to_uri_shrunk(args.image)],   # 列表：支持多图编辑扩展
         }
         return http_call("POST", f"{k['base']}{info['task_path']}", headers, body, timeout=120)
 
@@ -269,17 +324,15 @@ def cmd_edit(args) -> None:
     if not task_id:
         die(f"无 task_id: {json.dumps(resp, ensure_ascii=False)[:300]}")
 
+    poll_url = mg_core.build_poll_url(k["base"], info, str(task_id), style="path")
+    poll_headers = {"Authorization": f"Bearer {k['key']}",
+                    "X-ModelScope-Task-Type": "image_generation"}
     deadline = time.time() + 300
-    while time.time() < deadline:
-        time.sleep(args.wait)
-        try:
-            req = urllib.request.Request(f"{k['base']}{info['poll_path']}/{task_id}")
-            req.add_header("Authorization", f"Bearer {k['key']}")
-            req.add_header("X-ModelScope-Task-Type", "image_generation")
-            with urllib.request.urlopen(req, timeout=60) as r:
-                st = json.loads(r.read().decode("utf-8", "ignore"))
-        except Exception as e:
-            print(f"[media_gen] 轮询异常: {e}", file=sys.stderr)
+    for st, perr in mg_core.poll_tasks(poll_url, poll_headers,
+                                       interval=args.wait, deadline=deadline,
+                                       timeout=60):
+        if st is None:
+            print(f"[media_gen] 轮询异常: {perr}", file=sys.stderr)
             continue
         status = str(st.get("task_status") or "").upper()
         if status == "SUCCEED":
@@ -309,7 +362,8 @@ def cmd_run(args) -> None:
         if val:
             cmd += [flag, str(val)]
     for flag in ("--dry-run", "--qcgate", "--qcgate-strict", "--retry-failed",
-                 "--no-lint", "--no-qcseq", "--watermark-dry-run"):
+                 "--no-lint", "--no-qcseq", "--no-audio-qc", "--audio-qc-strict",
+                 "--no-faces", "--watermark-dry-run"):
         if getattr(args, flag[2:].replace("-", "_"), False):
             cmd.append(flag)
     sys.exit(subprocess.call(cmd))
@@ -375,20 +429,8 @@ def _tts_emotion_prefix(emotion: str) -> str:
     return f"你能用{e}的情感说吗，" if e else ""
 
 
-def _scan_tts_slots(env: dict, max_n: int = 200) -> list:
-    """扫已配 TTS key 序号（纯函数可单测）：起始空号跳过，遇配置后连续 3 空号停。
-    判"已配"用真值（空字符串=未配），与 mg_core.list_keys 口径一致。"""
-    ns, streak, tried = [], 0, False
-    for n in range(1, max_n):
-        has = bool(env.get(f"MEDIA_TTS_{n}_KEY") or env.get(f"MEDIA_TTS_{n}_BASE"))
-        if has:
-            ns.append(n)
-            streak, tried = 0, True
-        else:
-            streak += 1
-            if tried and streak >= 3:
-                break
-    return ns
+# 槽位扫描实现已收归 mg_core（单一事实源）——mg_status 曾各写一份导致口径漂移
+_scan_tts_slots = mg_core.scan_tts_slots
 
 
 def cmd_tts(args) -> None:
@@ -479,13 +521,18 @@ def main() -> None:
     p.add_argument("--out", required=True)
     p.add_argument("--count", type=int, default=1, help="批量出图张数（选优用），命名 shot_01_1.png ~ _N.png")
     p.add_argument("--pin-key", type=int, default=0, help="锁定第 N 把 key（0=轮转；双 worker 并行时各锁一把）")
+    p.add_argument("--ref-image", action="append", default=None, metavar="PATH_OR_URL",
+                   help="参考图（可重复，Agnes 最多 4 张）→ 图生图，用于角色/风格一致性。"
+                        "池声明 ref_image_style 才生效；**必须走 extra_body**（放顶层会被"
+                        "静默忽略、退化成文生图）")
 
     v = sub.add_parser("video")
     v.add_argument("--prompt", required=True)
     v.add_argument("--image", default="")
     v.add_argument("--last-frame", default="",
-                   help="尾帧图（首尾帧双条件/过渡镜）：池声明支持才生效——"
-                        "custom 池配 MEDIA_<P>_n_LAST_FRAME_PARAM=<字段名> 启用")
+                   help="尾帧图（首尾帧双条件/过渡镜）：Agnes 原生支持（extra_body "
+                        "keyframes 插值，2026-09 实测）；custom 池配 "
+                        "MEDIA_<P>_n_LAST_FRAME_PARAM=<字段名> 启用")
     v.add_argument("--provider", default="",
                    help="key 池名（留空=按 MEDIA_PRIORITY 自动选池，跨池兜底）")
     v.add_argument("--out", required=True)
@@ -536,6 +583,8 @@ def main() -> None:
                     help="跳过出镜前 prompt lint（slop/词数/主体漂移检查；默认强制）")
     bt.add_argument("--video-size", default="", help="视频分辨率覆盖（默认留空=每池各自默认：智谱 1920x1080 / 本地网关 1280x720）")
     bt.add_argument("--video-duration", default="", help="视频时长覆盖（默认留空=每池默认 short；本地网关风可 short/medium/long）")
+    bt.add_argument("--max-calls", type=int, default=0,
+                    help="调用次数门禁：预估上限（镜数×(1+重试)）超过它就直接拒跑（0=不设门禁）")
 
     tt = sub.add_parser("tts", help="语音合成（OpenAI 兼容，多 key failover，需配置 MEDIA_TTS_*）")
     tt.add_argument("--text", default="")
@@ -568,8 +617,10 @@ def main() -> None:
                       choices=["images", "videos", "harvest", "kenburns", "sound", "concat", "watermark"],
                       help="跑到该阶段后停（默认 concat，停在 QC 门前）")
     runp.add_argument("--dry-run", action="store_true", help="只打印各阶段命令不执行")
-    runp.add_argument("--workers-image", type=int, default=3)
-    runp.add_argument("--workers-video", type=int, default=3)
+    runp.add_argument("--workers-image", type=int, default=None,
+                      help="并行数（不给则读 plan.json 的 workers_image / workers，再缺省 3）")
+    runp.add_argument("--workers-video", type=int, default=None,
+                      help="并行数（不给则读 plan.json 的 workers_video / workers，再缺省 3）")
     runp.add_argument("--provider-image", default="")
     runp.add_argument("--provider-video", default="")
     runp.add_argument("--qcgate", action="store_true",
@@ -579,6 +630,12 @@ def main() -> None:
     runp.add_argument("--no-lint", action="store_true", help="跳过出镜前 prompt lint")
     runp.add_argument("--no-qcseq", action="store_true",
                       help="跳过 concat 前的跨镜首帧一致性粗检（qcseq）")
+    runp.add_argument("--no-audio-qc", action="store_true",
+                      help="跳过 concat 前的音频侧门禁（静音/削波/响度）")
+    runp.add_argument("--audio-qc-strict", action="store_true",
+                      help="音频门禁的 WARN 也判失败（默认只拦 FAIL）")
+    runp.add_argument("--no-faces", action="store_true",
+                      help="跳过 concat 前的跨镜人脸一致性检查（缺 cv2/模型时自动跳过）")
     runp.add_argument("--watermark", default="", help="去水印 provider（渠道名，读 watermark_profiles.json）")
     runp.add_argument("--watermark-dry-run", action="store_true",
                       help="水印只列待处理档/出红框自检图，不真抹")
@@ -603,6 +660,25 @@ def main() -> None:
                     help="把结果写进 ~/.workbuddy/.audio_profiles.json（同模型下次免测）")
     tr.add_argument("--refresh", action="store_true",
                     help="忽略档案实测结论强制重测（配合 --pool）")
+
+    aq = sub.add_parser("audio-qc", help="音频侧 QC：静音占比/削波/响度 + 语音判定（silero‖ffmpeg）")
+    aq.add_argument("path", help="音频/视频文件，或含产物的目录（批量）")
+    aq.add_argument("--json", action="store_true", help="输出 JSON（机器可读）")
+    aq.add_argument("--strict", action="store_true", help="WARN 也算失败（exit 2）")
+    aq.add_argument("--no-vad", action="store_true", help="跳过语音判定（只做 QC）")
+    aq.add_argument("--noise", type=float, default=-35.0,
+                    help="silencedetect 噪声门限 dB（默认 -35）")
+    aq.add_argument("--min-silence", type=float, default=0.35,
+                    help="静音最小时长秒（默认 0.35）")
+
+    fc = sub.add_parser("faces", help="跨镜人脸一致性（YuNet 检测 + SFace 嵌入余弦）——比 qcseq 的色调判据强")
+    fc.add_argument("paths", nargs="+", help="成片文件，或含产物的目录（批量）")
+    fc.add_argument("--ref", default="", help="角色参考图（角色圣经里的设定图）——有则一并比对")
+    fc.add_argument("--threshold", type=float, default=0.363, help="余弦阈值（SFace 官方 0.363）")
+    fc.add_argument("--min-side", type=int, default=48, help="人脸框短边下限像素（滤掉背景小脸）")
+    fc.add_argument("--min-score", type=float, default=0.6, help="YuNet 置信度下限")
+    fc.add_argument("--models-dir", default="", help="模型目录（默认 ~/.workbuddy/models）")
+    fc.add_argument("--json", action="store_true", help="输出 JSON（机器可读）")
 
     lg = sub.add_parser("ledger", help="#5 成本账本：调用次数/成败/白烧统计（按渠道/操作/天）")
     lg.add_argument("--days", type=int, default=0, help="只看最近 N 天（0=全部）")
@@ -645,6 +721,12 @@ def main() -> None:
     elif args.cmd == "triage":
         import audio_triage
         sys.exit(audio_triage.cmd(args))
+    elif args.cmd == "audio-qc":
+        import audio_qc
+        sys.exit(audio_qc.cmd(args))
+    elif args.cmd == "faces":
+        import face_consistency
+        sys.exit(face_consistency.cmd(args))
     elif args.cmd == "ledger":
         cmd_ledger(args)
 

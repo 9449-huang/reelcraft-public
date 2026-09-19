@@ -2,10 +2,13 @@
 from __future__ import annotations
 import argparse
 import base64
+import http.client
 import json
 import mimetypes
 import os
 import re
+import shutil
+import socket
 import subprocess
 import sys
 import threading
@@ -41,6 +44,10 @@ PROVIDERS: dict[str, dict[str, Any]] = {
                 "sizes": ["1024x1024", "1024x576", "1344x768", "2048x1152"],
                 # 1K=20RPM, 2K=10RPM, 3K/4K=~1RPM
                 "rpm_by_size": lambda s: 20 if int(s.split("x")[0]) <= 1024 else (10 if int(s.split("x")[0]) <= 2048 else 1),
+                # 多图参考（2026-09-11 实测）：extra_body.image=[...] → 走 /images/i2i/，
+                # 角色特征保留。⚠️ 顶层 image 会被**静默忽略**（退化成 /images/t2i/）
+                "ref_image_style": "extra_body",
+                "ref_image_max": 4,
             },
             "video": {
                 "default": "agnes-video-v2.0",
@@ -52,6 +59,9 @@ PROVIDERS: dict[str, dict[str, Any]] = {
                 "supports_negative": True,
                 "frame_choices": [9, 17, 25, 33, 41, 49, 57, 65, 73, 81, 89, 97, 105, 113, 121],
                 "rpm": 1,
+                # 首尾帧插值（2026-09-11 实测）：extra_body={"image":[首,尾],"mode":"keyframes"}
+                # → 真插值（末帧≈第二关键帧）。免费池即支持，不必接付费池。
+                "keyframes_style": "extra_body",
             },
         },
     },
@@ -143,6 +153,14 @@ class RateLimitedError(Exception):
 
 class AllKeysFailed(Exception):
     """同池全部 key 失败：单命令模式（--provider 留空）可按 MEDIA_PRIORITY 尝试下一池。"""
+
+
+class RequestUncertain(Exception):
+    """请求**已发出之后**才失败（读超时 / 连接被对端掐断）——服务端可能已受理。
+
+    此时重试或换 key 都等于**再提交一次 = 再扣一次费**，所以既不重试也不 failover：
+    直接抛到上层走"超时在途"协议（人工确认后台是否已有任务，再决定要不要重跑）。
+    """
 
 # ─── 密钥与 base 加载 ───────────────────────────────────────
 def _load_env_file(path: Path) -> None:
@@ -375,6 +393,25 @@ def run_capture(cmd: list[str], timeout: int | None = None, env: dict | None = N
                           encoding="utf-8", errors="replace", timeout=timeout, env=env)
 
 
+def is_transition(d: dict) -> bool:
+    """过渡镜判定（**唯一实现**——此前 mg_batch 定义一份、pipeline 内联两处，
+    概念无单一真相源，加能力必漏一处）。带 transition 字段且 from/to 齐全即算。"""
+    tr = d.get("transition")
+    return isinstance(tr, dict) and bool(tr.get("from")) and bool(tr.get("to"))
+
+
+def find_product(clips_dir, sid: str):
+    """找 sid 的已有 clip 产物（.mp4/.webp，任一存在且非空即算；无则 None）。
+
+    断点续跑只认"存在且非空"：产物可能是 .webp（部分渠道出动画 webp），
+    只认 .mp4 会误判未完成 → 重新提交 → 重复扣费。"""
+    for _ext in PRODUCT_EXTS:
+        cand = Path(clips_dir) / f"clip_{sid}{_ext}"
+        if cand.exists() and cand.stat().st_size > 0:
+            return cand
+    return None
+
+
 def natkey(s) -> list:
     """自然排序 key：数字段按数值比较（S2 < S10、clip_S2 < clip_S10）。
     接受 str/Path。所有 glob 排序（分镜 JSON、clip 产物、帧序列）必须用它——
@@ -448,6 +485,26 @@ def list_shot_files(shots_dir) -> list:
             seen[str(p.resolve())] = p          # 按解析后路径去重
     return [seen[k] for k in sorted(seen, key=lambda k: natkey(Path(k).name))]
 
+def scan_tts_slots(env: dict, max_n: int = 200) -> list:
+    """扫已配 TTS key 的序号（纯函数）：起始空号跳过，遇配置后连续 3 空号停。
+
+    放在 mg_core 是刻意的——**唯一实现**。此前 media_gen 与 mg_status 各写一份，
+    口径不一致导致 status 在 key#1 空缺时误报"tts 未配置"（假告警）。
+    判"已配"用真值（空字符串=未配），与 list_keys 口径一致。
+    """
+    ns, streak, tried = [], 0, False
+    for n in range(1, max_n):
+        has = bool(env.get(f"MEDIA_TTS_{n}_KEY") or env.get(f"MEDIA_TTS_{n}_BASE"))
+        if has:
+            ns.append(n)
+            streak, tried = 0, True
+        else:
+            streak += 1
+            if tried and streak >= 3:
+                break
+    return ns
+
+
 def list_keys(provider: str, pin: int = 0, required: bool = True, role: str = "") -> list[dict]:
     """返回 [{key, base, poll, n, roles, image_model, video_model}]（n 为序号）。
     pin>0 时只返回第 pin 把 key（多 worker 并行：各锁一把，互不踩 429）。
@@ -479,7 +536,13 @@ def list_keys(provider: str, pin: int = 0, required: bool = True, role: str = ""
                  # 过渡镜（首尾帧双条件）：key 级覆盖尾帧字段名/列表形（未配置=空串）
                  "last_frame_param": os.environ.get(f"{prefix}{n}_LAST_FRAME_PARAM", ""),
                  "last_frame_list": os.environ.get(f"{prefix}{n}_LAST_FRAME_LIST", "").strip().lower()
-                     in ("1", "true", "yes", "list")}
+                     in ("1", "true", "yes", "list"),
+                 # 能力级 key 覆盖（v4.7.8）：ref_image_supported/keyframes_supported 早就有
+                 # `key.get(...)` 分支，但这里从不写入 → 形同虚设；而报错提示恰恰让用户
+                 # 配 `_REF_IMAGE_STYLE=extra_body` → 照配仍 die（自指死循环）。补齐。
+                 "ref_image_style": os.environ.get(f"{prefix}{n}_REF_IMAGE_STYLE", ""),
+                 "ref_image_max": os.environ.get(f"{prefix}{n}_REF_IMAGE_MAX", ""),
+                 "keyframes_style": os.environ.get(f"{prefix}{n}_KEYFRAMES_STYLE", "")}
         # 口味档位（卡三四档：ultra/high/mid/low，由用户自选后落 env）；非法值 warn+忽略
         tier_raw = os.environ.get(f"{prefix}{n}_TIER", "").strip().lower()
         if tier_raw and tier_raw not in ("ultra", "high", "mid", "low"):
@@ -531,6 +594,29 @@ def die(msg: str, code: int = 1) -> None:
     print(f"[media_gen] ERROR: {msg}", file=sys.stderr)
     sys.exit(code)
 
+_UNCERTAIN_CAUSES = None      # 延迟构造（http.client 要 import）
+
+
+def _uncertain_causes() -> tuple:
+    return (socket.timeout, TimeoutError, ConnectionResetError,
+            http.client.RemoteDisconnected)
+
+
+def classify_network_error(exc: BaseException, method: str) -> str:
+    """网络异常分类（纯函数）：'uncertain' = 请求可能已送达；'retry' = 确定没送达。
+
+    只有**非幂等**方法（POST/PUT/PATCH）才把"发出后失败"判为 uncertain——
+    GET 重试无副作用，保留韧性。urllib 的 URLError 会把真实原因包在 .reason 里，
+    必须拆开看（否则读超时会被误判为普通连接错误而重试）。
+    """
+    cause: BaseException = exc
+    if isinstance(exc, urllib.error.URLError) and exc.reason is not None:
+        cause = exc.reason
+    if method.upper() in ("POST", "PUT", "PATCH") and isinstance(cause, _uncertain_causes()):
+        return "uncertain"
+    return "retry"
+
+
 def http_call(method: str, url: str, headers: dict, body: dict | None, timeout: int, max_retry: int = 3) -> dict:
     data = json.dumps(body).encode() if body is not None else None
     last_err = None
@@ -565,6 +651,13 @@ def http_call(method: str, url: str, headers: dict, body: dict | None, timeout: 
                 continue
             die(f"HTTP {code}: {txt[:300]}")
         except Exception as e:
+            # 非幂等请求"发出后失败"：服务端可能已受理 → 重试 = 再提交一次 = 重复扣费。
+            # 原来是通用 except 一律重试 3 次（POST 就打 3 个任务），这里改成直接抛出。
+            if classify_network_error(e, method) == "uncertain":
+                raise RequestUncertain(
+                    f"{method} {url} 发出后失败（{type(e).__name__}: {e}）——"
+                    f"服务端可能已受理，已停止重试以免重复扣费。"
+                    f"先确认后台是否已产生任务，再决定是否手动重跑")
             wait = min(30, 2 ** (attempt + 1))
             print(f"[media_gen] {type(e).__name__}: {e}, {wait}s 后重试", file=sys.stderr)
             time.sleep(wait)
@@ -623,6 +716,14 @@ def call_with_failover(
                                         "op": kind, "ok": False, "err": str(e),
                                         "ms": int((time.time() - t0) * 1000)})
             last_err = e
+        except RequestUncertain as e:
+            # 不换 key：换 key 也是一次新提交（重复扣费）。但必须落账——
+            # 这很可能是一笔**已经产生**的费用，账本漏了就等于白烧额度没人知道。
+            ledger_append(LEDGER_FILE, {"provider": provider, "key": k["n"],
+                                        "op": kind, "ok": False,
+                                        "err": f"uncertain: {e}",
+                                        "ms": int((time.time() - t0) * 1000)})
+            raise
         except Exception as e:
             ledger_append(LEDGER_FILE, {"provider": provider, "key": k["n"],
                                         "op": kind, "ok": False, "err": str(e),
@@ -695,10 +796,31 @@ def _final_out(out: str, url: str) -> str:
     return out
 
 def _download(url: str, out: str | Path, timeout: float = 120) -> None:
-    """带超时的下载：urlopen 流式写文件（urlretrieve 无超时，网络半死会无限挂起，#7）。
-    先写临时文件再 os.replace 原子落盘，防半截文件被断点续跑误判吞掉。
-    临时名带 pid：两个 subprocess 下同一 out 不会互相覆盖半截内容；
-    失败必须清掉残骸，否则 *.dl 垃圾会一直堆在工作区。"""
+    """取产物（**统一入口**，轮询/收割/同步三路共用）。
+
+    两类来源（v4.7 审计 P1 修复：轮询路径原对 local_path urlopen -> ValueError）：
+    - 本地路径（Windows 盘符 / POSIX 绝对路径，_extract_video_url 原样透传的
+      local_path）：直接 copyfile——不走网络、不受 http timeout 约束（#10）
+    - URL：带超时的下载。先写临时文件再 os.replace 原子落盘，防半截文件被
+      断点续跑误判吞掉（urlretrieve 无超时，网络半死会无限挂起，#7）。
+      临时名带 pid：两个 subprocess 下同一 out 不会互相覆盖半截内容；
+      失败必须清掉残骸，否则 *.dl 垃圾会一直堆在工作区。"""
+    if not str(url).startswith(("http://", "https://")):
+        # 本地路径（含 local_path）：urlopen 会抛 ValueError，必须直拷
+        src = Path(url)
+        if not src.is_file():
+            raise FileNotFoundError(f"取产物失败：本地路径不存在 {url}")
+        tmp = f"{out}.dl.{os.getpid()}"
+        try:
+            shutil.copyfile(src, tmp)
+            os.replace(tmp, out)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+        return
     tmp = f"{out}.dl.{os.getpid()}"
     try:
         with urllib.request.urlopen(url, timeout=timeout) as r, open(tmp, "wb") as f:
@@ -729,6 +851,53 @@ def _download_image(resp: dict, out: str, base: str = "") -> None:
     else:
         die(f"响应无 url/b64: {json.dumps(resp)[:300]}")
 
+def build_poll_url(base: str, info: dict, task_id: str,
+                   poll_path: str = "", style: str = "") -> str:
+    """轮询 URL 构造（单源，批四 B）：path 式 /{path}/{id}、query 式 /{path}?{param}={id}。
+
+    三处调用方曾各拼一份（_poll_video_task / _harvest_video / cmd_edit）——
+    poll_style 分叉散落 = 加新池必漏一处。
+    style 缺省沿 info['poll_style']；两者都未声明时按 query（与旧
+    _poll_video_task 的 else 分支一致——agnes 等池依赖此缺省，勿改）。
+    poll_path 非空时覆盖 info（harvest 用落盘记录里的路径，记录优先）。"""
+    path = poll_path or info.get("poll_path") or "/tasks"
+    if (style or info.get("poll_style") or "query") == "path":
+        return f"{base}{path}/{task_id}"
+    return f"{base}{path}?{info.get('poll_param', 'task_id')}={task_id}"
+
+
+def fetch_task_state(url: str, headers: dict, timeout: float = 30) -> tuple[dict | None, str | None]:
+    """单次任务状态查询（harvest 收割用）。返回 (state, err)：
+    异常不 raise，返回 (None, err) 由调用方决定跳过/重试。"""
+    try:
+        req = urllib.request.Request(url)
+        for hk, hv in headers.items():
+            req.add_header(hk, hv)
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode("utf-8", "ignore")), None
+    except Exception as e:
+        return None, str(e)
+
+
+def poll_tasks(url: str, headers: dict, interval: float, deadline: float,
+               timeout: float = 60, clock=time.time):
+    """轮询生成器（骨架单源，批四 B）：每轮 sleep(interval) → GET → yield (state, err)。
+
+    语义差异（终态集合/结果提取/超时后动作）留在调用方——生成器只管
+    节奏与网络；网络异常 yield (None, err) 不吞，由调用方决定继续/终止。
+    deadline 到点后生成器自然停止（调用方执行自己的超时动作）。"""
+    while clock() < deadline:
+        time.sleep(interval)
+        try:
+            req = urllib.request.Request(url)
+            for hk, hv in headers.items():
+                req.add_header(hk, hv)
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                yield json.loads(r.read().decode("utf-8", "ignore")), None
+        except Exception as e:
+            yield None, str(e)
+
+
 def _resolve_async_task(used_key: dict, resp: dict, poll_path: str = "/tasks",
                         out: str = "", pool: str = "") -> dict:
     """异步任务式渠道兜底：响应无 url/b64 但有 task_id 时，轮询取最终结果。
@@ -742,19 +911,16 @@ def _resolve_async_task(used_key: dict, resp: dict, poll_path: str = "/tasks",
     tid = resp.get("task_id")
     if not tid:
         return resp
-    poll_url = f"{used_key['base']}{poll_path}/{tid}"
+    poll_url = build_poll_url(used_key["base"], {}, str(tid),
+                              poll_path=poll_path, style="path")
     headers = {"Authorization": f"Bearer {used_key['key']}",
                "X-ModelScope-Task-Type": "image_generation"}
     print(f"[media_gen] 异步任务式响应，轮询 {poll_url} …", file=sys.stderr)
     deadline = time.time() + 300
-    while time.time() < deadline:
-        time.sleep(3)
-        try:
-            req = urllib.request.Request(poll_url, headers=headers)
-            with urllib.request.urlopen(req, timeout=60) as r:
-                st = json.loads(r.read().decode("utf-8", "ignore"))
-        except Exception as e:
-            print(f"[media_gen] 轮询异常: {e}", file=sys.stderr)
+    for st, perr in poll_tasks(poll_url, headers, interval=3, deadline=deadline,
+                               timeout=60):
+        if st is None:
+            print(f"[media_gen] 轮询异常: {perr}", file=sys.stderr)
             continue
         status = str(st.get("task_status") or "").upper()
         imgs = st.get("output_images") or []
@@ -766,7 +932,8 @@ def _resolve_async_task(used_key: dict, resp: dict, poll_path: str = "/tasks",
             die(f"任务成功但无图: {json.dumps(st, ensure_ascii=False)[:300]}")
     if out and pool:
         _save_pending_task(pool, str(tid), out, used_key.get("base", ""),
-                           kind="image", poll_path=poll_path)
+                           kind="image", poll_path=poll_path,
+                           key_n=used_key.get("n", 0))
         print(f"[media_gen] 图任务轮询超时：task_id={tid} 已落盘，稍后跑 harvest 收割",
               file=sys.stderr)
         sys.exit(4)
@@ -790,6 +957,17 @@ def _gen_image_once(pools: list[str], args, size: str, errs: list[str]) -> tuple
             if args.provider:
                 die(f"{pool} 不支持 size={size}。可选: {info['sizes']}", 2)
             continue
+        # 多图参考（角色一致性，v4.7）：池或**任一 key**（env 覆盖）声明支持才算候选
+        refs_raw = [str(p) for p in (getattr(args, "ref_image", None) or [])]
+        sup = ref_image_candidates(pool, info)
+        if refs_raw and not sup:
+            if args.provider:
+                die(f"{pool} 未声明支持多图参考（ref_image_style）。custom 池在 env 加 "
+                    f"{PROVIDERS[pool]['key_env_prefix']}1_REF_IMAGE_STYLE=extra_body 启用", 2)
+            continue
+        if refs_raw and sup and len(refs_raw) > sup["max"]:
+            die(f"参考图最多 {sup['max']} 张（收到 {len(refs_raw)}）——"
+                f"再多请合并成一张角色设定图", 2)
 
         def call_fn(k: dict, _info=info, _prefix=PROVIDERS[pool]["key_env_prefix"]) -> dict:
             model = k.get("image_model") or _info["default"]
@@ -798,7 +976,8 @@ def _gen_image_once(pools: list[str], args, size: str, errs: list[str]) -> tuple
             if k.get("image_sizes") and size not in k["image_sizes"]:
                 print(f"[media_gen] [warn] _IMAGE_SIZES 自填白名单不含 size={size}，仅警告不拦截（渠道真实能力以实跑为准）", file=sys.stderr)
             headers = {"Authorization": f"Bearer {k['key']}", "Content-Type": "application/json"}
-            body = {"model": model, "prompt": args.prompt, "size": size, "n": 1}
+            refs = [image_to_uri_shrunk(p) for p in refs_raw] if refs_raw else None
+            body = build_image_body(model, args.prompt, size, n=1, refs=refs)
             ipath = k.get("image_task_path") or k.get("task_path") or _info.get("task_path", "/images/generations")
             return http_call("POST", f"{k['base']}{ipath}", headers, body, timeout=600)
 
@@ -806,6 +985,10 @@ def _gen_image_once(pools: list[str], args, size: str, errs: list[str]) -> tuple
             resp, used = call_with_failover(pool, call_fn, kind="image", pin_key=args.pin_key)
             used["pool"] = pool
             return resp, used
+        except RequestUncertain as e:
+            # 不确定 = 上游可能已受理：跨池兜底也是**再提交一次**，必须停。
+            # 走超时在途协议（exit 4）：人工确认后台再决定是否重跑，不自动重扣。
+            die(str(e), 4)
         except AllKeysFailed as e:
             errs.append(str(e))
             if args.provider:
@@ -815,6 +998,138 @@ def _gen_image_once(pools: list[str], args, size: str, errs: list[str]) -> tuple
     die("所有可用池均失败:\n  " + "\n  ".join(errs), 3)
 
 # ─── 视频 ─────────────────────────────────────────────────
+def keyframes_supported(info: dict, key: dict | None = None) -> bool:
+    """首尾帧插值（keyframes）支持的声明式判定。
+
+    与 last_frame_param 是**两种不同的承载方式**：
+      - keyframes_style == "extra_body"（Agnes 风，2026-09-11 实测）：
+        extra_body = {"image": [首帧, 尾帧], "mode": "keyframes"}，不传顶层首帧
+      - last_frame_param（custom 池风，各家字段名不同）：见 build_last_frame_fields
+    未声明 → False（调用方走老路径）。"""
+    key = key or {}
+    return (key.get("keyframes_style") or info.get("keyframes_style")) == "extra_body"
+
+
+def load_character_bible(shots_dir) -> dict:
+    """读 `<shots>/characters.json`（角色圣经）。缺失/损坏 → {}（容错，绝不炸 batch）。
+
+    v4.9.0（漫剧方向第一步）：角色级连续性（跨几十镜引用同一角色）不该靠每镜手抄
+    参考图路径——在角色圣经里定义一次，shot 只写 `characters: ["hero"]`。"""
+    p = Path(shots_dir) / "characters.json"
+    if not p.exists():
+        return {}
+    try:
+        d = json.loads(p.read_text(encoding="utf-8"))
+    except Exception as e:
+        print(f"[media_gen] [warn] characters.json 解析失败（{e}），本次跳过角色圣经",
+              file=sys.stderr)
+        return {}
+    return d if isinstance(d, dict) else {}
+
+
+def merge_character_refs(shot: dict, bible: dict) -> tuple[list[str], list[str]]:
+    """shot 的 `characters`（角色 id）→ 参考图路径，与自带 `ref_image` 合并去重。
+
+    返回 `(refs, missing_ids)`；missing_ids 非空 = 角色 id 在圣经里查不到——调用方
+    必须报 MISS（**不能静默丢角色一致性**，那正是漫剧最贵的返工）。
+    bible 为空时等价于只回退 `ref_image`（旧行为不变）。"""
+    refs: list[str] = []
+    chars = shot.get("characters") or []
+    if isinstance(chars, str):
+        chars = [c.strip() for c in chars.split(",") if c.strip()]
+    missing: list[str] = []
+    for cid in chars:
+        ent = (bible.get("characters") or {}).get(str(cid))
+        if not isinstance(ent, dict):
+            missing.append(str(cid))
+            continue
+        for r in (ent.get("ref_images") or []):
+            if str(r) not in refs:
+                refs.append(str(r))
+    own = shot.get("ref_image") or []
+    if isinstance(own, str):
+        own = [own]
+    for r in own:
+        if str(r) not in refs:
+            refs.append(str(r))
+    return refs, missing
+
+
+def ref_image_candidates(pool: str, info: dict) -> dict | None:
+    """多图参考能力判定（池级优先，其次 key 级 env 覆盖）。
+
+    v4.7.8：`_gen_image_once` 的候选筛选原来只认池级声明，而报错提示又让用户
+    配 key 级 `_REF_IMAGE_STYLE=extra_body` → 池模板没声明时照提示配完仍被排除
+    （提示自指死循环）。这里把"池或其任一 key 声明"统一成一个判定。"""
+    sup = ref_image_supported(info)
+    if sup:
+        return sup
+    for kk in list_keys(pool, required=False):
+        sup = ref_image_supported(info, kk)
+        if sup:
+            return sup
+    return None
+
+
+def ref_image_supported(info: dict, key: dict | None = None) -> dict | None:
+    """多图参考（角色一致性）支持的声明式判定。未声明 → None。
+
+    返回 {"style": "extra_body", "max": N}。同样支持 key 级覆盖
+    （同池不同 key 接不同上游时）。"""
+    key = key or {}
+    style = key.get("ref_image_style") or info.get("ref_image_style")
+    if style != "extra_body":
+        return None
+    mx = key.get("ref_image_max") or info.get("ref_image_max") or 4
+    try:
+        mx = int(mx)
+    except (TypeError, ValueError):
+        mx = 4
+    return {"style": style, "max": mx}
+
+
+def build_image_body(model: str, prompt: str, size: str, n: int = 1,
+                     refs: list[str] | None = None) -> dict:
+    """出图 request body。带参考图时**必须**走 extra_body（实测坑）：
+
+    Agnes 的参考图/response_format 放 extra_body 才生效；放顶层会被**静默忽略**
+    → 退化成文生图（返回 URL 从 /images/i2i/ 变 /images/t2i/），不报错、难排查。"""
+    body: dict = {"model": model, "prompt": prompt, "size": size, "n": n}
+    if refs:
+        body["extra_body"] = {"image": list(refs), "response_format": "url"}
+    return body
+
+
+def image_to_uri_shrunk(path: str, max_bytes: int = 450_000,
+                        max_side: int = 1536) -> str:
+    """本地图片 → data URI；超体积时先转 JPEG（保尺寸、必要时缩边）再编码。
+
+    实测教训（2026-09-11）：960KB PNG 直传 Agnes → 读超时（2m23s 失败）；
+    同图缩到 220KB → 18s 成功。参考图/首帧/尾帧都吃这条上游约束。
+    小文件（≤ max_bytes）走原路径，行为与 image_to_url_or_path 完全一致（零回归）。
+    """
+    p = Path(path)
+    if not p.exists():
+        return path                      # URL 或缺失：原样交由上层处理
+    try:
+        if p.stat().st_size <= max_bytes:
+            return image_to_url_or_path(path)
+        from PIL import Image
+        import io
+        with Image.open(p) as im:
+            im = im.convert("RGB")
+            w, h = im.size
+            if max(w, h) > max_side:
+                r = max_side / max(w, h)
+                im = im.resize((max(1, int(w * r)), max(1, int(h * r))))
+            buf = io.BytesIO()
+            im.save(buf, format="JPEG", quality=90, optimize=True)
+        return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode()
+    except Exception as e:
+        print(f"[media_gen] [warn] 压缩 {p.name} 失败（{e}），按原图传", file=sys.stderr)
+        return image_to_url_or_path(path)
+
+
 def build_last_frame_fields(info: dict, key: dict | None = None) -> dict | None:
     """过渡镜（首尾帧双条件）：解析尾帧 payload 字段名与形式。
 
@@ -848,11 +1163,14 @@ def image_to_url_or_path(path: str) -> str:
 
 # ─── 视频超时协议：落盘 / 续等 / 收割 ─────────────────────
 def _save_pending_task(pool: str, task_id: str, out: str, base: str,
-                       kind: str = "video", poll_path: str = "") -> None:
+                       kind: str = "video", poll_path: str = "", key_n: int = 0) -> None:
     def _fn(s):
         s.setdefault("pending_tasks", {})[str(task_id)] = {
             "pool": pool, "out": out, "base": base, "submitted_at": time.time(),
             "kind": kind, "poll_path": poll_path,
+            # key 序号（v4.7.8）：续等必须用提交时那把 key——多 key 池（agnes 跨域名）
+            # 用 keys[0] 轮询必失败，任务永远收不回
+            "key_n": int(key_n or 0),
         }
     _update_state(_fn)          # 跨进程安全：防并发覆盖丢 pending 记录
 
@@ -918,19 +1236,12 @@ def _poll_video_task(pool: str, info: dict, k: dict, video_id: str, out: str, ar
     poll_url_base = k["poll"]
     pt = args.poll_timeout or (1800 if getattr(args, "provider", "") else 1200)
     deadline = time.time() + pt
-    while time.time() < deadline:
-        time.sleep(args.wait)
-        if info.get("poll_style") == "path":
-            poll_url = f"{poll_url_base}{info['poll_path']}/{video_id}"
-        else:
-            poll_url = f"{poll_url_base}{info['poll_path']}?{info['poll_param']}={video_id}"
-        try:
-            req = urllib.request.Request(poll_url)
-            req.add_header("Authorization", f"Bearer {k['key']}")
-            with urllib.request.urlopen(req, timeout=60) as r:
-                st = json.loads(r.read().decode("utf-8", "ignore"))
-        except Exception as e:
-            print(f"[media_gen] 轮询异常: {e}", file=sys.stderr)
+    poll_url = build_poll_url(poll_url_base, info, video_id)   # URL 单次构造（不含时间变项）
+    headers = {"Authorization": f"Bearer {k['key']}"}
+    for st, perr in poll_tasks(poll_url, headers, interval=args.wait,
+                               deadline=deadline, timeout=60):
+        if st is None:
+            print(f"[media_gen] 轮询异常: {perr}", file=sys.stderr)
             continue
         url = _abs_url(_extract_video_url(st), k.get("base", ""))
         if url:
@@ -943,7 +1254,7 @@ def _poll_video_task(pool: str, info: dict, k: dict, video_id: str, out: str, ar
         if status in ("FAIL", "FAILED", "ERROR"):
             die(f"视频任务失败: {json.dumps(st, ensure_ascii=False)[:300]}")
     print(f"[media_gen] 轮询超时 {pt // 60} 分钟", file=sys.stderr)
-    _save_pending_task(pool, video_id, out, k.get("base", ""))
+    _save_pending_task(pool, video_id, out, k.get("base", ""), key_n=k.get("n", 0))
     print(f"[media_gen] task {video_id} 已落盘（提交即扣，出片不浪费）：harvest 收割 / --wait-task {video_id} 零扣分续等", file=sys.stderr)
     _print_timeout_menu(pool)
     sys.exit(4)
@@ -958,8 +1269,12 @@ def _wait_existing_task(args) -> None:
     if not keys:
         die(f"池 {pool} 现无可用 key，无法续等", 2)
     out = rec.get("out") or args.out
+    # 用**提交时那把 key**续等（v4.7.8）：多 key 池（agnes 3 把跨域名）用 keys[0]
+    # 会 401/404 空转到 deadline；记录里的 key 已移除时退回第一把（旧记录兼容）
+    target_n = int(rec.get("key_n") or 0)
+    k = next((x for x in keys if x["n"] == target_n), keys[0]) if target_n else keys[0]
     print(f"[media_gen] 续等 {pool} 任务 {args.wait_task}（零扣分，不重新提交）", file=sys.stderr)
-    _poll_video_task(pool, info, keys[0], str(args.wait_task), out, args)
+    _poll_video_task(pool, info, k, str(args.wait_task), out, args)
 def _interleave_by_pool(spec: list[tuple[str, dict]],
                         pool_names: list[str]) -> list[tuple[str, dict]]:
     """(池,key) 候选按池轮流交错 → 混编时模型分布均匀（纯函数，可测）。"""

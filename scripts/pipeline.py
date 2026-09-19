@@ -36,7 +36,7 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from mg_core import list_shot_files, natkey  # noqa: E402
+from mg_core import PRODUCT_EXTS, find_product, is_transition, list_shot_files, natkey  # noqa: E402
 
 STAGES = ("images", "videos", "harvest", "kenburns", "sound", "concat", "watermark")
 
@@ -53,6 +53,22 @@ def _run(cmd: list[str], dry: bool, log: list[str]) -> int:
         return 0
     r = subprocess.run(cmd)
     return r.returncode
+
+
+def qc_gate_action(tool: str, rc: int) -> tuple:
+    """门禁退出码 → (动作, 说明)；动作 ∈ {"ok", "note", "die"}。
+
+    本仓有两族约定，这里统一消化：
+      · 报告族（qcseq / faces）：0=PASS / 1=WARN / >=2=FAIL
+      · 门禁族（qcgate / audio-qc）：非 strict 时 WARN 也返 0，>=2=FAIL
+    → 共同的硬判据只有 **>=2**；1 是报告性质，默认不拦流程
+      （要不要升级为拦由调用方决定，如 --audio-qc-strict，与 --qcgate-strict 同口味）。
+    """
+    if rc == 0:
+        return ("ok", "")
+    if rc == 1:
+        return ("note", f"{tool} 有 WARN（报告性质，不拦流程）")
+    return ("die", f"{tool} 失败 rc={rc}")
 
 
 def _shots(shots_dir: Path) -> list[dict]:
@@ -94,6 +110,48 @@ def _sync_frames(shots_dir: Path, shots: list[dict]) -> int:
     return n
 
 
+def resolve_workers(args, plan: dict) -> tuple[int, int]:
+    """并行数解析：CLI 显式 > plan.json（workers_image/workers_video，旧键 workers 兼容）> 3。
+
+    v4.7.9 修：pipeline 自称"workers 读自 plan.json"，实际只用 CLI 默认值 →
+    用户问⑤选的并行数落盘后零生效。非法值（0/字符串）忽略并回退默认。"""
+    def pick(cli, *keys):
+        if isinstance(cli, int) and cli > 0:
+            return cli
+        for k in keys:
+            v = plan.get(k)
+            if isinstance(v, int) and v > 0:
+                return v
+        return 3
+    return (pick(getattr(args, "workers_image", None), "workers_image", "workers"),
+            pick(getattr(args, "workers_video", None), "workers_video", "workers"))
+
+
+def resolve_pool_order(args, plan: dict) -> list[str]:
+    """视频池顺序解析：CLI `--provider-video` > plan.video_pool_order > []（走 MEDIA_PRIORITY）。
+
+    v4.8.0 修：plan.json 的 video_pool_order（问⑤落盘）此前**无任何代码消费**——
+    只在 PLAN_KNOWN_KEYS 里算"合法键"，pipeline/batch 都不读，决策零生效。
+    接入方式：转成 batch 的 `--provider a,b,c`（该参数本就按序取池）。
+    列表或逗号串都接受（plan 可能手写）；非法类型忽略。"""
+    cli = (getattr(args, "provider_video", "") or "").strip()
+    if cli:
+        return [p.strip().lower() for p in cli.split(",") if p.strip()]
+    raw = plan.get("video_pool_order")
+    if isinstance(raw, str):
+        raw = raw.split(",")
+    if not isinstance(raw, (list, tuple)):
+        return []
+    return [str(p).strip().lower() for p in raw if str(p).strip()]
+
+
+def resolve_watermark(args, plan: dict) -> str:
+    """水印渠道解析：CLI 显式 > plan.json（问⑤落盘）> ""（可选清洗，不默认开）。
+
+    v4.7.9 修：原先只看 CLI，plan.json 里的 watermark 零生效。"""
+    return getattr(args, "watermark", "") or str(plan.get("watermark") or "")
+
+
 def cmd(args) -> None:
     shots_dir = Path(args.shots)
     if not shots_dir.is_dir():
@@ -111,6 +169,11 @@ def cmd(args) -> None:
     if mode == "hybrid" and not hero:
         die("mode=hybrid 但 plan.json 没有 hero_shots——回 Step 1 问④ 让用户指定重点镜", 3)
     hero = [str(x) for x in hero] if hero else None
+    # 决策解析（v4.7.9）：plan.json 里的并行数/水印此前被静默忽略，只用 CLI 默认值
+    workers_image, workers_video = resolve_workers(args, plan)
+    watermark = resolve_watermark(args, plan)
+    _mc = plan.get("max_calls")           # 调用次数门禁（v4.9.0）：非法值忽略
+    max_calls = _mc if isinstance(_mc, int) and _mc > 0 else 0
 
     shots = _shots(shots_dir)
     frames = shots_dir / "frames"
@@ -118,16 +181,20 @@ def cmd(args) -> None:
     stop = args.stop_after
     # P2-1 修复：用户显式传 --watermark 却 stop_after 不含 watermark 阶段 → 静默跳过
     # （"以为做了 dry-run，实际一行没跑"）。这里自动提升 stop 点并提示。
-    if args.watermark and STAGES.index("watermark") > STAGES.index(stop):
-        print(f"[pipeline] --watermark={args.watermark} 已给 → 自动把 stop 提升到 watermark 阶段"
+    if watermark and STAGES.index("watermark") > STAGES.index(stop):
+        print(f"[pipeline] --watermark={watermark} 已给 → 自动把 stop 提升到 watermark 阶段"
               f"（原 --stop-after={stop} 会跳过水印，白给参数）", file=sys.stderr)
         stop = "watermark"
     qcseq_info: dict | None = None
+    audio_qc_info: dict | None = None
+    faces_info: dict | None = None
     log: list[str] = []
     mg = str(Path(__file__).resolve().parent / "media_gen.py")
     pp = str(Path(__file__).resolve().parent / "postprocess.py")
     vb = str(Path(__file__).resolve().parent / "vo_build.py")
     dlg = str(Path(__file__).resolve().parent / "delogo_watermark.py")
+    aq = str(Path(__file__).resolve().parent / "audio_qc.py")
+    fc = str(Path(__file__).resolve().parent / "face_consistency.py")
 
     def upto(stage: str) -> bool:
         return STAGES.index(stage) <= STAGES.index(stop)
@@ -138,7 +205,9 @@ def cmd(args) -> None:
         if copied:
             print(f"[pipeline] 同步 {copied} 张散图进 {frames}/")
         cmd = [sys.executable, mg, "batch", str(shots_dir), "--phase", "images",
-               "--workers", str(args.workers_image)]
+               "--workers", str(workers_image)]
+        if max_calls:
+            cmd += ["--max-calls", str(max_calls)]
         if args.provider_image:
             cmd += ["--provider", args.provider_image]
         rc = _run(cmd, args.dry_run, log)
@@ -174,12 +243,27 @@ def cmd(args) -> None:
                     f"`python prompt_lint.py {shots_dir} --kind videos`）——"
                     f"别让 slop 词烧额度。", 3)
         cmd = [sys.executable, mg, "batch", str(shots_dir), "--phase", "videos",
-               "--workers", str(args.workers_video)]
-        if args.provider_video:
-            cmd += ["--provider", args.provider_video]
+               "--workers", str(workers_video)]
+        # 池顺序（v4.8.0）：CLI --provider-video > plan.video_pool_order（问⑤落盘）> 默认
+        pool_order = resolve_pool_order(args, plan)
+        if pool_order:
+            cmd += ["--provider", ",".join(pool_order)]
+            print(f"[pipeline] 视频池顺序：{' → '.join(pool_order)}")
+        if max_calls:
+            cmd += ["--max-calls", str(max_calls)]
         if mode == "hybrid" and hero:
             cmd += ["--only", ",".join(hero)]
             print(f"[pipeline] hybrid：真视频只跑重点镜 {hero}")
+        # P1 透传（v4.7.5）：未给参数不追加——保持 batch 各池默认行为不变。
+        # getattr 防御：旧调用方手工构造 Namespace（测试/embedding）不因新参数崩
+        if getattr(args, "negative", ""):
+            cmd += ["--negative", args.negative]
+        if getattr(args, "video_size", ""):
+            cmd += ["--video-size", args.video_size]
+        if getattr(args, "video_duration", ""):
+            cmd += ["--video-duration", args.video_duration]
+        if getattr(args, "qc", False):
+            cmd += ["--qc"]
         if args.qcgate:
             cmd += ["--qcgate"]
             if args.qcgate_strict:
@@ -199,6 +283,13 @@ def cmd(args) -> None:
                     + (f"：{sorted(pend, key=natkey)}" if pend else "")
                     + f"。按 SKILL「视频超时询问协议」问用户：切下一池 / 续等 --wait-task / 放弃。"
                     f"出片后 `harvest` 收割，再 `--retry-failed` 补 FAIL 镜。", 4)
+            # blocked（缺首帧/缺依赖，没跑成）与 failed 分开报——两者的修法不同：
+            # blocked 要先补依赖，failed 要修 prompt/换池
+            blocked = [sid for sid, t in tags.items() if t == "blocked"]
+            if blocked:
+                die(f"视频阶段有 {len(blocked)} 镜没跑成（缺首帧/缺依赖）："
+                    f"{sorted(blocked, key=natkey)}。先补依赖（缺帧跑 images 阶段 / "
+                    f"邻居镜出片后重跑），再 `--retry-failed` 补跑。", 1)
             failed = [sid for sid, t in tags.items() if t.endswith("(failed)")]
             die(f"视频阶段有 {len(failed)} 镜失败：{sorted(failed, key=natkey)}。"
                 f"修好后 `pipeline.py --retry-failed` 或 batch --retry-failed 补跑。", 1)
@@ -214,13 +305,22 @@ def cmd(args) -> None:
     # ── 阶段 4: 缓推补齐（hybrid 的非重点镜 / stills 全部）──
     # 只转"还没有 clip 的镜"：hybrid 的重点镜在阶段2已出真视频（done=True 跳过），
     # 剩下的（hybrid 过场镜 / stills 全镜）才补缓推。天然按 mode 区分，无需判断 hero。
+    # 过渡镜（transition 字段，v4.6）除外：它等邻居 clip 出片后由 batch pass2
+    # 出真过渡视频（首尾帧衔接语义），缓推会破坏该语义。
     if upto("kenburns") and mode in ("hybrid", "stills"):
         made = 0
         for s in shots:
             sid = s["sid"]
+            try:
+                _d = json.loads(s["path"].read_text(encoding="utf-8"))
+            except Exception:
+                _d = {}
+            if is_transition(_d):
+                print(f"[pipeline] 过渡镜 {sid} 跳过缓推（等邻居 clip，batch pass2 出真过渡）")
+                continue
             done = any((clips / f"clip_{sid}{e}").exists() and
                        (clips / f"clip_{sid}{e}").stat().st_size > 0
-                       for e in (".mp4", ".webp"))
+                       for e in PRODUCT_EXTS)
             if done:
                 continue
             img = frames / f"{sid}.png"
@@ -268,6 +368,38 @@ def cmd(args) -> None:
     # ── 阶段 6: 后期统一 + 声音三件套 + xfade + 自检 → final ──
     final = Path(args.final) if args.final else (shots_dir.parent / "final.mp4")
     if upto("concat"):
+        # ── concat 前的三道门禁（v4.10.2：audio-qc / faces 此前做完了却没接进流程）──
+        # ① 音频侧：qcgate 只看**画面**——"旁白整段丢 / 音轨没接上"都是 rc=0 的静默失败
+        if not args.no_audio_qc:
+            aq_cmd = [sys.executable, aq, str(clips)]
+            if args.audio_qc_strict:
+                aq_cmd.append("--strict")
+            arc = _run(aq_cmd, args.dry_run, log)
+            if not args.dry_run:
+                act, msg = qc_gate_action("audio-qc", arc)
+                if act == "die":
+                    die(f"{msg}——先听一遍声音再拼接（明细见上方 audio-qc 输出）", arc)
+                audio_qc_info = {"rc": arc, "note": msg}
+                if act == "note":
+                    print(f"[pipeline] {msg}")
+        # ② 人脸一致性：qcseq 只比**色调**，换了张脸它看不出来（漫剧锁脸靠这条）。
+        #    可选依赖（cv2 + 两个 ONNX 模型）——缺就跳过并说明，**不因可选依赖拦流程**
+        if not args.no_faces:
+            import face_consistency            # 延迟 import：只在真跑时才探测 cv2
+            if face_consistency.face_backend():
+                frc = _run([sys.executable, fc, str(clips)], args.dry_run, log)
+                if not args.dry_run:
+                    act, msg = qc_gate_action("faces", frc)
+                    if act == "die":
+                        die(f"{msg}——跨镜人脸对不上，先确认是不是同一个人"
+                            f"（可用角色圣经的设定图做 --ref 再跑一次）", frc)
+                    faces_info = {"rc": frc, "note": msg}
+                    if act == "note":
+                        print(f"[pipeline] {msg}")
+            else:
+                print("[pipeline] 跳过人脸一致性（缺 opencv-python 或 ONNX 模型）"
+                      "——装好后重跑 concat 即可；安装指引见 `media_gen.py faces --help`")
+                faces_info = {"rc": None, "note": "缺依赖，未跑"}
         # 优化⑤：concat 前跨镜首帧一致性粗检（WARN 报告不拦——跑偏镜重跑或整体调色，是人的决策）
         # P2-2 修复：区分 exit 1=WARN（提示放行）与 exit 2=真错误（输入错误/抽帧失败，必须中断）
         if not args.no_qcseq:
@@ -298,9 +430,9 @@ def cmd(args) -> None:
         if rc != 0 and not args.dry_run:
             die(f"concat 失败 rc={rc}", rc)
 
-    # ── 阶段 7: 去水印旁线（可选：--watermark <provider>；默认不跑）──
-    if upto("watermark") and args.watermark:
-        wm_cmd = [sys.executable, dlg, str(final), "--provider", args.watermark]
+    # ── 阶段 7: 去水印旁线（可选：--watermark <provider> 或 plan.json 的 watermark；默认不跑）──
+    if upto("watermark") and watermark:
+        wm_cmd = [sys.executable, dlg, str(final), "--provider", watermark]
         if args.watermark_dry_run:
             wm_cmd += ["--dry-run"]
         rc = _run(wm_cmd, args.dry_run, log)
@@ -312,7 +444,8 @@ def cmd(args) -> None:
         (shots_dir / "pipeline_run.json").write_text(
             json.dumps({"plan_mode": mode, "hero": hero, "stop_after": stop,
                         "stages": STAGES[:STAGES.index(stop) + 1], "final": str(final),
-                        "qcseq": qcseq_info},
+                        "qcseq": qcseq_info, "audio_qc": audio_qc_info,
+                        "faces": faces_info},
                        ensure_ascii=False, indent=2), encoding="utf-8")
 
     if args.dry_run:
@@ -353,8 +486,9 @@ def audit(shots_dir: Path) -> int:
     for j in js:
         d = json.loads(j.read_text(encoding="utf-8"))
         sid = d.get("shot_id") or j.stem
+        is_trans = is_transition(d)
         frame = (frames / f"{sid}.png").exists() and (frames / f"{sid}.png").stat().st_size > 0
-        clip_path = next(((clips / f"clip_{sid}{e}") for e in (".mp4", ".webp")
+        clip_path = next(((clips / f"clip_{sid}{e}") for e in PRODUCT_EXTS
                           if (clips / f"clip_{sid}{e}").exists() and
                           (clips / f"clip_{sid}{e}").stat().st_size > 0), None)
         clip = clip_path is not None
@@ -367,22 +501,36 @@ def audit(shots_dir: Path) -> int:
                 au = "?"
         tag = prev.get(sid, "")
         st = "OK" if clip else ("出图✓" if frame else "缺帧")
+        if is_trans and not clip:
+            # 过渡镜缺的不是 t2i 帧而是邻居依赖：seed（from 末帧）+ to 首帧
+            tr = d["transition"]
+            dep_ok = (frames / f"{sid}_seed.png").exists() and \
+                (frames / f"{tr['to']}.png").exists() and \
+                find_product(clips, tr["from"]) is not None
+            st = "OK" if dep_ok else f"待邻出片（{tr['from']}→{sid}→{tr['to']}）"
+            if not dep_ok:
+                n_missing_frame += 1
         if tag.endswith("(timeout-pending)"):
             st = f"PENDING 在途 → harvest"
             n_pend += 1
         elif tag.endswith("(failed)") or tag.endswith("(lint)"):
-            st = f"FAIL({tag[-12:-1].strip()}) → 修后 --retry-failed"
+            kind = "lint" if tag.endswith("(lint)") else "failed"
+            st = f"FAIL({kind}) → 修后 --retry-failed"
             n_fail += 1
-        elif not frame and not clip:
+        elif tag == "blocked":
+            st = "没跑成（缺首帧/缺依赖）→ 补依赖后 --retry-failed"
+            n_fail += 1
+        elif not frame and not clip and not is_trans:
             st = "缺首帧 → images 阶段"
             n_missing_frame += 1
         rows.append((sid, "出图✓" if frame else "—", "出片✓" if clip else "—", au, st))
 
     print(f"[audit] {shots_dir}  mode={plan.get('mode', '?')}"
           + (f" hero={plan.get('hero_shots')}" if plan.get("hero_shots") else ""))
-    qc = run_log.get("qcseq") or {}
-    if qc:
-        print(f"  上次 qcseq：rc={qc.get('rc')} {qc.get('note', '')}")
+    for _key, _label in (("audio_qc", "audio-qc"), ("faces", "faces"), ("qcseq", "qcseq")):
+        info = run_log.get(_key) or {}
+        if info:
+            print(f"  上次 {_label}：rc={info.get('rc')} {info.get('note', '')}")
     print(f"  镜数 {len(rows)}   出图 {sum(1 for r in rows if r[1] == '出图✓')}   "
           f"出片 {sum(1 for r in rows if r[2] == '出片✓')}"
           f"   有声 {sum(1 for r in rows if r[3] == '有音')} / 哑片 {sum(1 for r in rows if r[3] == '哑片')}"
@@ -407,7 +555,8 @@ _TRASH_NAME = ".trash"
 
 # 可再生中间产物：删了可由 shots JSON + plan 重新生成（--yes 后移入 .trash）
 _CLEAN_DIRS = ("frames", "clips", "qc_frames", "caps_smoke")
-_CLEAN_FILES = ("style_grid.png", "pipeline_run.json")
+_CLEAN_FILES = ("style_grid.png", "pipeline_run.json",
+                "_norm.mp4", "_mixed.mp4", "_with_text.mp4")   # v4.7.5：concat/字幕中间件纳入治理面
 _CLEAN_GLOBS = ("*.tmp",)
 # 绝不动：shots/*.json（源）、plan.json、vo_lines.json（旁白脚本）、batch_run.json
 # （账单+断点续跑依据）、final*.mp4（成片）、.trash 本身
@@ -533,10 +682,17 @@ def main() -> None:
     ap.add_argument("--stop-after", default="concat", choices=STAGES,
                     help="跑到该阶段后停（默认 concat；想每阶段人工把关可 --stop-after images）")
     ap.add_argument("--dry-run", action="store_true", help="只打印各阶段命令不执行")
-    ap.add_argument("--workers-image", type=int, default=3)
-    ap.add_argument("--workers-video", type=int, default=3)
+    ap.add_argument("--workers-image", type=int, default=None,
+                    help="并行数（缺省读 plan.json 的 workers_image / workers，再缺省 3）")
+    ap.add_argument("--workers-video", type=int, default=None,
+                    help="并行数（缺省读 plan.json 的 workers_video / workers，再缺省 3）")
     ap.add_argument("--provider-image", default="", help="覆盖出图池（默认按 env/MEDIA_PRIORITY）")
     ap.add_argument("--provider-video", default="", help="覆盖出视频池")
+    ap.add_argument("--qc", action="store_true",
+                    help="videos 阶段每段生成后抽 3 帧到 clips/qc/（透传 batch --qc）")
+    ap.add_argument("--negative", default="", help="负面提示词（透传 batch；留空=batch 默认）")
+    ap.add_argument("--video-size", default="", help="视频分辨率覆盖（透传 batch）")
+    ap.add_argument("--video-duration", default="", help="视频时长覆盖（透传 batch）")
     ap.add_argument("--qcgate", action="store_true", help="视频阶段过机器门禁（FAIL 记失败待重跑）")
     ap.add_argument("--qcgate-strict", action="store_true", help="qcgate 的 WARN 也判失败")
     ap.add_argument("--kenburns-dur", type=float, default=5.0, help="缓推单镜时长秒")
@@ -546,6 +702,12 @@ def main() -> None:
                     help="跳过出镜前 prompt lint（slop/词数/主体漂移；默认强制）")
     ap.add_argument("--no-qcseq", action="store_true",
                     help="跳过 concat 前的跨镜首帧一致性粗检（qcseq）")
+    ap.add_argument("--no-audio-qc", action="store_true",
+                    help="跳过 concat 前的音频侧门禁（audio-qc：静音占比/削波/响度）")
+    ap.add_argument("--audio-qc-strict", action="store_true",
+                    help="audio-qc 的 WARN 也判失败（默认只拦 FAIL）")
+    ap.add_argument("--no-faces", action="store_true",
+                    help="跳过 concat 前的跨镜人脸一致性检查（faces）；缺 cv2/模型时本来就会跳过")
     # 后期透传
     ap.add_argument("--final", default="", help="成片输出路径（默认 <shots>/../final.mp4）")
     ap.add_argument("--target-res", default="1280x720")

@@ -629,5 +629,734 @@ class TestBatchLastFrame(unittest.TestCase):
             self.assertIn("MISS (last_frame", r.stdout)
 
 
+@unittest.skipUnless(not _slow, 'slow: SLOW=1 启用')
+class TestBatchTransition(unittest.TestCase):
+    """v4.6 方案二：过渡镜（transition 字段）一等公民——编排理解 DAG 依赖。
+
+    过渡镜 = 独立 shot JSON（如 S01T，natkey 排序天然落在 S01 与 S02 之间），
+    带 transition={"from": "S01", "to": "S02"}：无 t2i_prompt（不进 images 阶段）、
+    首帧=from 镜 clip 末帧（编排自动抽）、尾帧=to 镜首帧。
+    batch videos 两趟调度：pass1 普通镜 → 抽末帧 → pass2 过渡镜。
+    缺依赖 = MISS 跳过不提交（提交即扣额度）。
+    """
+
+    def _run(self, td: Path, phase="videos", extra=None):
+        import subprocess as sp
+        mg = Path(__file__).resolve().parents[1] / "scripts" / "media_gen.py"
+        env = {**os.environ, "PYTHONUTF8": "1",
+               "MEDIA_AGNES_1_KEY": "k1", "MEDIA_AGNES_1_BASE": "https://example.invalid/v1"}
+        cmd = [sys.executable, str(mg), "batch", str(td),
+               "--phase", phase, "--provider", "agnes",
+               "--workers", "1", "--dry-run"]
+        if extra:
+            cmd += extra
+        return sp.run(cmd, capture_output=True, text=True,
+                      encoding="utf-8", env=env)
+
+    def _setup_shots(self, td: Path):
+        """S1 + S2 普通镜 + S1T 过渡镜（依赖 S1 末帧 + S2 首帧）。"""
+        (td / "frames").mkdir()
+        (td / "clips").mkdir()
+        (td / "frames" / "S1.png").write_bytes(b"f1")
+        (td / "frames" / "S2.png").write_bytes(b"f2")
+        (td / "shot_01.json").write_text(json.dumps({
+            "shot_id": "S1", "t2i_prompt": "x", "i2v_prompt": "y"}), encoding="utf-8")
+        (td / "shot_02.json").write_text(json.dumps({
+            "shot_id": "S2", "t2i_prompt": "x", "i2v_prompt": "y"}), encoding="utf-8")
+        (td / "shot_01T.json").write_text(json.dumps({
+            "shot_id": "S1T", "transition": {"from": "S1", "to": "S2"},
+            "i2v_prompt": "slow morph"}), encoding="utf-8")
+
+    def test_transition_excluded_from_images_phase(self):
+        """过渡镜无 t2i_prompt → images 阶段不跑（首帧来自邻居，不是 t2i）。"""
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            self._setup_shots(td)
+            r = self._run(td, phase="images")
+            self.assertEqual(r.returncode, 0, r.stderr[-300:])
+            # 排除方式 = 打 skip 标签、绝不构造生成命令（不烧 t2i 额度）
+            self.assertIn("skip (transition)", r.stdout)
+            ti_lines = [ln for ln in r.stdout.splitlines() if "S1T" in ln]
+            for ln in ti_lines:
+                self.assertIn("[skip (transition)]", ln,
+                              f"过渡镜 images 阶段只允许 skip，不允许生成命令: {ln}")
+
+    def test_transition_missing_deps_reports_miss(self):
+        """依赖未就绪（S1 无 clip）→ 报 MISS 不提交。"""
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            self._setup_shots(td)
+            r = self._run(td)
+            self.assertEqual(r.returncode, 0, r.stderr[-300:])
+            self.assertIn("MISS (transition", r.stdout)
+
+    def test_transition_ready_builds_two_pass(self):
+        """依赖就绪（S1 有 clip + 抽出末帧）→ 两趟调度：先普通镜后过渡镜，
+        过渡镜命令带 --image <抽的末帧> 和 --last-frame <S2 首帧>。"""
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            self._setup_shots(td)
+            (td / "clips" / "clip_S1.mp4").write_bytes(b"c1")
+            # 抽末帧步骤会产出 frames/S1T_seed.png（模拟已抽）
+            (td / "frames" / "S1T_seed.png").write_bytes(b"seed")
+            r = self._run(td)
+            self.assertEqual(r.returncode, 0, r.stderr[-300:])
+            self.assertIn("S1T", r.stdout)
+            self.assertIn("--last-frame", r.stdout)
+            self.assertIn("S1T_seed.png", r.stdout)
+
+    def test_transition_orphan_rejected(self):
+        """transition 的 from/to 指向不存在的镜 → die 提示（防静默 MISS 死循环）。"""
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            (td / "frames").mkdir()
+            (td / "shot_01T.json").write_text(json.dumps({
+                "shot_id": "S1T", "transition": {"from": "S1", "to": "S9"},
+                "i2v_prompt": "x"}), encoding="utf-8")
+            r = self._run(td)
+            self.assertNotEqual(r.returncode, 0, "孤儿过渡镜必须 die 而非静默 MISS")
+            self.assertIn("S9", r.stdout + r.stderr)
+
+    def test_transition_seed_stale_reextracts(self):
+        """失效链：from 镜 clip 比 seed 新（邻居重拍）→ 报 STALE 提示重抽。"""
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            self._setup_shots(td)
+            (td / "clips" / "clip_S1.mp4").write_bytes(b"c1")
+            seed = td / "frames" / "S1T_seed.png"
+            seed.write_bytes(b"seed")
+            # clip 比 seed 新（邻居重拍后）
+            import os as _os
+            old = seed.stat().st_mtime - 100
+            _os.utime(td / "clips" / "clip_S1.mp4", (old + 200, old + 200))
+            r = self._run(td)
+            self.assertEqual(r.returncode, 0, r.stderr[-300:])
+            self.assertIn("STALE", r.stdout)
+
+
+class TestBuildVideoPayload(unittest.TestCase):
+    """v4.7：video payload 构造提为纯函数，钉死三种首尾帧承载方式的差异。
+
+    - Agnes 风 keyframes：extra_body={"image":[首,尾],"mode":"keyframes"}，**不传顶层首帧**
+    - custom 池风：首帧走 image_param，尾帧走独立字段名（last_frame_param）
+    - 无尾帧：老行为（顶层 image 单帧 i2v）不变
+    """
+
+    def _args(self, **kw):
+        import argparse
+        base = dict(prompt="p", image="", last_frame="", num_frames=121,
+                    negative="neg", video_size="", video_duration="")
+        base.update(kw)
+        return argparse.Namespace(**base)
+
+    def test_agnes_keyframes_uses_extra_body(self):
+        info = {"keyframes_style": "extra_body", "supports_num_frames": True,
+                "supports_negative": True}
+        a = self._args(image="/tmp/first.png", last_frame="/tmp/last.png")
+        with mock.patch("media_gen.image_to_uri_shrunk", side_effect=lambda p: f"URL({p})"):
+            payload = mg.build_video_payload(info, {}, a, "1024x1024", None, "agnes-video-v2.0")
+        self.assertEqual(payload["extra_body"]["mode"], "keyframes")
+        self.assertEqual(payload["extra_body"]["image"],
+                         ["URL(/tmp/first.png)", "URL(/tmp/last.png)"])
+        self.assertNotIn("image", payload, "keyframes 模式不得再传顶层首帧")
+        self.assertEqual(payload["num_frames"], 121)
+        self.assertEqual(payload["negative_prompt"], "neg")
+
+    def test_keyframes_without_image_dies(self):
+        info = {"keyframes_style": "extra_body"}
+        a = self._args(image="", last_frame="/tmp/last.png")
+        with self.assertRaises(SystemExit) as cm:
+            mg.build_video_payload(info, {}, a, "", None, "m")
+        self.assertEqual(cm.exception.code, 2, "keyframes 必须双帧齐全")
+
+    def test_custom_pool_last_frame_field(self):
+        """custom 池风（可灵系字段名）：首帧 image_param + 尾帧独立字段，老行为不变。"""
+        info = {"image_param": "image", "last_frame_param": "tail_image",
+                "last_frame_list": False}
+        a = self._args(image="/tmp/f.png", last_frame="/tmp/l.png")
+        with mock.patch("media_gen.image_to_uri_shrunk", side_effect=lambda p: f"URL({p})"):
+            payload = mg.build_video_payload(info, {}, a, "", None, "m")
+        self.assertEqual(payload["image"], "URL(/tmp/f.png)")
+        self.assertEqual(payload["tail_image"], "URL(/tmp/l.png)")
+        self.assertNotIn("extra_body", payload)
+
+    def test_plain_i2v_unchanged(self):
+        info = {"image_param": "image", "supports_num_frames": True}
+        a = self._args(image="/tmp/f.png")
+        with mock.patch("media_gen.image_to_uri_shrunk", side_effect=lambda p: f"URL({p})"):
+            payload = mg.build_video_payload(info, {}, a, "", None, "m")
+        self.assertEqual(payload["image"], "URL(/tmp/f.png)")
+        self.assertNotIn("extra_body", payload)
+
+
+@unittest.skipUnless(not _slow, 'slow: SLOW=1 启用')
+class TestBatchRefImage(unittest.TestCase):
+    """角色一致性（v4.7.1）：shot JSON 的 ref_image → batch images 阶段透传 --ref-image。
+
+    意义：v4.7 只加了单命令 `image --ref-image`，批量主流程用不了；本批把它接进 batch。
+    相对路径按 shots 根解析（shot JSON 就在 shots/ 下，写 "char_hero.png" 即可）。
+    """
+
+    def _run(self, td: Path, phase="images"):
+        import subprocess as sp
+        mg = Path(__file__).resolve().parents[1] / "scripts" / "media_gen.py"
+        env = {**os.environ, "PYTHONUTF8": "1",
+               "MEDIA_AGNES_1_KEY": "k1", "MEDIA_AGNES_1_BASE": "https://example.invalid/v1"}
+        return sp.run([sys.executable, str(mg), "batch", str(td),
+                       "--phase", phase, "--provider", "agnes",
+                       "--workers", "1", "--dry-run"],
+                      capture_output=True, text=True, encoding="utf-8", env=env)
+
+    def test_ref_image_passed_through(self):
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            (td / "frames").mkdir()
+            (td / "char_hero.png").write_bytes(b"c")          # 角色设定图（shots 根下）
+            (td / "shot_01.json").write_text(json.dumps({
+                "shot_id": "S1", "t2i_prompt": "x", "i2v_prompt": "y",
+                "ref_image": ["char_hero.png"]}), encoding="utf-8")
+            r = self._run(td)
+            self.assertEqual(r.returncode, 0, r.stderr[-300:])
+            self.assertIn("--ref-image", r.stdout)
+            self.assertIn("char_hero.png", r.stdout)
+
+    def test_ref_image_string_form(self):
+        """字符串单图也支持（不必写成列表）。"""
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            (td / "frames").mkdir()
+            (td / "hero.png").write_bytes(b"c")
+            (td / "shot_01.json").write_text(json.dumps({
+                "shot_id": "S1", "t2i_prompt": "x", "ref_image": "hero.png"}),
+                encoding="utf-8")
+            r = self._run(td)
+            self.assertEqual(r.returncode, 0, r.stderr[-300:])
+            self.assertIn("--ref-image", r.stdout)
+
+    def test_ref_image_missing_reports_miss(self):
+        """参考图缺失 → MISS 不提交（提交即扣额度）。"""
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            (td / "frames").mkdir()
+            (td / "shot_01.json").write_text(json.dumps({
+                "shot_id": "S1", "t2i_prompt": "x", "ref_image": ["ghost.png"]}),
+                encoding="utf-8")
+            r = self._run(td)
+            self.assertEqual(r.returncode, 0, r.stderr[-300:])
+            self.assertIn("MISS (ref_image", r.stdout)
+
+
+class TestRunShotOnce(unittest.TestCase):
+    """pass1（多 worker）与 pass2（过渡镜串行）共用同一执行器 run_shot_once。
+
+    之前两份复制逻辑 → pass2 漏掉 qcgate/qc（locality 崩塌）。本测试钉死：
+    ①qcgate 必须被调用 ②结果记录格式与 pass1 一致。
+    """
+
+    def _args(self, **kw):
+        import argparse
+        base = dict(phase="videos", retries=1, no_lint=True, qcgate=False,
+                    qcgate_strict=False, qc=False, negative="x",
+                    video_size="", video_duration="")
+        base.update(kw)
+        return argparse.Namespace(**base)
+
+    def _fixture(self, td: Path, create_out=True) -> Path:
+        (td / "clips").mkdir()
+        out = td / "clips" / "clip_S1.mp4"
+        if create_out:
+            out.write_bytes(b"x")
+        (td / "shot_01.json").write_text("{}", encoding="utf-8")
+        return out
+
+    def test_qcgate_runs_and_ok_recorded(self):
+        import threading
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            out = self._fixture(td)
+            results: list[str] = []
+            pm: dict[str, str] = {}
+            gate = mock.Mock(return_value=mock.Mock(returncode=0, stdout=""))
+            with mock.patch("mg_batch.subprocess.call", return_value=0), \
+                 mock.patch("mg_batch.run_capture", gate):
+                mg_batch.run_shot_once(td / "shot_01.json", "S1", "agnes", 1,
+                                       ["python", "x"], out, self._args(qcgate=True),
+                                       td / "clips", td / "clips" / "qc",
+                                       results, pm, threading.Lock(), 0)
+            self.assertEqual(gate.call_count, 1, "qcgate 必须被调用一次")
+            gate_cmd = gate.call_args[0][0]
+            self.assertIn("qcgate", " ".join(gate_cmd), gate_cmd)
+            self.assertIn("OK S1 (agnes key#1)", results)
+            self.assertEqual(pm["S1"], "agnes key#1")
+
+    def test_failure_records_fail_and_bumps_streak(self):
+        """产物不存在时 rc!=0 → 记 FAIL 并累加连续失败（worker 退场判定用）。"""
+        import threading
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            out = self._fixture(td, create_out=False)
+            results: list[str] = []
+            pm: dict[str, str] = {}
+            with mock.patch("mg_batch.subprocess.call", return_value=2):
+                streak = mg_batch.run_shot_once(
+                    td / "shot_01.json", "S1", "agnes", 1, ["python", "x"], out,
+                    self._args(), td / "clips", td / "clips" / "qc",
+                    results, pm, threading.Lock(), 0)
+            self.assertEqual(streak, 1, "失败要累加连续失败计数（worker 退场判定用）")
+            self.assertTrue(results[0].startswith("FAIL(rc=2)"), results)
+            self.assertTrue(pm["S1"].endswith("(failed)"))
+
+    def test_existing_product_upgrades_to_ok(self):
+        """断点续跑兜底：rc!=0 但产物已落盘非空 → 视为成功（不误报 FAIL）。"""
+        import threading
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            out = self._fixture(td)          # 产物存在
+            results: list[str] = []
+            with mock.patch("mg_batch.subprocess.call", return_value=2):
+                streak = mg_batch.run_shot_once(
+                    td / "shot_01.json", "S1", "agnes", 1, ["python", "x"], out,
+                    self._args(), td / "clips", td / "clips" / "qc",
+                    results, {}, threading.Lock(), 0)
+            self.assertEqual(streak, 0)
+            self.assertTrue(results[0].startswith("OK S1"), results)
+
+
+class TestZhipuVideoPayload(unittest.TestCase):
+    """zhipu 风视频 payload 统一走 build_video_payload（原来在 cmd_video 里另起一份）。
+
+    修两类"静默"：① --last-frame / --negative 被无声丢弃 → 产出与预期不符还不报错；
+    ② image_url 走未压缩编码 → 大图直传读超时（v4.7 已在 agnes 侧实测过这条上游约束）。
+    """
+
+    ZHIPU = {"payload_style": "zhipu", "supports_num_frames": False,
+             "supports_negative": False}
+
+    def setUp(self):
+        # _IGNORED_WARNED 是模块级"每池只警告一次"去重集合：不清就会跨用例累积，
+        # 后面的用例看不到告警（测试互相污染，不是实现问题）
+        mg._IGNORED_WARNED.clear()
+
+    def _args(self, **kw):
+        import argparse
+        base = dict(prompt="p", image="", last_frame="", num_frames=121,
+                    negative="", video_size="", video_duration="")
+        base.update(kw)
+        return argparse.Namespace(**base)
+
+    def test_field_shape(self):
+        a = self._args(image="/tmp/f.png")
+        with mock.patch("media_gen.image_to_uri_shrunk", side_effect=lambda p: f"S({p})"):
+            payload = mg.build_video_payload(self.ZHIPU, {}, a, "1920x1080", 5,
+                                             model="cogvideox-flash")
+        self.assertEqual(payload["model"], "cogvideox-flash")
+        self.assertEqual(payload["prompt"], "p")
+        self.assertFalse(payload["with_audio"])
+        self.assertEqual(payload["fps"], 30)
+        self.assertEqual(payload["size"], "1920x1080")
+        self.assertEqual(payload["duration"], 5)
+
+    def test_image_url_uses_shrunk_encoder(self):
+        """大图压缩必须覆盖 zhipu 这条 i2v 路径（原用未压缩 image_to_url_or_path）。"""
+        a = self._args(image="/tmp/big.png")
+        with mock.patch("media_gen.image_to_uri_shrunk",
+                        side_effect=lambda p: f"S({p})") as m:
+            payload = mg.build_video_payload(self.ZHIPU, {}, a, "1920x1080", 5, model="m")
+        self.assertEqual(payload["image_url"], "S(/tmp/big.png)")
+        self.assertTrue(m.called)
+
+    def test_last_frame_dies_loudly(self):
+        """zhipu 不支持首尾帧 → 必须大声报错，不能静默产出一段"没插值"的视频。"""
+        a = self._args(image="/tmp/f.png", last_frame="/tmp/l.png")
+        with self.assertRaises(SystemExit) as cm:
+            mg.build_video_payload(self.ZHIPU, {}, a, "1920x1080", 5, model="m")
+        self.assertEqual(cm.exception.code, 2)
+
+    def test_negative_warns_not_silent(self):
+        import contextlib
+        import io
+        a = self._args(image="/tmp/f.png", negative="blurry")
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            payload = mg.build_video_payload(self.ZHIPU, {}, a, "1920x1080", 5, model="m")
+        self.assertNotIn("negative_prompt", payload)
+        self.assertIn("negative", buf.getvalue().lower(), "被丢弃的参数必须留下痕迹")
+
+    def test_generic_pool_warns_when_negative_unsupported(self):
+        import contextlib
+        import io
+        info = {"supports_negative": False}
+        a = self._args(negative="blurry")
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            payload = mg.build_video_payload(info, {}, a, "", None, model="m")
+        self.assertNotIn("negative_prompt", payload)
+        self.assertIn("negative", buf.getvalue().lower())
+
+    def test_warning_fires_once_per_pool(self):
+        """batch 逐镜调用 → 同一池的忽略告警不能每镜刷一次（否则刷屏看不见真错误）。"""
+        import contextlib
+        import io
+        info = {"supports_negative": False}
+        a = self._args(negative="x")
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            for _ in range(3):
+                mg.build_video_payload(info, {}, a, "", None, model="m")
+        warned = [ln for ln in buf.getvalue().splitlines() if "negative" in ln.lower()]
+        self.assertEqual(len(warned), 1, f"同一池的忽略告警应只出现一次，实际 {len(warned)} 次")
+
+
+class TestStatusTtsSlot(unittest.TestCase):
+    """status 必须看到**任意**已配 TTS 槽位（曾只看 MEDIA_TTS_1 → 误报未配置）。"""
+
+    def test_reports_second_slot_when_first_empty(self):
+        import argparse
+        import contextlib
+        import io
+        import mg_status
+        env = {k: v for k, v in os.environ.items() if not k.startswith("MEDIA_")}
+        env["MEDIA_TTS_2_KEY"] = "k2"
+        env["MEDIA_TTS_2_BASE"] = "https://tts.invalid/v1"
+        buf = io.StringIO()
+        with mock.patch.dict(os.environ, env, clear=True), \
+             contextlib.redirect_stdout(buf):
+            mg_status.cmd_status(argparse.Namespace(no_probe=True))
+        out = buf.getvalue()
+        self.assertIn("tts key#2", out, "key#2 已配却没显示 —— 槽位扫描口径不一致")
+        self.assertNotIn("tts: 未配置", out)
+
+    def test_reports_unconfigured_when_no_slot(self):
+        import argparse
+        import contextlib
+        import io
+        import mg_status
+        env = {k: v for k, v in os.environ.items() if not k.startswith("MEDIA_")}
+        buf = io.StringIO()
+        with mock.patch.dict(os.environ, env, clear=True), \
+             contextlib.redirect_stdout(buf):
+            mg_status.cmd_status(argparse.Namespace(no_probe=True))
+        self.assertIn("tts", buf.getvalue())
+
+
+class TestBuildPollUrl(unittest.TestCase):
+    """批四 B：轮询 URL 构造收归 mg_core.build_poll_url 单源。
+
+    此前三处各拼一份（_poll_video_task / _harvest_video / cmd_edit）——
+    poll_style path/query 的分叉逻辑散落 = 加新池必漏一处。"""
+
+    def test_query_style_with_param(self):
+        info = {"poll_style": "query", "poll_path": "/videos/generations",
+                "poll_param": "task_id"}
+        self.assertEqual(
+            mg_core.build_poll_url("http://b/v1", info, "T1"),
+            "http://b/v1/videos/generations?task_id=T1")
+
+    def test_path_style(self):
+        info = {"poll_style": "path", "poll_path": "/videos"}
+        self.assertEqual(
+            mg_core.build_poll_url("http://b/v1", info, "T1"),
+            "http://b/v1/videos/T1")
+
+    def test_default_style_is_query(self):
+        """未声明 poll_style 的视频池（如 agnes）默认 query 风格——与
+        _poll_video_task 旧 else 分支一致，改默认值会直接改坏 agnes 轮询。"""
+        self.assertEqual(
+            mg_core.build_poll_url("http://b/v1",
+                                   {"poll_path": "/agnesapi", "poll_param": "video_id"}, "T9"),
+            "http://b/v1/agnesapi?video_id=T9")
+
+    def test_image_side_forced_path(self):
+        """image 侧（魔撘 /tasks/{id}）info 无 poll_style，调用方显式 style='path'。"""
+        self.assertEqual(
+            mg_core.build_poll_url("http://b/v1", {}, "T1",
+                                   poll_path="/tasks", style="path"),
+            "http://b/v1/tasks/T1")
+
+    def test_poll_path_override_wins(self):
+        """harvest 用落盘记录里的 poll_path 覆盖池配置（记录优先）。"""
+        info = {"poll_style": "path", "poll_path": "/videos"}
+        self.assertEqual(
+            mg_core.build_poll_url("http://b/v1", info, "T1", poll_path="/other"),
+            "http://b/v1/other/T1")
+
+
+class TestStatusCapabilityRows(unittest.TestCase):
+    """批四 A：status 显示能力档案汇总行（声明/实测/过期一眼可见）。
+
+    caps show 已覆盖明细，但 status 是第一入口——用户看 status 时
+    不该对"哪些池真测过 ref_image/keyframes"一无所知。"""
+
+    def _run_status(self):
+        import argparse
+        import contextlib
+        import io
+        import mg_status
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            mg_status.cmd_status(argparse.Namespace(no_probe=True))
+        return buf.getvalue()
+
+    def _caps_load(self, data):
+        """patch 真实 mg_caps 模块的 load（cmd_status 延迟 import 拿到同一模块对象）。"""
+        import mg_caps
+        if isinstance(data, Exception) or callable(data):
+            return mock.patch.object(mg_caps, "load", side_effect=data)
+        return mock.patch.object(mg_caps, "load", return_value=data)
+
+    def _run_status(self):
+        import argparse
+        import contextlib
+        import io
+        import mg_status
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            mg_status.cmd_status(argparse.Namespace(no_probe=True))
+        return buf.getvalue()
+
+    def test_shows_measured_and_unmeasured(self):
+        data = {"custom": {
+            "image:cap:ref_image": {"ok": True, "probed_at_ts": time.time()},
+        }}
+        with self._caps_load(data):
+            out = self._run_status()
+        self.assertIn("能力", out, "status 缺能力汇总段（批四 A 目标）")
+        self.assertIn("ref_image", out)
+        self.assertIn("keyframes", out)
+
+    def test_stale_probe_marked(self):
+        stale_ts = time.time() - 8 * 86400      # 超 7 天 TTL
+        data = {"custom": {
+            "image:cap:ref_image": {"ok": True, "probed_at_ts": stale_ts},
+        }}
+        with self._caps_load(data):
+            out = self._run_status()
+        self.assertIn("过期", out, "超 TTL 的实测应标「过期」而非冒充有效")
+
+    def test_corrupt_caps_does_not_crash_status(self):
+        """caps 档案损坏不能拖垮 status（load 抛异常时静默跳过该段）。"""
+        with self._caps_load(RuntimeError("corrupt json")):
+            out = self._run_status()          # 不应 raise
+        self.assertIn("providers", out)
+
+
+class TestProbeInnerPollTimeout(unittest.TestCase):
+    """v4.7.8：探针外层超时必须**晚于**内层轮询超时。
+
+    否则 media_gen 在落盘前被 run_capture 杀掉 → 已受理的付费任务永久丢失，
+    而 `_execute_smoke` 提示的"用 harvest 收割"无记录可收（提示指向不存在的路径）。"""
+
+    def test_inner_timeout_lt_outer(self):
+        import mg_caps
+        self.assertLess(mg_caps.inner_poll_timeout(300), 300,
+                        "内层轮询超时必须小于外层，media_gen 才能先主动落盘")
+        self.assertGreaterEqual(mg_caps.inner_poll_timeout(300), 60)
+        self.assertGreaterEqual(mg_caps.inner_poll_timeout(120), 60,
+                                "外层很短时内层也不能低于下限")
+
+    def test_cap_probe_cmd_carries_poll_timeout(self):
+        import mg_caps
+        with tempfile.TemporaryDirectory() as td:
+            cmd = mg_caps.cap_cmd("agnes", "image", "ref_image",
+                                  Path(td) / "o.png", 1, Path(td), timeout=300)
+        self.assertIn("--poll-timeout", cmd,
+                      "探针命令必须带内层超时，否则任务被外层杀在落盘前")
+        self.assertLess(int(cmd[cmd.index("--poll-timeout") + 1]), 300)
+
+    def test_real_smoke_cmd_carries_poll_timeout(self):
+        import mg_caps
+        seen = {}
+
+        def fake_exec(cmd, out, kind, **kw):
+            seen["cmd"] = cmd
+            return {"ok": False, "rc": 1}
+
+        with mock.patch.object(mg_caps, "_execute_smoke", side_effect=fake_exec):
+            mg_caps._real_smoke("agnes", "video", timeout=300)
+        self.assertIn("--poll-timeout", seen["cmd"])
+
+
+class TestEnvcheckRunnerNone(unittest.TestCase):
+    """v4.8.0：runner 异常被吞返回 None → 原 `r.stdout` AttributeError（体检直接崩）。"""
+
+    def test_runner_none_does_not_crash(self):
+        import envcheck
+        rs = envcheck.run_checks(runner=lambda cmd: None)
+        self.assertTrue(rs, "runner 返回 None 时仍应产出体检项（标 warn/skip 而非崩）")
+
+
+class TestPromptLintAtomicNull(unittest.TestCase):
+    """v4.8.0：shot JSON 里 `_atomic: null` → `None.get` AttributeError。"""
+
+    def test_atomic_null_does_not_crash(self):
+        import prompt_lint
+        lex = Path(__file__).resolve().parents[1] / "references" / "anti-slop-lexicon.md"
+        hard, mood = prompt_lint.parse_lexicon_md(lex)
+        shot = {"shot_id": "S1", "i2v_prompt": "x", "_atomic": None}
+        issues = prompt_lint.lint_shot(shot, "videos", hard, mood)
+        self.assertIsInstance(issues, list)
+
+
+class TestDelogoGeometry(unittest.TestCase):
+    """v4.8.0：水印框的分辨率解析与钳制。
+
+    ① 带封面图的 mp4 会先列 mjpeg 缩略图 → 原 `re.search` 取首个匹配拿到 320x240，
+       框位整体算错（已实证）；② 钳制用 OR 触发且不校验不变式：框比画面还大时
+       钳完仍越界，还打印"已钳制"（假象）。"""
+
+    def _mod(self):
+        import importlib.util
+        src = Path(__file__).resolve().parents[1] / "scripts" / "delogo_watermark.py"
+        spec = importlib.util.spec_from_file_location("reelcraft_delogo", src)
+        m = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(m)
+        return m
+
+    def test_parse_size_skips_mjpeg_cover(self):
+        m = self._mod()
+        stderr = ("  Stream #0:0(eng): Video: mjpeg, yuvj420p, 320x240\n"
+                  "  Stream #0:1(eng): Video: h264, yuv420p, 1920x1080\n")
+        self.assertEqual(m.parse_size(stderr), (1920, 1080),
+                         "带封面图应跳过 mjpeg 缩略图取真实视频流分辨率")
+
+    def test_parse_size_plain(self):
+        m = self._mod()
+        self.assertEqual(m.parse_size("  Stream #0:0: Video: h264, 1280x720\n"), (1280, 720))
+
+    def test_parse_size_none(self):
+        m = self._mod()
+        self.assertIsNone(m.parse_size("no video line"))
+
+    def test_clamp_box_in_range(self):
+        m = self._mod()
+        self.assertEqual(m.clamp_box(10, 20, 54, 56, 1280, 720), (10, 20, 54, 56))
+
+    def test_clamp_box_over_edge_stays_inside(self):
+        m = self._mod()
+        x, y, w, h = m.clamp_box(1260, 700, 54, 56, 1280, 720)
+        self.assertLess(x + w, 1280, "钳制后框必须真的在画面内")
+        self.assertLess(y + h, 720)
+        self.assertGreaterEqual(x, 1)
+        self.assertGreaterEqual(y, 1)
+
+    def test_clamp_box_too_big_dies(self):
+        m = self._mod()
+        with self.assertRaises(SystemExit):
+            m.clamp_box(0, 0, 2000, 2000, 1280, 720)
+
+
+class TestTtsSlotSingleSource(unittest.TestCase):
+    """v4.8.0：TTS 槽位枚举单源。
+
+    audio_triage 曾自带 `_scan_tts_slot` 副本，与 mg_core.scan_tts_slots 口径
+    不一致（status 说"已配"、triage 说"未配"）。这里断言二者**判定一致**：
+    半配槽（只有 BASE 或只有 KEY）不给出，但也不中断后续枚举。"""
+
+    def test_skips_half_configured_but_keeps_scanning(self):
+        import audio_triage as at
+        import mg_core
+        env = {"MEDIA_TTS_2_BASE": "http://half/v1",           # 半配
+               "MEDIA_TTS_3_KEY": "k3", "MEDIA_TTS_3_BASE": "http://c/v1"}
+        n, base, key = at._scan_tts_slot(env)
+        self.assertEqual((n, base, key), (3, "http://c/v1", "k3"),
+                         "半配槽不能中断枚举（须与 mg_core.scan_tts_slots 同口径）")
+        self.assertIn(n, mg_core.scan_tts_slots(env),
+                      "枚举结果必须是 mg_core 槽位表的子集（单源）")
+
+    def test_first_ready_slot_wins(self):
+        import audio_triage as at
+        env = {"MEDIA_TTS_1_KEY": "k1", "MEDIA_TTS_1_BASE": "http://a/v1",
+               "MEDIA_TTS_2_KEY": "k2", "MEDIA_TTS_2_BASE": "http://b/v1"}
+        self.assertEqual(at._scan_tts_slot(env), (1, "http://a/v1", "k1"))
+
+    def test_none_ready(self):
+        import audio_triage as at
+        self.assertEqual(at._scan_tts_slot({}), (0, "", ""))
+
+
+class TestOnlyWithTransition(unittest.TestCase):
+    """批二：--only × 过渡镜兼容（hybrid 核心场景）。
+
+    过渡镜是两镜之间的"桥"：邻居在本次运行 → pass2 接上；已有历史产物 → skip (exists)；
+    from 镜带不动（不在 --only 且无历史产物）→ 排除并提示，不留在计划里刷 MISS。"""
+
+    def _run(self, td: Path, only: str):
+        import subprocess as sp
+        mg = Path(__file__).resolve().parents[1] / "scripts" / "media_gen.py"
+        env = {**os.environ, "PYTHONUTF8": "1",
+               "MEDIA_AGNES_1_KEY": "k1", "MEDIA_AGNES_1_BASE": "https://example.invalid/v1"}
+        cmd = [sys.executable, str(mg), "batch", str(td), "--phase", "videos",
+               "--provider", "agnes", "--workers", "1", "--dry-run",
+               "--only", only]
+        return sp.run(cmd, capture_output=True, text=True, encoding="utf-8", env=env)
+
+    def _setup(self, td: Path, s1_clip: bool = False):
+        """S1/S2 普通镜 + S1T 过渡镜（JSON 永远齐全——孤儿依赖该 die 是另一条防线）。"""
+        (td / "frames").mkdir()
+        (td / "clips").mkdir()
+        (td / "frames" / "S1.png").write_bytes(b"f1")
+        (td / "frames" / "S2.png").write_bytes(b"f2")
+        (td / "shot_01.json").write_text(json.dumps(
+            {"shot_id": "S1", "t2i_prompt": "x", "i2v_prompt": "y"}), encoding="utf-8")
+        (td / "shot_02.json").write_text(json.dumps(
+            {"shot_id": "S2", "t2i_prompt": "x", "i2v_prompt": "y"}), encoding="utf-8")
+        (td / "shot_01T.json").write_text(json.dumps(
+            {"shot_id": "S1T", "transition": {"from": "S1", "to": "S2"},
+             "i2v_prompt": "m"}), encoding="utf-8")
+        if s1_clip:
+            (td / "clips" / "clip_S1.mp4").write_bytes(b"c1")
+
+    def test_only_keeps_adjacent_transition(self):
+        """邻居在本次 --only 里 → 过渡镜保留（hybrid 核心场景）。"""
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            self._setup(td)
+            r = self._run(td, "S1,S2")
+            self.assertEqual(r.returncode, 0, r.stderr[-300:])
+            self.assertIn("S1T", r.stdout, "--only 把过渡镜整个滤掉了——hybrid 出不了过渡")
+
+    def test_only_keeps_transition_with_from_history(self):
+        """from 镜不在本次运行但有历史 clip → seed 能从历史产物抽，过渡镜保留。"""
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            self._setup(td, s1_clip=True)
+            r = self._run(td, "S2")
+            self.assertEqual(r.returncode, 0, r.stderr[-300:])
+            self.assertIn("S1T", r.stdout, "from 有历史产物就能抽 seed，不该丢")
+
+    def test_only_drops_unrunnable_transition_loudly(self):
+        """from 镜不在 --only 且无任何历史产物 → 排除并提示（不留在计划里刷 MISS）。"""
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            self._setup(td)
+            r = self._run(td, "S2")
+            self.assertEqual(r.returncode, 0, r.stderr[-300:])
+            self.assertNotIn("S1T ->", r.stdout, "带不动的过渡镜不该出现在计划里")
+            self.assertIn("S1T", r.stderr, "排除必须留痕，不能无声")
+
+
+
+
+class TestCleanIntermediateFiles(unittest.TestCase):
+    """S5：concat 的 _norm/_mixed/_with_text 中间文件必须纳入 clean 治理面。
+
+    v4.7 审计 P2：这些可再生中间产物会留在工作区越积越多，clean 只认
+    frames/clips 等目录，散落在 clips/ 里的 _norm.mp4 等文件扫不到。
+    """
+
+    def test_norm_mixed_in_clean_plan(self):
+        import pipeline
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            (td / "clips").mkdir()
+            (td / "clips" / "_norm.mp4").write_bytes(b"n")
+            (td / "clips" / "_mixed.mp4").write_bytes(b"m")
+            (td / "clips" / "clip_S1.mp4").write_bytes(b"c")
+            plan = pipeline.plan_clean(td)
+            removed = [p.name for p in plan["remove"]]
+            self.assertIn("_norm.mp4", removed, "_norm.mp4 应属可再生中间产物")
+            self.assertIn("_mixed.mp4", removed, "_mixed.mp4 应属可再生中间产物")
+            self.assertIn("clip_S1.mp4", removed, "clip 产物本来就在治理面")
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

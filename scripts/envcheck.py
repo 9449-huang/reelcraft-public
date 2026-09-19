@@ -103,7 +103,11 @@ def check_runtime(env: dict | None = None, runner=None) -> list:
     # libx264（concat/kenburns/qcgate 都依赖）
     if ffmpeg and runner:
         r = runner([ffmpeg, "-hide_banner", "-encoders"])
-        if "libx264" in (r.stdout or ""):
+        # runner 异常时返回 None（v4.8.0 修：原直接 r.stdout → AttributeError 把体检打崩）
+        if r is None:
+            out.append(_result("libx264", "warn",
+                               "编码器探测失败（runner 异常/超时）——本地服务类失败不影响开跑"))
+        elif "libx264" in (r.stdout or ""):
             out.append(_result("libx264", "ok", "编码器可用"))
         else:
             out.append(_result("libx264", "fail", "ffmpeg 无 libx264 编码器——后期全挂"))

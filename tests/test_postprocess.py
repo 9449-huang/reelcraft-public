@@ -171,6 +171,65 @@ class TestQcSeq(unittest.TestCase):
         self.assertNotIn("qcseq", r.stdout, "--no-qcseq 应跳过粗检")
 
 
+@unittest.skipUnless(not _slow, 'slow: SLOW=1 启用')
+class TestSingleTrackKeepsPicture(unittest.TestCase):
+    """单路音频（静帧成片 + 仅旁白）走 acopy 时，画面不得被 -shortest 截到音频长度。
+
+    v4.7.7 修 P0：单路分支 `pad=""` 不给 apad → 音轨长 = adelay+旁白 < 画面 →
+    `-shortest` 以最短流收尾。实证（修复前）：10s 画面 + 3s 旁白(adelay 1s)
+    → 成片 4.02s，rc=0，画面尾部静默丢失。stills 档 + --voice 是常态组合。"""
+
+    def test_picture_length_kept_over_short_voice(self):
+        import argparse
+        import subprocess as sp
+        import postprocess as pp
+        ff = pp._ffmpeg()
+        d = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        clips = d / "clips"
+        clips.mkdir()
+        v, a = clips / "clip_01.mp4", d / "vo.m4a"
+        sp.run([ff, "-y", "-loglevel", "error", "-f", "lavfi",
+                "-i", "color=c=blue:s=320x240:d=10", "-c:v", "libx264",
+                "-pix_fmt", "yuv420p", str(v)], check=True)
+        sp.run([ff, "-y", "-loglevel", "error", "-f", "lavfi",
+                "-i", "sine=f=440:d=3", "-c:a", "aac", str(a)], check=True)
+        out = d / "final.mp4"
+        ns = argparse.Namespace(clips=str(clips), out=str(out), target_res="320x240",
+                                xfade="0", freeze_last=0.0, voice=str(a), bgm="",
+                                ambient_db=0.0, voice_delay=1.0, voice_db=0.0, bgm_db=-18.0,
+                                subtitles="", slogan="", slogan_at=-1.0,
+                                slogan_position="left", slogan_fade=0.3)
+        pp.cmd_concat(ns)
+        self.assertTrue(out.exists(), "concat 未产出成片")
+        dur = pp.probe(str(out))["duration"]
+        self.assertGreaterEqual(
+            dur, 9.5, f"成片 {dur}s < 画面 10s —— 画面被 -shortest 截到旁白长度")
+
+
+class TestQcTimes(unittest.TestCase):
+    """v4.8.0：qcgate 抽帧时间点。
+
+    原来 `info.get("duration", 5.0)` 兜底 → probe 解析不出 Duration 时（如
+    异常容器/webp）30s 的片只测开头 5s，后半段黑帧/静帧全漏检却打 PASS。"""
+
+    def test_known_duration_spans_full_clip(self):
+        import postprocess as pp
+        ts = pp.qc_times(30.0, 6)
+        self.assertEqual(len(ts), 6)
+        self.assertAlmostEqual(ts[0], 0.0)
+        self.assertAlmostEqual(ts[-1], 30.0)
+
+    def test_single_frame_mid(self):
+        import postprocess as pp
+        self.assertEqual(pp.qc_times(10.0, 1), [5.0])
+
+    def test_unknown_duration_does_not_fake_5s(self):
+        import postprocess as pp
+        self.assertEqual(pp.qc_times(0.0, 6), [0.0],
+                         "时长未知不能假装 5s 均布（会把后半段漏检）")
+        self.assertEqual(pp.qc_times(None, 6), [0.0])
+
+
 class TestQcseqErrorStops(unittest.TestCase):
     """P2-2 修复：qcseq exit 2（真错误）必须中断 pipeline，只有 exit 1（WARN）放行。"""
 
@@ -191,7 +250,8 @@ class TestQcseqErrorStops(unittest.TestCase):
                                 bgm="", bgm_db=-18.0, subtitles="", slogan="",
                                 slogan_position="left", watermark="", watermark_dry_run=False,
                                 sound_lines="", sound_voice="", sound_speed=1.0,
-                                sound_skip_tts=False, sound_auto_shift=False, sound_gap=0.3)
+                                sound_skip_tts=False, sound_auto_shift=False, sound_gap=0.3,
+                                no_audio_qc=False, audio_qc_strict=False, no_faces=False)
 
         def fake_run(cmd, dry, log):
             # 只有 qcseq 调用返回 2（输入错误），其余阶段放行
@@ -221,7 +281,8 @@ class TestQcseqErrorStops(unittest.TestCase):
                                 bgm="", bgm_db=-18.0, subtitles="", slogan="",
                                 slogan_position="left", watermark="", watermark_dry_run=False,
                                 sound_lines="", sound_voice="", sound_speed=1.0,
-                                sound_skip_tts=False, sound_auto_shift=False, sound_gap=0.3)
+                                sound_skip_tts=False, sound_auto_shift=False, sound_gap=0.3,
+                                no_audio_qc=False, audio_qc_strict=False, no_faces=False)
 
         def fake_run(cmd, dry, log):
             if any("qcseq" in str(c) for c in cmd):
@@ -658,6 +719,94 @@ class TestSubtitlePreset(unittest.TestCase):
 
 
 @unittest.skipUnless(not _slow, "slow: SLOW=1 启用")
+class TestMixedAudioConcatEndToEnd(unittest.TestCase):
+    """决定性验证（历史教训：rc=0 ≠ 对）。
+
+    混编（一片有音轨 + 一片无音轨，hybrid 模式常态）时 concat 产物**必须真的有音轨**。
+    修前 `all(audio)` 判定会让整卷静默无声、但 rc=0——只有内容级探测能发现。
+    """
+
+    def _mk(self, ff: str, out: Path, with_audio: bool) -> None:
+        import subprocess as sp
+        cmd = [ff, "-y", "-loglevel", "error",
+               "-f", "lavfi", "-i", "color=c=blue:s=320x240:d=2:r=24"]
+        if with_audio:
+            cmd += ["-f", "lavfi", "-i", "sine=frequency=440:duration=2"]
+        cmd += ["-c:v", "libx264", "-pix_fmt", "yuv420p"]
+        if with_audio:
+            cmd += ["-c:a", "aac", "-shortest"]
+        cmd += [str(out)]
+        r = sp.run(cmd, capture_output=True, text=True, timeout=120)
+        self.assertEqual(r.returncode, 0, r.stderr[-300:])
+
+    def _concat(self, clips: Path, out: Path):
+        import subprocess as sp
+        return sp.run([sys.executable,
+                       str(Path(__file__).resolve().parents[1] / "scripts" / "postprocess.py"),
+                       "concat", str(clips), "--out", str(out)],
+                      capture_output=True, text=True, timeout=300, encoding="utf-8")
+
+    def test_mixed_audio_keeps_track(self):
+        import postprocess as pp
+        ff = pp._ffmpeg()
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td)
+            clips = d / "clips"
+            clips.mkdir()
+            self._mk(ff, clips / "clip_S1.mp4", with_audio=True)
+            self._mk(ff, clips / "clip_S2.mp4", with_audio=False)
+            out = d / "final.mp4"
+            r = self._concat(clips, out)
+            self.assertEqual(r.returncode, 0,
+                             (r.stdout or "")[-300:] + (r.stderr or "")[-300:])
+            self.assertTrue(pp.probe(str(out)).get("audio"),
+                            "混编时音轨被丢弃了（all() 判定回归）——成片会静默无声")
+
+    def test_all_silent_stays_silent(self):
+        """全无音轨时不凭空造音轨（避免引入空音轨改变既有行为）。"""
+        import postprocess as pp
+        ff = pp._ffmpeg()
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td)
+            clips = d / "clips"
+            clips.mkdir()
+            self._mk(ff, clips / "clip_S1.mp4", with_audio=False)
+            self._mk(ff, clips / "clip_S2.mp4", with_audio=False)
+            out = d / "final.mp4"
+            r = self._concat(clips, out)
+            self.assertEqual(r.returncode, 0, (r.stderr or "")[-300:])
+            self.assertFalse(pp.probe(str(out)).get("audio"))
+
+    def test_voice_only_on_silent_clips(self):
+        """stills 档常态：静帧成片 + 只加旁白（无环境音、无 BGM）。
+
+        历史（2026-09 实测）：amix 要求 ≥2 输入，`amix=inputs=1` 会让 ffmpeg
+        **无限挂起**（不报错、不退出）；修的过程中还一度把 run() 缩进在 amix
+        分支内 → rc=0 但旁白被静默丢弃。本测试同时钉死这两种回归。
+        """
+        import postprocess as pp
+        import subprocess as sp
+        ff = pp._ffmpeg()
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td)
+            clips = d / "clips"
+            clips.mkdir()
+            self._mk(ff, clips / "clip_S1.mp4", with_audio=False)
+            self._mk(ff, clips / "clip_S2.mp4", with_audio=False)
+            vo = d / "vo.m4a"
+            sp.run([ff, "-y", "-loglevel", "error", "-f", "lavfi", "-i",
+                    "sine=frequency=440:duration=3", str(vo)], check=True, timeout=60)
+            out = d / "final.mp4"
+            r = sp.run([sys.executable,
+                        str(Path(__file__).resolve().parents[1] / "scripts" / "postprocess.py"),
+                        "concat", str(clips), "--out", str(out), "--voice", str(vo)],
+                       capture_output=True, text=True, timeout=120, encoding="utf-8")
+            self.assertEqual(r.returncode, 0, (r.stderr or "")[-300:])
+            self.assertTrue(pp.probe(str(out)).get("audio"),
+                            "单路旁白被静默丢弃（run 缩进/amix 分支回归）")
+
+
+@unittest.skipUnless(not _slow, "slow: SLOW=1 启用")
 class TestSrtBurnEndToEnd(unittest.TestCase):
     """srt 导入 + 预设烧录端到端：lavfi 造 3s 片 → srt 文件 → concat 真跑 → 抽帧验证字幕存在。
 
@@ -699,6 +848,83 @@ class TestSrtBurnEndToEnd(unittest.TestCase):
                 px = list(im.convert("RGB").getdata())
             whites = sum(1 for p in px if p[0] > 230 and p[1] > 230 and p[2] > 230)
             self.assertGreater(whites, 50, "1s 处应有白色字幕像素——srt 没烧进去")
+
+
+class TestDurationVerdict(unittest.TestCase):
+    """P1：时长解析失败时旧逻辑兜底成 0 → `0 <= max` 恒真 → 规格门禁形同虚设（假合格）。"""
+
+    def test_unknown_duration_is_not_ok(self):
+        import postprocess as pp
+        level, msg = pp.duration_verdict({}, 120.0)
+        self.assertEqual(level, "warn", "拿不到时长 ≠ 合规")
+        self.assertIn("无法", msg)
+
+    def test_over_limit_is_fail(self):
+        import postprocess as pp
+        level, msg = pp.duration_verdict({"duration": 300.0}, 120.0)
+        self.assertEqual(level, "fail")
+        self.assertIn("300", msg)
+
+    def test_within_limit_is_ok(self):
+        import postprocess as pp
+        self.assertEqual(pp.duration_verdict({"duration": 30.0}, 120.0)[0], "ok")
+
+    def test_zero_limit_skips_check(self):
+        """max_duration<=0 = 不校验（与 qcgate 原语义一致，别把"关掉校验"判成失败）。"""
+        import postprocess as pp
+        self.assertEqual(pp.duration_verdict({"duration": 99.0}, 0)[0], "ok")
+
+    def test_check_never_prints_ok_for_unknown_duration(self):
+        """行为级：ffprobe 拿不到时长时，check 的输出里不得出现 [OK] duration。"""
+        import argparse
+        import contextlib
+        import io
+        import postprocess as pp
+        buf = io.StringIO()
+        with mock.patch.object(pp, "probe", return_value={}), \
+             contextlib.redirect_stdout(buf):
+            with self.assertRaises(SystemExit):
+                pp.cmd_check(argparse.Namespace(path="x.mp4", min_res="1280x720",
+                                                max_duration=120.0, min_fps=24.0))
+        out = buf.getvalue()
+        self.assertNotIn("[OK] duration", out, "时长无法判定却报 OK —— 假合格回归了")
+        self.assertIn("[WARN]", out)
+
+    def test_qcgate_unknown_duration_is_warn_not_pass(self):
+        """真跑 ffmpeg：文件正常但 probe 报不出时长 → 只应有 WARN，且非 strict 时 rc=0。"""
+        import argparse
+        import contextlib
+        import io
+        import subprocess
+        import postprocess as pp
+        ff = pp._ffmpeg()
+        with tempfile.TemporaryDirectory() as td:
+            f = Path(td) / "ok.mp4"
+            subprocess.run([ff, "-y", "-loglevel", "error", "-f", "lavfi", "-i",
+                            "color=c=gray:s=320x240:d=2:r=24", "-c:v", "libx264",
+                            "-pix_fmt", "yuv420p", str(f)], check=True)
+            buf = io.StringIO()
+            # 只屏蔽时长：其余字段照真（抽帧能成功，避免"抽帧失败"的 FAIL 干扰判定）
+            with mock.patch.object(pp, "probe",
+                                   return_value={"width": 320, "height": 240, "fps": 24.0}), \
+                 contextlib.redirect_stdout(buf):
+                with self.assertRaises(SystemExit) as cm:
+                    pp.cmd_qcgate(argparse.Namespace(
+                        path=str(f), min_res="320x240", max_duration=120.0,
+                        min_fps=24.0, frames=3, black_th=8.0, white_th=245.0,
+                        motion_th=0.5, strict=False))
+            out = buf.getvalue()
+            self.assertIn("时长无法判定", out, "时长未知必须显式报出来")
+            self.assertEqual(cm.exception.code, 0, "非 strict 下 WARN 不该拦")
+            with mock.patch.object(pp, "probe",
+                                   return_value={"width": 320, "height": 240, "fps": 24.0}), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                with self.assertRaises(SystemExit) as cm2:
+                    pp.cmd_qcgate(argparse.Namespace(
+                        path=str(f), min_res="320x240", max_duration=120.0,
+                        min_fps=24.0, frames=3, black_th=8.0, white_th=245.0,
+                        motion_th=0.5, strict=True))
+            self.assertEqual(cm2.exception.code, 2, "--strict 下 WARN 应升级为 FAIL")
 
 
 if __name__ == '__main__':

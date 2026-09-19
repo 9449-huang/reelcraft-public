@@ -24,7 +24,8 @@
   media_gen.py caps sync [--check]                   # 实测快照 ↔ model-capabilities.md 单源同步
 """
 from __future__ import annotations
-from mg_core import PROVIDERS, die, list_keys, run_capture
+from mg_core import (PROVIDERS, die, keyframes_supported, list_keys,
+                     ref_image_supported, run_capture)
 from mg_status import _probe_models
 import argparse
 import json
@@ -150,7 +151,9 @@ def _real_smoke(pool: str, kind: str, *, model: str = "", size: str = "",
         out = Path(td) / (f"caps_smoke.{'mp4' if kind == 'video' else 'png'}")
         cmd = [sys.executable, mg, "video" if kind == "video" else "image",
                "--prompt", SMOKE_PROMPT, "--out", str(out),
-               "--provider", pool, "--pin-key", str(pin)]
+               "--provider", pool, "--pin-key", str(pin),
+               # 内层先超时 → media_gen 主动落盘 pending + exit 4（任务可 harvest 收割）
+               "--poll-timeout", str(inner_poll_timeout(timeout))]
         if size:
             cmd += ["--video-size" if kind == "video" else "--size", size]
         if kind == "video" and image:
@@ -159,43 +162,144 @@ def _real_smoke(pool: str, kind: str, *, model: str = "", size: str = "",
         if model:
             # 模型只能经 env 覆盖（CLI 无 --model：模型是 key 的属性不是请求参数）
             env[f"MEDIA_{pool.upper()}_1_{kind.upper()}_MODEL"] = model
-        t0 = time.time()
-        try:
-            r = run_capture(cmd, timeout=timeout, env=env)
-            tail = (r.stderr or "").strip().splitlines()
-            err = "\n".join(tail[-6:])[:600]
-            rc, timed_out = r.returncode, False
-        except subprocess.TimeoutExpired:
-            rc, timed_out, err = -1, True, f"超时 {timeout}s（任务可能仍在生成，用 harvest 收割）"
-
-        res: dict[str, Any] = {
-            "method": "real-smoke",
-            "probed_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "probed_at_ts": time.time(),
-            "elapsed_s": round(time.time() - t0, 1),
-            "model": model or ((PROVIDERS.get(pool, {}).get("models") or {})
-                               .get(kind, {}).get("default", "")),
-            "requested_size": size or "",
-            "i2v": bool(image),
-            "timeout": timed_out,
-            "rc": rc,
-        }
-        produced = out if out.exists() else None
-        if produced is None:
-            # 视频可能被 _final_out 改成 .webp —— 按产物白名单找真实落点
-            from mg_core import PRODUCT_EXTS
-            for ext in PRODUCT_EXTS:
-                cand = out.with_suffix(ext)
-                if cand.exists() and cand.stat().st_size > 0:
-                    produced = cand
-                    break
-        if produced is not None and produced.stat().st_size > 0:
-            res.update(ok=True)
-            res.update(_measure(produced, kind))
-            res["out_name"] = produced.name
-        else:
-            res.update(ok=False, error=err or f"rc={rc}，无产物")
+        res = _execute_smoke(cmd, out, kind, timeout=timeout, env=env,
+                             model=model or ((PROVIDERS.get(pool, {}).get("models") or {})
+                                             .get(kind, {}).get("default", "")),
+                             requested=size, image=bool(image))
+        res["method"] = "real-smoke"
         return res
+
+
+def _execute_smoke(cmd: list[str], out: Path, kind: str, *, timeout: int,
+                   env: dict | None = None, model: str = "",
+                   requested: str = "", image: bool = False) -> dict:
+    """执行探针命令 → 产物测量 → 统一 result 结构。
+
+    **唯一实现**：_real_smoke（池级）与 _cap_smoke（能力级）共用——
+    落点后缀纠正、超时协议、产物测量这些真实路径细节写两遍必漂移。"""
+    t0 = time.time()
+    try:
+        r = run_capture(cmd, timeout=timeout, env=env)
+        tail = (r.stderr or "").strip().splitlines()
+        err = "\n".join(tail[-6:])[:600]
+        rc, timed_out = r.returncode, False
+    except subprocess.TimeoutExpired:
+        rc, timed_out, err = -1, True, f"超时 {timeout}s（任务可能仍在生成，用 harvest 收割）"
+
+    res: dict[str, Any] = {
+        "probed_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "probed_at_ts": time.time(),
+        "elapsed_s": round(time.time() - t0, 1),
+        "model": model,
+        "requested_size": requested,
+        "i2v": image,
+        "timeout": timed_out,
+        "rc": rc,
+    }
+    produced = out if out.exists() else None
+    if produced is None:
+        # 视频可能被 _final_out 改成 .webp —— 按产物白名单找真实落点
+        from mg_core import PRODUCT_EXTS
+        for ext in PRODUCT_EXTS:
+            cand = out.with_suffix(ext)
+            if cand.exists() and cand.stat().st_size > 0:
+                produced = cand
+                break
+    if produced is not None and produced.stat().st_size > 0:
+        res.update(ok=True)
+        res.update(_measure(produced, kind))
+        res["out_name"] = produced.name
+    else:
+        res.update(ok=False, error=err or f"rc={rc}，无产物")
+    return res
+
+
+# ─── 能力级探针（批二）：把"实测过"从池级延伸到能力维度 ──
+# 池级冒烟只证"能出片"，不证"参考图真的锁脸 / 首尾帧真的插值"——
+# v4.7 实测踩过：顶层 image 被静默忽略、大图直传读超时，这类只有真跑才知道。
+_CAP_SPECS: dict[tuple[str, str], str] = {
+    ("image", "ref_image"): "多图参考（角色一致性）",
+    ("video", "keyframes"): "首尾帧插值（过渡镜）",
+}
+
+
+def cap_declared(pool: str, kind: str, cap: str) -> bool:
+    """池是否**声明**支持该能力。声明 ≠ 真的——真跑才算数，这正是探针存在的理由。"""
+    info = (PROVIDERS.get(pool, {}).get("models") or {}).get(kind) or {}
+    if (kind, cap) == ("image", "ref_image"):
+        return bool(ref_image_supported(info))
+    if (kind, cap) == ("video", "keyframes"):
+        return bool(keyframes_supported(info))
+    return False
+
+
+def _tiny_png(path: Path) -> None:
+    from PIL import Image
+    with Image.new("RGB", (64, 64), (180, 60, 60)) as im:
+        im.save(path, format="PNG", optimize=True)
+
+
+def inner_poll_timeout(outer: int) -> int:
+    """探针外层超时 → 传给 media_gen 的内层轮询超时。
+
+    v4.7.8 修 P0：外层 `run_capture(timeout=N)` 到点会**杀掉子进程**，而 pending
+    落盘只发生在 media_gen 自己的超时分支 → 被杀的进程来不及落盘，已受理（已扣费）
+    的任务永久丢失，且错误提示让用户"用 harvest 收割"根本无记录可收。
+    让内层先到点（主动落盘 + exit 4），外层再宽限。下限 60s 防外层配得过小。"""
+    return max(60, int(outer) - 60)
+
+
+def cap_cmd(pool: str, kind: str, cap: str, out: Path, pin: int, tmp: Path,
+            timeout: int = 300) -> list[str]:
+    """能力探针命令构造（fixture 图现场生成：64px 小图，规避大图直传超时约束）。
+
+    未声明就拒绝——探针本身要花一次真实额度，声明都没有的池测了也是白烧。"""
+    if (kind, cap) not in _CAP_SPECS:
+        die(f"未知能力探针 {kind}/{cap}。已知: "
+            + ", ".join(f"{k}/{c}" for k, c in _CAP_SPECS), 2)
+    if not cap_declared(pool, kind, cap):
+        die(f"{pool} 未声明支持 {cap}——探针只会白烧一次额度。"
+            f"确属新能力先在 PROVIDERS 模板声明（ref_image_style / keyframes_style）再测", 2)
+    mg = str(Path(__file__).resolve().parent / "media_gen.py")
+    cmd = [sys.executable, mg, "image" if kind == "image" else "video",
+           "--prompt", SMOKE_PROMPT, "--out", str(out), "--provider", pool,
+           "--pin-key", str(pin),
+           # 内层先超时 → media_gen 主动落盘 pending + exit 4（任务可 harvest 收割）
+           "--poll-timeout", str(inner_poll_timeout(timeout))]
+    if cap == "ref_image":
+        ref = tmp / "cap_ref.png"
+        _tiny_png(ref)
+        cmd += ["--ref-image", str(ref)]
+    else:                                   # keyframes
+        first, last = tmp / "cap_first.png", tmp / "cap_last.png"
+        _tiny_png(first)
+        _tiny_png(last)
+        cmd += ["--image", str(first), "--last-frame", str(last)]
+    return cmd
+
+
+def capability_view(pool: str) -> list[dict]:
+    """能力维度的 声明/实测 视图（权威规则与 effective() 一致：真测未过期才算数）。"""
+    caps_pool = load().get(pool) or {}
+    rows: list[dict] = []
+    for kind, cap in sorted(_CAP_SPECS):
+        m = caps_pool.get(f"{kind}:cap:{cap}")
+        stale = bool(m) and (time.time() - float(m.get("probed_at_ts", 0))) > CAPS_TTL
+        rows.append({"pool": pool, "kind": kind, "cap": cap,
+                     "declared": cap_declared(pool, kind, cap),
+                     "measured": None if stale else m, "stale": stale})
+    return rows
+
+
+def _cap_smoke(pool: str, kind: str, cap: str, pin: int = 1, timeout: int = 600) -> dict:
+    with tempfile.TemporaryDirectory(prefix="capsmoke_") as td:
+        tmp = Path(td)
+        out = tmp / (f"cap_smoke.{'mp4' if kind == 'video' else 'png'}")
+        cmd = cap_cmd(pool, kind, cap, out, pin, tmp, timeout=timeout)
+        res = _execute_smoke(cmd, out, kind, timeout=timeout)
+    res["method"] = "cap-smoke"
+    res["cap"] = cap
+    return res
 
 
 def _models_smoke(pool: str) -> dict:
@@ -274,13 +378,28 @@ def cmd_caps(args) -> None:
                 if not spec.get(kind) and not (load().get(p) or {}).get(kind):
                     continue        # 该池本来就没这个角色，不刷屏
                 print(_fmt_view(effective(p, kind)))
-        print("[caps] 提示：caps probe <pool> --kind video --real 可写入实测（权威）")
+            for r in capability_view(p):
+                if not (r["declared"] or r["measured"]):
+                    continue          # 既没声明也没测过，不刷屏
+                spec = _CAP_SPECS[(r["kind"], r["cap"])]
+                if r["measured"]:
+                    head = "实测✅" if r["measured"].get("ok") else "实测❌"
+                    st = f"{head} {r['measured'].get('probed_at', '')}" \
+                         + ("  ⚠ 已过期" if r["stale"] else "")
+                else:
+                    st = (f"声明未测（caps probe {p} --kind {r['kind']} "
+                          f"--cap {r['cap']} --real）")
+                print(f"    能力 {r['kind']}/{r['cap']}（{spec}）: {st}")
+        print("[caps] 提示：caps probe <pool> --kind video --real 可写入实测（权威）；"
+              "能力级加 --cap ref_image|keyframes")
         return
 
     # ─── probe ───
     if args.pool not in PROVIDERS:
         die(f"未知池 {args.pool!r}。已声明：{', '.join(PROVIDERS)}"
             f"（custom 通用池按 MEDIA_CUSTOM_<n>_* 序号命名，如 custom_2）", 2)
+    if not args.real and getattr(args, "cap", ""):
+        die("能力级探测必须 --real（/models 猜不出参数会不会被静默忽略——这正是它存在的理由）", 2)
     if not args.real:
         res = _models_smoke(args.pool)
         record(args.pool, f"{args.kind}:models", res)
@@ -291,14 +410,20 @@ def cmd_caps(args) -> None:
               f"{args.pool} --kind {args.kind} --real")
         return
 
-    print(f"[caps] 真实冒烟 {args.pool}/{args.kind}"
+    cap = getattr(args, "cap", "")
+    where = f"{args.kind}:cap:{cap}" if cap else args.kind
+    print(f"[caps] {'能力' if cap else '真实'}冒烟 {args.pool}/{args.kind}"
+          + (f"/{cap}" if cap else "")
           + (f" model={args.model}" if args.model else "")
           + (f" size={args.size}" if args.size else "")
           + (f" i2v={args.image}" if args.image else "")
           + f" timeout={args.timeout}s")
-    res = _real_smoke(args.pool, args.kind, model=args.model, size=args.size,
-                      image=args.image, timeout=args.timeout, pin=args.pin_key)
-    record(args.pool, args.kind, res)
+    if cap:
+        res = _cap_smoke(args.pool, args.kind, cap, pin=args.pin_key, timeout=args.timeout)
+    else:
+        res = _real_smoke(args.pool, args.kind, model=args.model, size=args.size,
+                          image=args.image, timeout=args.timeout, pin=args.pin_key)
+    record(args.pool, where, res)
     if res.get("ok"):
         print(f"[caps] ✅ 出片 {res.get('out_name')}  res={res.get('actual_res') or '?'}  "
               f"dur={res.get('duration_s', '-')}s  codec={res.get('codec', '-')}  "
@@ -325,6 +450,9 @@ def build_parser(sub) -> None:
     pr.add_argument("--model", default="", help="模型覆盖（经 env 注入，因模型是 key 的属性）")
     pr.add_argument("--size", default="", help="指定 size 实测（留空=用池默认）")
     pr.add_argument("--image", default="", help="i2v 实测：传首帧图路径")
+    pr.add_argument("--cap", default="", choices=["", "ref_image", "keyframes"],
+                    help="能力级实测：ref_image（参考图）/ keyframes（首尾帧插值）。"
+                         "fixture 图现场生成，须搭配 --real")
     pr.add_argument("--timeout", type=int, default=300, help="冒烟超时秒（默认 300）")
     pr.add_argument("--pin-key", type=int, default=1, help="用第几把 key 冒烟（默认 1）")
 

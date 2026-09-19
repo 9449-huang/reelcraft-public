@@ -49,14 +49,41 @@ def load_profile(provider: str) -> dict:
     return p
 
 
+def parse_size(stderr: str) -> tuple[int, int] | None:
+    """从 `ffmpeg -i` 的 stderr 取**真实视频流**分辨率（纯函数可单测）。
+
+    v4.8.0 修：带封面图的 mp4 会先列出 mjpeg 缩略图（如 320x240），原来
+    `re.search` 取**首个**匹配 → 框位按缩略图分辨率算错（已实证）。这里逐行扫、
+    跳过 mjpeg 流。"""
+    for line in stderr.splitlines():
+        if "Video:" not in line or "mjpeg" in line.lower():
+            continue
+        mm = re.search(r"(\d{2,5})x(\d{2,5})", line)
+        if mm:
+            return int(mm.group(1)), int(mm.group(2))
+    return None
+
+
+def clamp_box(x, y, w, h, W, H) -> tuple[int, int, int, int]:
+    """把水印框钳制到画面内（**每维独立**，保 1px 边）。
+
+    v4.8.0 修：原实现 `if x+w>=W or y+h>=H` 一刀切 + 钳后不校验不变式——
+    框比画面还大时 `min(x, W-w-1)` 得负值再被 `max(1, …)` 抬回 1，框仍越界，
+    却打印"已钳制"（假象）。这里先拒绝放不下的框，再逐维钳制。"""
+    if w >= W - 2 or h >= H - 2:
+        die(f"水印框 {w}x{h} 相对画面 {W}x{H} 太大（每维至少留 2px）——"
+            f"检查 --w/--h 或档案里的 base_res")
+    return max(1, min(int(x), W - w - 1)), max(1, min(int(y), H - h - 1)), w, h
+
+
 def probe_size(ff: str, src: Path) -> tuple[int, int]:
     """从 `ffmpeg -i` 的 stderr 解析视频分辨率。"""
     r = subprocess.run([ff, "-i", str(src)], capture_output=True, text=True,
                        encoding="utf-8", errors="replace")
-    m = re.search(r"Video:.*?(\d{2,5})x(\d{2,5})", r.stderr)
-    if not m:
+    size = parse_size(r.stderr)
+    if not size:
         die("无法从 ffmpeg 输出解析分辨率，请用 --x/--y/--w/--h 手动指定")
-    return int(m.group(1)), int(m.group(2))
+    return size
 
 
 def scale_box(box, bw, bh, W, H):
@@ -109,10 +136,10 @@ def main() -> None:
     # delogo 硬约束：框须完全在画面内且至少留 1px 边
     if w < 8 or h < 8:
         die("水印框太小（至少 8x8）")
-    if x + w >= W or y + h >= H:
-        x = max(1, min(x, W - w - 1))
-        y = max(1, min(y, H - h - 1))
-        print(f"[warn] 框超出画面，已钳制到 ({x},{y},{w},{h})")
+    _nx, _ny, w, h = clamp_box(x, y, w, h, W, H)
+    if (_nx, _ny) != (x, y):
+        print(f"[warn] 框超出画面，已钳制到 ({_nx},{_ny},{w},{h})")
+    x, y = _nx, _ny
 
     # 自检图公共参数：水印区外扩 3 倍、3x 放大
     cx, cy = max(0, x - w * 3), max(0, y - h * 3)

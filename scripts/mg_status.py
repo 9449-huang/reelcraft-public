@@ -8,6 +8,7 @@ from mg_core import (
     die,
     key_mask,
     list_keys,
+    scan_tts_slots,
     run_capture,
 )
 import argparse
@@ -101,6 +102,29 @@ def _probe_models(base: str, key: str) -> dict | None:
             guess[role] = hits[:6]          # 每角色最多展示 6 个，防刷屏
     return {"total": len(ids), "guess": guess}
 
+def fmt_capability_rows(rows: list[dict]) -> list[str]:
+    """能力档案汇总行（批四 A）：声明/实测/过期一眼可见。
+
+    明细在 caps show——这里只做一行/池的粗粒度汇总，让 status（第一入口）
+    不再对"哪些池真测过 ref_image/keyframes"一无所知。纯函数可测。"""
+    lines: list[str] = []
+    for r in rows:
+        cap = f"{r['kind']}:{r['cap']}"
+        if r["stale"]:
+            # capability_view 对过期实测置 measured=None 只留 stale 标志——
+            # 这里必须先判 stale，否则过期档被冒充成"声明未测"（丢信息）
+            mark = "实测已过期（超 7 天）"
+        elif r["measured"] is not None:
+            ok = r["measured"].get("ok")
+            mark = "实测✅" if ok else "实测❌"
+        elif r["declared"]:
+            mark = "声明未测"
+        else:
+            mark = "未声明"
+        lines.append(f"  {r['pool']}/{cap}: {mark}")
+    return lines
+
+
 def cmd_status(args) -> None:
     state = _load_state() or {}
     print(json.dumps({"providers": {p: PROVIDERS[p]["label"] for p in PROVIDERS},
@@ -133,19 +157,37 @@ def cmd_status(args) -> None:
                 extra.append(f"sizes={len(k['image_sizes'])}项自填")
             suffix = f"  [{' '.join(extra)}]" if extra else ""
             print(f"  {p} key#{k['n']}: {key_mask(k['key'])}  base={k['base']}{suffix}")
-    # ─── TTS 池（cmd_tts 硬编码用 MEDIA_TTS_1_*；同步合成模式与 image/video 异步任务
-    # 不同构，不入 PROVIDERS 走通用枚举，这里单独显示/探测）───
-    tts_key = os.environ.get("MEDIA_TTS_1_KEY", "")
-    tts_base = os.environ.get("MEDIA_TTS_1_BASE", "").rstrip("/")
-    tts_model = os.environ.get("MEDIA_TTS_1_MODEL", "")
-    tts_ok = bool(tts_key and tts_base)
+    # ─── TTS 池（与 cmd_tts 共用 mg_core.scan_tts_slots：槽位口径必须一致）───
+    # 同步合成模式与 image/video 异步任务不同构，不入 PROVIDERS 走通用枚举，这里单独显示/探测
+    tts_slots = scan_tts_slots(os.environ)
+    tts_ok = bool(tts_slots)
+    _first = tts_slots[0] if tts_slots else 0
+    tts_key = os.environ.get(f"MEDIA_TTS_{_first}_KEY", "") if _first else ""
+    tts_base = os.environ.get(f"MEDIA_TTS_{_first}_BASE", "").rstrip("/") if _first else ""
+    tts_model = os.environ.get(f"MEDIA_TTS_{_first}_MODEL", "") if _first else ""
     if tts_ok:
-        print(f"  tts key#1: {key_mask(tts_key)}  base={tts_base}"
-              f"  model={tts_model or 'cosyvoice-v1(缺省)'}")
+        for _n in tts_slots:
+            _k = os.environ.get(f"MEDIA_TTS_{_n}_KEY", "")
+            _b = os.environ.get(f"MEDIA_TTS_{_n}_BASE", "").rstrip("/")
+            _m = os.environ.get(f"MEDIA_TTS_{_n}_MODEL", "")
+            print(f"  tts key#{_n}: {key_mask(_k)}  base={_b}"
+                  f"  model={_m or 'cosyvoice-v1(缺省)'}")
     else:
         no_keys.append("tts")
     if no_keys:
         print(f"  {'/'.join(no_keys)}: 未配置 key（{KEY_ENV_FILE}）")
+    # ─── 能力档案汇总（批四 A：声明/实测/过期一眼可见；明细看 caps show）───
+    # 延迟 import：mg_caps 顶层引用 mg_status._probe_models，顶层 import 会循环。
+    # caps 档案损坏不能拖垮 status（load 抛异常时静默跳过该段）。
+    try:
+        import mg_caps
+        rows = [r for p in PROVIDERS for r in mg_caps.capability_view(p)]
+        cap_lines = fmt_capability_rows(rows)
+        if cap_lines:
+            print("  —— 能力档案（声明/实测；明细与真探针见 caps show）——")
+            print("\n".join(cap_lines))
+    except Exception as e:
+        print(f"  [能力档案不可用: {e}]")
     if getattr(args, "no_probe", False):
         return
     print("  —— /models 能力探测（启发式猜的，仅供参考；能否真用以实跑为准）——")
@@ -175,18 +217,18 @@ def cmd_status(args) -> None:
                 treq.add_header("Content-Type", "application/json")
                 with urllib.request.urlopen(treq, timeout=15) as r:
                     nbytes = len(r.read())
-                print(f"    tts key#1: 合成探测✅ ({nbytes // 1024}KB, voice={v} 小样)")
+                print(f"    tts key#{_first}: 合成探测✅ ({nbytes // 1024}KB, voice={v} 小样)")
                 break
             except Exception as e:
                 last = f"{e.__class__.__name__}: {e}"
         else:
-            print(f"    tts key#1: 合成探测失败（{last}）——服务没起或音色不兼容；"
+            print(f"    tts key#{_first}: 合成探测失败（{last}）——服务没起或音色不兼容；"
                   f"用 media_gen.py tts --voice <服务实际音色> 实测为准")
 
 # ─── plan 校验（字段拼错静默失效是坑）────────────────────
 PLAN_KNOWN_KEYS = {"role_assign", "workers", "workers_image", "workers_video",
                    "watermark", "mode", "hero_shots", "video_pool_order", "tier_map",
-                   "xfade", "freeze_last"}   # xfade/freeze_last：pipeline concat 阶段读
+                   "xfade", "freeze_last", "max_calls"}   # max_calls：调用次数门禁（v4.9.0）
 
 def cmd_plan_check(args) -> None:
     """校验 plan.json：未知键 warn（拼错会被静默忽略）、枚举值/类型检查。"""

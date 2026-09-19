@@ -25,14 +25,9 @@ import subprocess
 import sys
 from pathlib import Path
 
-from ffmpeg_probe import find_ffmpeg
-from mg_core import PRODUCT_EXTS, natkey, run_capture
-
-_ffmpeg_cache: dict[str, str] = {}
-def _ffmpeg() -> str:
-    if "exe" not in _ffmpeg_cache:
-        _ffmpeg_cache["exe"] = find_ffmpeg()
-    return _ffmpeg_cache["exe"]
+from mg_core import PRODUCT_EXTS, _ffmpeg, natkey, run_capture
+# ffmpeg 路径单源：从 mg_core 取（v4.8.0 收编——本地副本曾各自维护 _ffmpeg_cache，
+# audio_triage 那份漏了缓存，每次调用重探测文件系统）
 
 def run(cmd: list[str]) -> int:
     print(" ".join(cmd), file=sys.stderr)
@@ -167,6 +162,23 @@ def probe(path: str) -> dict:
     _PROBE_CACHE[path] = info
     return info
 
+def duration_verdict(info: dict, max_duration: float) -> tuple[str, str]:
+    """时长校验的显式三态判定（纯函数）：('ok'|'warn'|'fail', 说明)。
+
+    'warn' = ffprobe 没解析出 Duration（动图 webp / 容器异常 / 流式封装）——
+    **不能当通过**：旧逻辑用 info.get("duration", 0) 兜底，缺失时 `0 <= max` 恒真，
+    规格门禁形同虚设（"假合格"）。max_duration <= 0 表示不校验。
+    """
+    if not max_duration or max_duration <= 0:
+        return "ok", "未设时长上限"
+    dur = info.get("duration")
+    if dur is None:
+        return "warn", "时长无法判定（ffprobe 未解析出 Duration）——请人工确认"
+    if dur > max_duration:
+        return "fail", f"{dur}s > {max_duration}s"
+    return "ok", f"{dur}s <= {max_duration}s"
+
+
 # ─── 拼接 + 后期统一 ──────────────────────────────────────
 def _collect_clips(clips_dir: Path) -> list[Path]:
     """收集待拼分片：clip_*.mp4 / .webp，按镜号自然排序。
@@ -179,19 +191,52 @@ def _collect_clips(clips_dir: Path) -> list[Path]:
     return clips
 
 
+def audio_plan(probes: list[dict]) -> str:
+    """整卷音轨策略（纯函数，可单测）：
+      none  = 全部分片都无音轨 → 不产出音轨
+      all   = 全部分片都有音轨 → 直接 acrossfade / concat
+      mixed = 部分有音轨 → **必须给无音轨的分片补等长静音**，否则整卷丢音
+
+    历史 bug（2026-09 复测发现）：曾用 `all(probe(c).get("audio") ...)` 判定，
+    mixed 场景（真视频带环境音 + kenburns 静帧片段混编——hybrid 模式的常态）
+    直接落进 none 分支 → 整卷音轨被静默丢弃，rc=0 无声成片。
+    """
+    flags = [bool((p or {}).get("audio")) for p in probes]
+    if not flags or not any(flags):
+        return "none"
+    return "all" if all(flags) else "mixed"
+
+
+def audio_src(has_audio: bool, idx: int, dur: float) -> str:
+    """单片音轨输入链：有音轨 → 重采样；无音轨 → 补等长静音（混编保音轨的关键）。"""
+    if has_audio:
+        return f"[{idx}:a]aresample=48000,asetpts=PTS-STARTPTS[a{idx}]"
+    d = dur if dur > 0 else 5.0
+    return (f"anullsrc=r=48000:cl=stereo,atrim=0:{d:.3f},"
+            f"asetpts=PTS-STARTPTS[a{idx}]")
+
+
 def cmd_concat(args) -> None:
     clips_dir = Path(args.clips)
     clips = _collect_clips(clips_dir)
+    # 一次性探测每片（规格/时长/音轨）——避免同一文件被反复 ffprobe，也保证
+    # 规格告警、xfade offset、音轨补齐用的是同一份数据
+    _probes = [probe(str(c)) for c in clips]
+    _durs = [float(p.get("duration") or 0.0) for p in _probes]
+    _audio = [bool(p.get("audio")) for p in _probes]
     # 混合 provider 提示：不同 provider 输出分辨率不同（如 Agnes 1088x832 vs 智谱 1920x1080），
     # 统一缩放至 --target-res 时可能引入轻微画质/比例差异，提示人工确认。
     # 签名含 codec：同分辨率不同编码（h264 vs vp9）直拼同样会花屏（#4）
-    res_set = {(probe(str(c)).get("width"), probe(str(c)).get("height"),
-                probe(str(c)).get("codec")) for c in clips}
-    # .webp 动图进 concat demuxer 不可靠（时长/时间基解析异常）→ 一律走重编码分支
-    need_recode = any(c.suffix.lower() != ".mp4" for c in clips)
+    res_set = {(p.get("width"), p.get("height"), p.get("codec")) for p in _probes}
+    # .webp 动图进 concat demuxer 不可靠（时长/时间基解析异常）→ 一律走重编码分支；
+    # 音轨存在性不一致（真视频带环境音 + kenburns 静帧片段）→ -c copy 直拼会失败，
+    # 同样强制重编码（重编码分支会给无音轨片补静音，保整卷音轨）
+    mixed_audio = len(set(_audio)) > 1
+    need_recode = any(c.suffix.lower() != ".mp4" for c in clips) or mixed_audio
     if need_recode:
-        print(f"[postprocess] 检测到非 mp4 分片（如 .webp 动图），强制重编码拼接",
-              file=sys.stderr)
+        why = "非 mp4 分片（如 .webp 动图）" if any(c.suffix.lower() != ".mp4" for c in clips) \
+            else "音轨存在性不一致（部分分片无音轨）"
+        print(f"[postprocess] 检测到{why}，强制重编码拼接", file=sys.stderr)
     if len(res_set) > 1:
         # 打印时用 str 归一：元组里可能有 None（probe 不到），直接 sorted 会
         # 抛 TypeError（None 与 int/str 不可比），反倒让提示信息本身把流程打断
@@ -224,20 +269,21 @@ def cmd_concat(args) -> None:
                 f"crop={tw}:{th},settb=AVTB,setpts=PTS-STARTPTS,fps=24[f{i}]"
             )
         prev = "f0"
-        total_len = probe(str(clips[0])).get("duration", 5.0)   # L_0
+        total_len = _durs[0] or 5.0                           # L_0
         for i in range(1, len(clips)):
-            dur = probe(str(clips[i])).get("duration", 5.0)
+            dur = _durs[i] or 5.0
             d_k = durs[i - 1]
             offset = total_len - d_k
             label = f"x{i}"
             fc.append(f"[{prev}][f{i}]xfade=transition=fade:duration={d_k}:offset={offset:.3f}[{label}]")
             prev = label
             total_len = offset + dur                            # L_i
-        # 音频链：acrossfade 与视频 xfade 逐段对齐（前提：各 clip 音频时长≈视频时长）
-        has_audio = all(probe(str(c)).get("audio") for c in clips)
-        if has_audio:
+        # 音频链：acrossfade 与视频 xfade 逐段对齐（前提：各 clip 音频时长≈视频时长）。
+        # 混编（部分分片无音轨）时给无音轨片补等长静音——用 all() 判定会整卷丢音。
+        aplan = audio_plan(_probes)
+        if aplan != "none":
             for i in range(len(clips)):
-                fc.append(f"[{i}:a]aresample=48000,asetpts=PTS-STARTPTS[a{i}]")
+                fc.append(audio_src(_audio[i], i, _durs[i]))
             aprev = "a0"
             for i in range(1, len(clips)):
                 alabel = f"ya{i}"
@@ -270,11 +316,12 @@ def cmd_concat(args) -> None:
                     f"[{i}:v]scale={tw}:{th}:force_original_aspect_ratio=increase,"
                     f"crop={tw}:{th},settb=AVTB,setpts=PTS-STARTPTS,fps=24[v{i}]"
                 )
-            # 音轨：写死 a=0 会静默丢掉环境音（xfade 分支是保音轨的，两分支必须对称）
-            has_audio = all(probe(str(c)).get("audio") for c in clips)
-            if has_audio:
+            # 音轨：写死 a=0 会静默丢掉环境音（xfade 分支是保音轨的，两分支必须对称）。
+            # 混编时给无音轨片补等长静音（同 xfade 分支，见 audio_plan 的历史 bug 说明）
+            aplan = audio_plan(_probes)
+            if aplan != "none":
                 for i in range(len(clips)):
-                    fc.append(f"[{i}:a]aresample=48000,asetpts=PTS-STARTPTS[a{i}]")
+                    fc.append(audio_src(_audio[i], i, _durs[i]))
                 fc.append("".join(f"[v{i}][a{i}]" for i in range(len(clips))) +
                           f"concat=n={len(clips)}:v=1:a=1[outv][outa]")
                 map_args = ["-map", "[outv]", "-map", "[outa]",
@@ -326,25 +373,43 @@ def cmd_concat(args) -> None:
             nxt += 1
         fc: list[str] = []
         srcs: list[str] = []
-        if probe(str(norm)).get("audio"):
+        has_amb = bool(probe(str(norm)).get("audio"))
+        # 成片（画面）时长：旁白要补静音到这一刻。**必须给 whole_dur**——
+        # 无参 apad 造无限音频流，本 ffmpeg 版本下 `-shortest` 不会终止它
+        # → 整个 concat 挂起（2026-09-12 实证：40s 未结束）。probe 失败退回不补。
+        _out_dur = float(probe(str(norm)).get("duration") or 0.0) \
+            + (float(args.freeze_last) if args.freeze_last > 0 else 0.0)
+        if has_amb:
             # 原始环境音：默认压低垫底（-10dB），不抢人声
             fc.append(f"[0:a]aresample=48000,volume={args.ambient_db}dB[amb]")
             srcs.append("[amb]")
         if voice_idx is not None:
             d = int(round(args.voice_delay * 1000))
-            # apad：旁白结束后补静音，避免 amix 在某路输入结束时抬升其余音轨电平
+            # apad=whole_dur：旁白结束后补静音到成片长度。两个作用——
+            # ① 单路：音频短于画面时 `-shortest` 会把画面截到音频长度
+            #    （v4.7.7 修 P0：实证 10s 画面 + 3s 旁白 → 4.02s 成片，rc=0）；
+            # ② 多路：避免 amix 在某路结束时抬升其余音轨电平。
+            pad = f",apad=whole_dur={_out_dur:.3f}" if _out_dur > 0 else ""
             fc.append(f"[{voice_idx}:a]aresample=48000,adelay={d}|{d},"
-                      f"volume={args.voice_db}dB,apad[vo]")
+                      f"volume={args.voice_db}dB{pad}[vo]")
             srcs.append("[vo]")
         if bgm_idx is not None:
             fc.append(f"[{bgm_idx}:a]aresample=48000,volume={args.bgm_db}dB[bm]")
             srcs.append("[bm]")
-        if srcs:
+        if len(srcs) == 1:
+            # 单路音频（静帧成片只加旁白 / 只铺 BGM）——**amix 要求 ≥2 输入，
+            # inputs=1 会让 ffmpeg 无限挂起**（不报错、不退出，2026-09 实测复现）。
+            # 直接透传该路，不做混音。
+            fc.append(f"{srcs[0]}acopy[mix]")
+        elif srcs:
             # normalize=0：各路音量已用 volume= 显式指定，避免某路结束时 amix
             # 自动重新归一化导致音量突跳
             fc.append("".join(srcs) +
                       f"amix=inputs={len(srcs)}:duration=first:dropout_transition=0"
                       f":normalize=0[mix]")
+        if srcs:
+            # 执行混音必须在 if/elif **之外**——曾把 run 缩进在 amix 分支内，
+            # 单路分支只拼了 filter 不执行 → rc=0 但旁白被静默丢弃（2026-09 实测）
             run([*cmd, "-filter_complex", ";".join(fc),
                  "-map", "0:v", "-map", "[mix]",
                  "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-ac", "2",
@@ -462,17 +527,20 @@ def cmd_check(args) -> None:
     print(json.dumps(info, indent=2))
     # 自检阈值可配置（默认 = 通用平台质量下限；目标平台/赛事不同时用 --min-res/--max-duration/--min-fps 覆盖）
     min_w, min_h = (int(x) for x in args.min_res.split("x"))
+    dur_level, dur_msg = duration_verdict(info, args.max_duration)
     rules = [
         (f"resolution >= {args.min_res}",
-         info.get("width", 0) >= min_w and info.get("height", 0) >= min_h),
-        (f"duration <= {args.max_duration}s",
-         info.get("duration", 0) <= args.max_duration),
+         "ok" if (info.get("width", 0) >= min_w and info.get("height", 0) >= min_h) else "fail",
+         f"{info.get('width')}x{info.get('height')}"),
+        (f"duration <= {args.max_duration}s", dur_level, dur_msg),
         (f"fps >= {args.min_fps}",
-         info.get("fps", 0) >= args.min_fps - 0.1),
+         "ok" if info.get("fps", 0) >= args.min_fps - 0.1 else "fail",
+         f"{info.get('fps')}"),
     ]
-    for name, ok in rules:
-        print(f"  [{'OK' if ok else 'FAIL'}] {name}")
-    if not all(ok for _, ok in rules):
+    for name, level, detail in rules:
+        print(f"  [{level.upper()}] {name}  ({detail})")
+    # WARN 不拦（动图 webp 常常本就没有 Duration），但必须显式打出来，绝不当 OK
+    if any(level == "fail" for _, level, _ in rules):
         sys.exit(2)
 
 # ─── QC 硬门禁（机器可判的自动判，判不了的才交人眼，#4）────
@@ -492,6 +560,18 @@ def _frame_stats(frames: list) -> dict:
     motion = sum(diffs) / len(diffs) if diffs else 0.0
     return {"means": means, "motion": motion}
 
+def qc_times(dur, n: int) -> list[float]:
+    """qcgate 抽帧时间点（纯函数）。
+
+    v4.8.0 修：原来 `info.get("duration", 5.0)` 兜底——probe 解析不出 Duration 时
+    （异常容器/部分 webp）30s 的片只测开头 5s，后半段黑帧/静帧全漏检却打 PASS。
+    时长未知就**只抽首帧**（其余交给 duration_verdict 的 WARN 提示人工复核）。"""
+    if dur and float(dur) > 0:
+        d = float(dur)
+        return [d * i / (n - 1) if n > 1 else d / 2 for i in range(n)]
+    return [0.0]
+
+
 def cmd_qcgate(args) -> None:
     """单段 QC 门禁：规格 + 黑帧/过曝/静帧 机器判定，输出 PASS/WARN/FAIL 并给 exit code。
     与 `check`（只查规格）互补：这里补上"画面是不是坏的"这类机器可判项。
@@ -509,15 +589,18 @@ def cmd_qcgate(args) -> None:
     # ① 规格（与 check 同阈值）
     if not (info.get("width", 0) >= min_w and info.get("height", 0) >= min_h):
         add("FAIL", f"分辨率 {info.get('width')}x{info.get('height')} < {args.min_res}")
-    if args.max_duration and info.get("duration", 0) > args.max_duration:
-        add("FAIL", f"时长 {info.get('duration')}s > {args.max_duration}s")
+    dur_level, dur_msg = duration_verdict(info, args.max_duration)
+    if dur_level == "fail":
+        add("FAIL", f"时长 {dur_msg}")
+    elif dur_level == "warn":
+        add("WARN", dur_msg)      # 未知 ≠ 合规；--strict 会把它升级为 FAIL
     if info.get("fps", 0) < args.min_fps - 0.1:
         add("FAIL", f"帧率 {info.get('fps')} < {args.min_fps}")
 
     # ② 抽帧机器判定
-    dur = info.get("duration", 5.0)
+    dur = info.get("duration") or 0.0
     n = args.frames
-    times = [dur * i / (n - 1) if n > 1 else dur / 2 for i in range(n)]
+    times = qc_times(dur, n)
     import tempfile
     with tempfile.TemporaryDirectory(prefix="qcgate_") as td:
         frames = []

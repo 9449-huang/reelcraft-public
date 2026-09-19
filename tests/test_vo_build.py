@@ -23,6 +23,39 @@ _slow = not os.environ.get("SLOW")
 
 
 
+class TestFirstRunTts(unittest.TestCase):
+    """首次运行（lines 目录无既有录音）必须走 TTS 合成。
+
+    v4.7.7 修 P0：`f = None`（找不到录音）后直接 `f.exists()`
+    → AttributeError，且崩在**调用 TTS 之前**（连合成请求都没发出去）。
+    `--skip-tts` 分支有 `f is None` 判空、非 skip_tts 分支没有 = 两处语义不一致。"""
+
+    def test_missing_recording_reaches_tts(self):
+        import vo_build as vb
+
+        class _ReachedTts(Exception):
+            pass
+
+        calls = []
+
+        def fake_tts(*a, **k):
+            calls.append(a)
+            raise _ReachedTts()      # 在真调 TTS 前截断，断言"确实走到了合成这一步"
+
+        d = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        vo = d / "vo_lines_at.json"
+        vo.write_text(json.dumps({"acts": [], "lines": [
+            {"id": "L1", "text": "第一句", "at": 0.0}]}, ensure_ascii=False),
+            encoding="utf-8")
+        argv = ["vo_build.py", str(vo), "--out", str(d / "vo.m4a")]
+        with mock.patch.object(sys, "argv", argv), \
+             mock.patch.object(vb, "tts_line", side_effect=fake_tts):
+            with self.assertRaises(_ReachedTts):
+                vb.main()
+        self.assertEqual(len(calls), 1,
+                         "无既有录音却没走到 TTS 合成（f=None 崩在判空前，属 P0 回归）")
+
+
 @unittest.skipUnless(not _slow, 'slow: SLOW=1 启用')
 class TestVoBuildPerLine(unittest.TestCase):
     """方案A：vo_build 逐句声音属性——voice/emotion/speed 透传到 media_gen tts 命令。"""
@@ -463,6 +496,41 @@ class TestPlanEndToEnd(unittest.TestCase):
             back = json.loads(at_file.read_text(encoding="utf-8"))
             self.assertEqual({l["id"]: l["at"] for l in back["lines"]}, ats)
 
+
+
+
+class TestMissingAtField(unittest.TestCase):
+    """S3：vo_build 正向拼装遇缺 at 字段必须友好报错，不能 KeyError 裸奔。
+
+    v4.7 审计 P1：main() 正向流程 lines[i]["at"] 直下标——手写 vo_lines_at.json
+    少个 at 就 KeyError 裸奔 exit 1。校验必须发生在 TTS/录音检查**之前**
+    （错误的数据不该开始烧 TTS 额度）。
+    """
+
+    def _run(self, data: dict) -> "subprocess.CompletedProcess":
+        import subprocess as sp
+        vb = Path(__file__).resolve().parents[1] / "scripts" / "vo_build.py"
+        with tempfile.TemporaryDirectory() as td:
+            src = Path(td) / "vo_lines_at.json"
+            src.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+            return sp.run([sys.executable, str(vb), str(src),
+                           "--out", str(Path(td) / "vo.m4a"), "--skip-tts"],
+                          capture_output=True, text=True, encoding="utf-8")
+
+    def test_missing_at_dies_before_tts_with_line_id(self):
+        r = self._run({"lines": [
+            {"id": "L1", "text": "hello", "at": 0.0, "dur": 1.0},
+            {"id": "L2", "text": "world", "dur": 1.0}]})        # L2 缺 at
+        self.assertEqual(r.returncode, 2, r.stderr[-300:])
+        self.assertIn("L2", r.stderr, "报错必须指认缺字段的行")
+        self.assertIn("at", r.stderr)
+
+    def test_valid_lines_pass_validation(self):
+        """at 齐全时校验放行（后续因缺录音 die(2)/die(4) 属正常，不是 KeyError）。"""
+        r = self._run({"lines": [
+            {"id": "L1", "text": "hello", "at": 0.0, "dur": 1.0}]})
+        self.assertEqual(r.returncode, 2, r.stderr[-300:])   # 缺录音：die(2)，非 traceback
+        self.assertNotIn("KeyError", r.stderr)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
