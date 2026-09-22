@@ -456,6 +456,412 @@ class TestPlanAxis(unittest.TestCase):
         self.assertAlmostEqual(out["total"], 6.3)
 
 
+class TestPlanAxisWords(unittest.TestCase):
+    """#7 词级接线 A：plan_axis 把**相对句首**的词轴转成成片绝对时间。
+
+    word_axis 的词 at 以该句录音自身为原点（0 = 句首）；字幕要的是成片绝对时间。
+    转换必须发生在排轴处——那是唯一知道 line.at 的地方。越界必须**可观测**：
+    whisper 的锚点插值有可能吐出略超句长的末词，静默放行会让字幕跑出句外。
+    """
+
+    def test_words_shifted_to_absolute(self):
+        import vo_build as vb
+        items = [
+            {"id": "L01", "text": "甲乙丙", "dur": 2.0, "shot": "S01",
+             "words": [{"w": "甲", "at": 0.0, "dur": 0.6},
+                       {"w": "乙", "at": 0.7, "dur": 0.6},
+                       {"w": "丙", "at": 1.4, "dur": 0.6}]},
+            {"id": "L02", "text": "丁", "dur": 1.0, "shot": "S01",
+             "words": [{"w": "丁", "at": 0.1, "dur": 0.5}]},
+        ]
+        out = vb.plan_axis(items, gap=0.5, pad=0.8)
+        w0 = out["lines"][0]["words"]
+        self.assertAlmostEqual(w0[0]["at"], 0.0)
+        self.assertAlmostEqual(w0[2]["at"], 1.4)
+        # L02 at = 2.0 + 0.5 = 2.5 → 句内 0.1 变 2.6
+        self.assertAlmostEqual(out["lines"][1]["words"][0]["at"], 2.6)
+
+    def test_no_words_key_when_absent(self):
+        """无词轴时输出与旧版一致（不凭空造 words 键）。"""
+        import vo_build as vb
+        out = vb.plan_axis([{"id": "L01", "text": "甲", "dur": 1.0, "shot": "S01"}])
+        self.assertNotIn("words", out["lines"][0])
+
+    def test_words_clamped_inside_line_and_counted(self):
+        """词落在句外 → 夹回句内，且必须在 word_stats 里计数（不许静默夹）。"""
+        import vo_build as vb
+        items = [{"id": "L01", "text": "甲乙", "dur": 1.0, "shot": "S01",
+                  "words": [{"w": "甲", "at": 0.2, "dur": 0.4},
+                            {"w": "乙", "at": 3.5, "dur": 0.4}]}]
+        out = vb.plan_axis(items)
+        ws = out["lines"][0]["words"]
+        self.assertAlmostEqual(ws[1]["at"], 1.0, msg="越界词必须夹到句尾")
+        self.assertGreaterEqual(ws[1]["dur"], 0.02)
+        self.assertEqual(out["word_stats"]["clamped"], 1)
+
+    def test_word_stats_counts(self):
+        import vo_build as vb
+        items = [
+            {"id": "L01", "text": "甲", "dur": 1.0, "shot": "S01",
+             "words": [{"w": "甲", "at": 0.1, "dur": 0.3}]},
+            {"id": "L02", "text": "乙", "dur": 1.0, "shot": "S02"},
+        ]
+        out = vb.plan_axis(items)
+        self.assertEqual(out["word_stats"], {"lines": 1, "words": 1, "clamped": 0})
+
+    def test_blank_and_malformed_words_ignored(self):
+        """空词/非 dict 的词轴条目丢弃（whisper 偶有空 token）；不炸也不占位。"""
+        import vo_build as vb
+        items = [{"id": "L01", "text": "甲", "dur": 1.0, "shot": "S01",
+                  "words": [{"w": "  ", "at": 0.1, "dur": 0.3},
+                            "垃圾",
+                            {"w": "甲", "at": 0.4, "dur": 0.3}]}]
+        out = vb.plan_axis(items)
+        self.assertEqual([w["w"] for w in out["lines"][0]["words"]], ["甲"])
+
+
+class TestSplitLineCues(unittest.TestCase):
+    """#7 词级接线 B：字幕按**词边界**切行（不是按字符硬切）。
+
+    句级字幕在长句时是一大坨，只能靠 drawtext 自动折行；有词轴就能在词之间断行——
+    既不切断词，也不超 max_chars / max_dur。无词轴时保持旧行为（整句一条）。
+    """
+
+    def _line(self, **kw):
+        d = {"id": "L01", "text": "甲乙丙丁戊己庚辛壬癸", "at": 2.0, "dur": 5.0}
+        d.update(kw)
+        return d
+
+    def _cj_words(self, text, step=0.4, dur_ratio=0.9, base=2.0):
+        """词轴按**成片绝对时间**给——与 vo_lines_at.json 的真实产出一致
+        （plan_axis 已把相对句首的词转成绝对；split_line_cues 收到的就是绝对的）。"""
+        return [{"w": c, "at": base + i * step, "dur": step * dur_ratio}
+                for i, c in enumerate(text)]
+
+    def test_without_words_single_cue(self):
+        import vo_build as vb
+        cues = vb.split_line_cues(self._line())
+        self.assertEqual(len(cues), 1)
+        self.assertAlmostEqual(cues[0]["at"], 2.0)
+        self.assertAlmostEqual(cues[0]["dur"], 5.0, msg="无词轴时 dur 与旧版一致，不抬升")
+        self.assertEqual(cues[0]["text"], "甲乙丙丁戊己庚辛壬癸")
+
+    def test_punctuation_preserved_via_original_text(self):
+        """词轴不含标点，但字幕文本要用**原句**：按词定位后从原文取片段。"""
+        import vo_build as vb
+        line = self._line(text="And so my, fellow", dur=4.0,
+                          words=[{"w": "And", "at": 2.0, "dur": 0.4},
+                                 {"w": "so", "at": 2.5, "dur": 0.3},
+                                 {"w": "my", "at": 2.9, "dur": 0.3},
+                                 {"w": "fellow", "at": 3.3, "dur": 0.6}])
+        cues = vb.split_line_cues(line, max_width=9, max_dur=99.0, min_dur=0.1)
+        self.assertEqual([c["text"] for c in cues], ["And so my,", "fellow"],
+                         "逗号必须保留（不能被词拼接吞掉）")
+
+    def test_falls_back_when_words_do_not_match_text(self):
+        """转写与输入文本对不上（换词/换语言）→ 回退词拼接，不丢词也不崩。"""
+        import vo_build as vb
+        line = self._line(text="完全不同的原文", dur=3.0,
+                          words=[{"w": "alpha", "at": 2.0, "dur": 0.5},
+                                 {"w": "beta", "at": 2.6, "dur": 0.5}])
+        cues = vb.split_line_cues(line, max_width=999, min_dur=0.1)
+        self.assertEqual([c["text"] for c in cues], ["alpha beta"])
+
+    def test_splits_on_max_width_without_breaking_words(self):
+        import vo_build as vb
+        line = self._line(text="甲乙丙丁戊己", words=self._cj_words("甲乙丙丁戊己"))
+        cues = vb.split_line_cues(line, max_width=6, max_dur=99.0, min_dur=0.1)
+        self.assertEqual([c["text"] for c in cues], ["甲乙丙", "丁戊己"],
+                         "必须按词边界切，不切断词")
+        self.assertAlmostEqual(cues[0]["at"], 2.0)
+        self.assertAlmostEqual(cues[1]["at"], 2.0 + 3 * 0.4)
+
+    def test_splits_on_max_dur(self):
+        import vo_build as vb
+        line = self._line(text="甲乙丙丁",
+                          words=[{"w": c, "at": i * 1.0, "dur": 0.9}
+                                 for i, c in enumerate("甲乙丙丁")])
+        cues = vb.split_line_cues(line, max_width=999, max_dur=2.0, min_dur=0.1)
+        self.assertEqual([c["text"] for c in cues], ["甲乙", "丙丁"])
+
+    def test_short_tail_merged_into_previous(self):
+        """尾片过短（< min_dur）并回前一条——避免一闪而过的字幕。"""
+        import vo_build as vb
+        line = self._line(text="甲乙丙",
+                          words=[{"w": c, "at": i * 1.0, "dur": 0.9}
+                                 for i, c in enumerate("甲乙丙")])
+        cues = vb.split_line_cues(line, max_width=4, max_dur=99.0, min_dur=1.5)
+        self.assertEqual(len(cues), 1)
+        self.assertEqual(cues[0]["text"], "甲乙丙")
+
+    def test_english_words_joined_with_space(self):
+        """拉丁词之间必须留空格（否则字幕变成 Andsomy）。"""
+        import vo_build as vb
+        line = self._line(text="And so my fellow", dur=4.0,
+                          words=[{"w": "And", "at": 0.0, "dur": 0.4},
+                                 {"w": "so", "at": 0.5, "dur": 0.3},
+                                 {"w": "my", "at": 0.9, "dur": 0.3},
+                                 {"w": "fellow", "at": 1.3, "dur": 0.6}])
+        cues = vb.split_line_cues(line, max_width=9, max_dur=99.0, min_dur=0.1)
+        self.assertEqual([c["text"] for c in cues], ["And so my", "fellow"])
+
+    def test_cue_keeps_absolute_word_times(self):
+        """每条 cue 带自己的词（绝对时间）——卡拉OK/逐词高亮的接缝。"""
+        import vo_build as vb
+        line = self._line(text="甲乙", words=self._cj_words("甲乙"))
+        cues = vb.split_line_cues(line, max_width=2, min_dur=0.01)
+        self.assertEqual([w["w"] for w in cues[0]["words"]], ["甲"])
+        self.assertAlmostEqual(cues[0]["words"][0]["at"], 2.0)
+
+    def test_cues_cover_line_and_stay_inside(self):
+        """不变量：切开后拼回 == 原句；首条起点 == 句起点；末条不越出句尾。"""
+        import vo_build as vb
+        line = self._line(text="甲乙丙丁戊", dur=3.0, words=self._cj_words("甲乙丙丁戊", step=0.6))
+        cues = vb.split_line_cues(line, max_width=4, max_dur=99.0, min_dur=0.01)
+        self.assertAlmostEqual(cues[0]["at"], 2.0)
+        last = cues[-1]
+        self.assertLessEqual(round(last["at"] + last["dur"], 3), round(5.0 + 0.001, 3))
+        self.assertEqual("".join(c["text"] for c in cues), "甲乙丙丁戊")
+
+    def test_cue_dur_never_zero(self):
+        """退化词轴（dur 全 0）不许产出 0 长字幕（drawtext 会直接不显示）。"""
+        import vo_build as vb
+        line = self._line(text="甲", dur=0.0, words=[{"w": "甲", "at": 0.0, "dur": 0.0}])
+        cues = vb.split_line_cues(line)
+        self.assertGreaterEqual(cues[0]["dur"], 0.02)
+
+
+class TestPlanWordsWiring(unittest.TestCase):
+    """#7 词级接线 C：`plan --words` 把词轴真写进 vo_lines_at.json（内容级，不只看 rc）。"""
+
+    def _args(self, **kw):
+        import argparse
+        d = dict(lines="", out="", dir="", gap=0.5, pad=0.8, skip_tts=True,
+                 voice="", speed=1.0, words=True, word_lang="", word_models_dir="")
+        d.update(kw)
+        return argparse.Namespace(**d)
+
+    def test_words_persisted_into_vo_lines_at(self):
+        import tempfile
+        from pathlib import Path as P
+        from unittest import mock as mk
+        import vo_build as vb
+        import word_axis
+        with tempfile.TemporaryDirectory() as td:
+            td = P(td)
+            src = td / "vo_lines.json"
+            src.write_text(json.dumps({"acts": [], "lines": [
+                {"id": "L01", "text": "甲乙", "shot": "S01"}]}), encoding="utf-8")
+            fake = td / "L01.m4a"
+            fake.write_bytes(b"x")
+            with mk.patch.object(vb, "_existing_recording", return_value=fake), \
+                 mk.patch.object(vb, "probe", return_value=2.0), \
+                 mk.patch.object(word_axis, "transcribe",
+                                 return_value={"backend": "whisper", "text": "甲乙",
+                                               "words": [{"w": "甲", "at": 0.0, "dur": 0.4},
+                                                         {"w": "乙", "at": 0.5, "dur": 0.4}],
+                                               "duration": 2.0}):
+                with self.assertRaises(SystemExit) as cm:
+                    vb.cmd_plan(self._args(lines=str(src), out=str(td / "plan.json")))
+            self.assertEqual(cm.exception.code, 0)
+            back = json.loads((td / "vo_lines_at.json").read_text(encoding="utf-8"))
+            words = back["lines"][0].get("words")
+            self.assertTrue(words, "词轴必须落进 vo_lines_at.json（否则字幕仍是句级）")
+            self.assertAlmostEqual(words[1]["at"], 0.5)
+            plan = json.loads((td / "plan.json").read_text(encoding="utf-8"))
+            self.assertEqual(plan["word_stats"]["words"], 2)
+
+    def test_words_without_model_dies_with_hint(self):
+        """显式要词轴而运行时不具备 → rc=2 + 安装指引（**不静默**给句级轴）。"""
+        import contextlib
+        import io
+        import tempfile
+        from pathlib import Path as P
+        from unittest import mock as mk
+        import vo_build as vb
+        with tempfile.TemporaryDirectory() as td:
+            td = P(td)
+            src = td / "vo_lines.json"
+            src.write_text(json.dumps({"acts": [], "lines": [
+                {"id": "L01", "text": "甲", "shot": "S01"}]}), encoding="utf-8")
+            fake = td / "L01.m4a"
+            fake.write_bytes(b"x")
+            empty = td / "empty_models"
+            empty.mkdir()
+            err = io.StringIO()
+            with mk.patch.object(vb, "_existing_recording", return_value=fake), \
+                 mk.patch.object(vb, "probe", return_value=2.0), \
+                 contextlib.redirect_stderr(err):
+                with self.assertRaises(SystemExit) as cm:
+                    vb.cmd_plan(self._args(lines=str(src), out=str(td / "plan.json"),
+                                           word_models_dir=str(empty)))
+            self.assertEqual(cm.exception.code, 2)
+            self.assertIn("whisper", err.getvalue().lower(),
+                          "必须给出词轴模型/依赖的安装指引")
+
+
+class TestPlanPunctWiring(unittest.TestCase):
+    """v4.19：--punct 接进 plan——标点挂回词目 + whisper 静默忽略必须拦截。"""
+
+    def _args(self, **kw):
+        import argparse
+        d = dict(lines="", out="", dir="", gap=0.5, pad=0.8, skip_tts=True,
+                 voice="", speed=1.0, words=False, punct=False, word_lang="",
+                 word_backend="", word_models_dir="")
+        d.update(kw)
+        return argparse.Namespace(**d)
+
+    def _run_plan(self, tmp, transcribe_ret):
+        """公共脚手架：1 句稿 + 假录音 + mock 掉 transcribe，返回 (vo_lines_at, plan, err)。"""
+        import contextlib
+        import io
+        import tempfile
+        from pathlib import Path as P
+        from unittest import mock as mk
+        import vo_build as vb
+        import word_axis
+        with tempfile.TemporaryDirectory() as td:
+            td = P(td)
+            src = td / "vo_lines.json"
+            src.write_text(json.dumps({"acts": [], "lines": [
+                {"id": "L01", "text": "甲乙", "shot": "S01"}]}), encoding="utf-8")
+            fake = td / "L01.m4a"
+            fake.write_bytes(b"x")
+            err = io.StringIO()
+            with mk.patch.object(vb, "_existing_recording", return_value=fake), \
+                 mk.patch.object(vb, "probe", return_value=2.0), \
+                 mk.patch.object(word_axis, "transcribe",
+                                 return_value=transcribe_ret), \
+                 contextlib.redirect_stderr(err):
+                with self.assertRaises(SystemExit) as cm:
+                    vb.cmd_plan(self._args(lines=str(src), out=str(td / "plan.json"),
+                                           **(tmp or {})))
+            self.assertEqual(cm.exception.code, 0)
+            back = json.loads((td / "vo_lines_at.json").read_text(encoding="utf-8"))
+            plan = json.loads((td / "plan.json").read_text(encoding="utf-8"))
+            return back, plan, err.getvalue()
+
+    def test_punct_persisted_into_words(self):
+        """--punct 生效时：词目带标点写进 vo_lines_at.json（内容级验证）。"""
+        back, plan, _ = self._run_plan(
+            {"punct": True}, {"backend": "sherpa", "punct": "sherpa", "text": "甲乙。",
+                              "words": [{"w": "甲", "at": 0.0, "dur": 0.4},
+                                        {"w": "乙。", "at": 0.5, "dur": 0.4}],
+                              "duration": 2.0})
+        words = back["lines"][0]["words"]
+        self.assertEqual([w["w"] for w in words], ["甲", "乙。"],
+                         "标点必须挂回词目（否则下游 _cue_text 拿不到带标点文本）")
+        self.assertEqual(plan["word_stats"]["words"], 2)
+
+    def test_punct_implies_words(self):
+        """--punct 不带 --words 也要跑词轴（标点的挂点是词目，隐含要求）。"""
+        called = []
+
+        def fake_transcribe(rec, **kw):
+            called.append(kw)
+            return {"backend": "sherpa", "punct": "sherpa", "text": "甲乙。",
+                    "words": [{"w": "甲", "at": 0.0, "dur": 0.4},
+                              {"w": "乙。", "at": 0.5, "dur": 0.4}], "duration": 2.0}
+
+        import tempfile
+        from pathlib import Path as P
+        from unittest import mock as mk
+        import vo_build as vb
+        import word_axis
+        with tempfile.TemporaryDirectory() as td:
+            td = P(td)
+            src = td / "vo_lines.json"
+            src.write_text(json.dumps({"acts": [], "lines": [
+                {"id": "L01", "text": "甲乙", "shot": "S01"}]}), encoding="utf-8")
+            fake = td / "L01.m4a"
+            fake.write_bytes(b"x")
+            with mk.patch.object(vb, "_existing_recording", return_value=fake), \
+                 mk.patch.object(vb, "probe", return_value=2.0), \
+                 mk.patch.object(word_axis, "transcribe", side_effect=fake_transcribe):
+                with self.assertRaises(SystemExit) as cm:
+                    vb.cmd_plan(self._args(lines=str(src), out=str(td / "plan.json"),
+                                           punct=True))
+            self.assertEqual(cm.exception.code, 0)
+            self.assertTrue(called, "--punct 必须触发词轴（隐含 --words）")
+            self.assertTrue(all(kw.get("punctuate") for kw in called),
+                            "punctuate=True 必须传给 transcribe")
+
+    def test_punct_on_whisper_dies_loudly(self):
+        """whisper 后端静默忽略 punctuate → 必须 die(2)（静默失败主形态防线）。"""
+        import contextlib
+        import io
+        import tempfile
+        from pathlib import Path as P
+        from unittest import mock as mk
+        import vo_build as vb
+        import word_axis
+        with tempfile.TemporaryDirectory() as td:
+            td = P(td)
+            src = td / "vo_lines.json"
+            src.write_text(json.dumps({"acts": [], "lines": [
+                {"id": "L01", "text": "甲乙", "shot": "S01"}]}), encoding="utf-8")
+            fake = td / "L01.m4a"
+            fake.write_bytes(b"x")
+            err = io.StringIO()
+            with mk.patch.object(vb, "_existing_recording", return_value=fake), \
+                 mk.patch.object(vb, "probe", return_value=2.0), \
+                 mk.patch.object(word_axis, "transcribe",
+                                 return_value={"backend": "whisper", "text": "甲乙",
+                                               "words": [{"w": "甲", "at": 0.0, "dur": 0.4},
+                                                         {"w": "乙", "at": 0.5, "dur": 0.4}],
+                                               "duration": 2.0}), \
+                 contextlib.redirect_stderr(err):
+                with self.assertRaises(SystemExit) as cm:
+                    vb.cmd_plan(self._args(lines=str(src), out=str(td / "plan.json"),
+                                           punct=True))
+            self.assertEqual(cm.exception.code, 2)
+            self.assertIn("标点", err.getvalue(), "错误信息必须点明标点未生效")
+            self.assertIn("sherpa", err.getvalue(), "必须指引切到 sherpa 后端")
+
+
+class TestPlanWordsWiring2(unittest.TestCase):
+    """v4.13 词级接线 C 的补充（归 TestPlanWordsWiring 语义，独立类避免插入错位）。"""
+
+    def _args(self, **kw):
+        import argparse
+        d = dict(lines="", out="", dir="", gap=0.5, pad=0.8, skip_tts=True,
+                 voice="", speed=1.0, words=True, word_lang="", word_backend="",
+                 word_models_dir="")
+        d.update(kw)
+        return argparse.Namespace(**d)
+
+    def test_words_auto_backend_error_passthrough(self):
+        """auto 但两个后端都不可用 → transcribe 不抛、只带回 error 字段；
+        vo_build 必须把安装指引**递出去**（否则只剩"一句词轴都没拿到"，排查抓瞎）。"""
+        import contextlib
+        import io
+        import tempfile
+        from pathlib import Path as P
+        from unittest import mock as mk
+        import vo_build as vb
+        import word_axis
+        with tempfile.TemporaryDirectory() as td:
+            td = P(td)
+            src = td / "vo_lines.json"
+            src.write_text(json.dumps({"acts": [], "lines": [
+                {"id": "L01", "text": "甲", "shot": "S01"}]}), encoding="utf-8")
+            fake = td / "L01.m4a"
+            fake.write_bytes(b"x")
+            err = io.StringIO()
+            with mk.patch.object(vb, "_existing_recording", return_value=fake), \
+                 mk.patch.object(vb, "probe", return_value=2.0), \
+                 mk.patch.object(word_axis, "transcribe",
+                                 return_value={"backend": "", "text": "", "words": [],
+                                               "duration": 2.0,
+                                               "error": "安装指引哨兵XYZ"}), \
+                 contextlib.redirect_stderr(err):
+                with self.assertRaises(SystemExit) as cm:
+                    vb.cmd_plan(self._args(lines=str(src), out=str(td / "plan.json")))
+            self.assertEqual(cm.exception.code, 2)
+            self.assertIn("安装指引哨兵XYZ", err.getvalue(),
+                          "error 里的安装指引必须原样递给用户")
+
+
 @unittest.skipUnless(not _slow, 'slow: SLOW=1 启用')
 class TestPlanEndToEnd(unittest.TestCase):
     """#6 plan 端到端：造两段假录音 → --skip-tts 排轴 → 落盘 at/need 正确。"""
@@ -497,6 +903,44 @@ class TestPlanEndToEnd(unittest.TestCase):
             self.assertEqual({l["id"]: l["at"] for l in back["lines"]}, ats)
 
 
+
+
+@unittest.skipUnless(not _slow, 'slow: SLOW=1 启用')
+class TestWordCuesEndToEnd(unittest.TestCase):
+    """#7 端到端：带词轴的 vo_lines_at.json → subtitles_final.json **必须按词切成多条**。
+
+    防两层假绿：split_line_cues 单测过但 main 没用它（改回句级也照样 rc=0）。
+    """
+
+    def test_subtitles_split_on_word_boundaries(self):
+        import subprocess as sp
+        from ffmpeg_probe import find_ffmpeg
+        ff = find_ffmpeg()
+        text = "甲乙丙丁戊己庚辛壬癸" * 3          # 30 字，宽 60 > 上限 40 → 必然要切
+        words = [{"w": c, "at": round(0.05 + i * 0.09, 3), "dur": 0.08}
+                 for i, c in enumerate(text)]
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            (td / "lines").mkdir()
+            sp.run([ff, "-y", "-loglevel", "error", "-f", "lavfi",
+                    "-i", "sine=frequency=440:duration=3", "-ar", "48000",
+                    str(td / "lines" / "L01.m4a")], check=True)
+            (td / "vo_lines_at.json").write_text(json.dumps(
+                {"acts": [], "lines": [{"id": "L01", "text": text, "at": 0.0,
+                                        "words": words}]}, ensure_ascii=False),
+                encoding="utf-8")
+            vb = Path(__file__).resolve().parents[1] / "scripts" / "vo_build.py"
+            r = sp.run([sys.executable, str(vb), str(td / "vo_lines_at.json"),
+                        "--out", str(td / "vo.m4a"), "--skip-tts",
+                        "--subs-out", str(td / "subs.json")],
+                       capture_output=True, text=True, encoding="utf-8")
+            self.assertEqual(r.returncode, 0, r.stderr[-400:])
+            subs = json.loads((td / "subs.json").read_text(encoding="utf-8"))
+        self.assertGreater(len(subs), 1, "有词轴时字幕必须切成多条（整句一条 = 没接线）")
+        self.assertEqual("".join(s["text"] for s in subs), text,
+                         "切开后拼回必须等于原句——不切断词")
+        for s in subs:
+            self.assertIn("words", s, "每条 cue 应带该片词（逐词高亮的接缝）")
 
 
 class TestMissingAtField(unittest.TestCase):

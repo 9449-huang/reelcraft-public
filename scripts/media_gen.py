@@ -357,7 +357,8 @@ def cmd_run(args) -> None:
     cmd = [sys.executable, pipe, args.shots]
     for flag in ("--final", "--stop-after", "--target-res", "--bgm",
                  "--slogan", "--slogan-position", "--provider-image", "--provider-video",
-                 "--workers-image", "--workers-video", "--watermark"):
+                 "--workers-image", "--workers-video", "--watermark",
+                 "--subtitle-render"):
         val = getattr(args, flag[2:].replace("-", "_"), "")
         if val:
             cmd += [flag, str(val)]
@@ -643,6 +644,9 @@ def main() -> None:
     runp.add_argument("--bgm", default="")
     runp.add_argument("--slogan", default="")
     runp.add_argument("--slogan-position", default="left", choices=["left", "bottom"])
+    runp.add_argument("--subtitle-render", default="", choices=["", "ass", "drawtext"],
+                      help="字幕渲染通道（留空=ass/libass，支持逐词高亮）；"
+                           "drawtext=旧通道（回滚用，做不到逐词高亮）")
 
     au = sub.add_parser("audit", help="项目进度审计：每镜 出图/出片/失败 + 下一步清单")
     au.add_argument("shots", help="shots 目录")

@@ -299,6 +299,81 @@ class TestConcatGatesWired(unittest.TestCase):
                          "media_gen run 应把 --no-faces 传下去")
 
 
+class TestSubtitleRenderWiring(unittest.TestCase):
+    """v4.15：字幕渲染通道的逃生阀必须从两个入口都能碰到。
+
+    默认通道换成了 ASS/libass；一旦它在某台机器上出问题，用户需要
+    `--subtitle-render drawtext` 立刻退回旧通道。若这个 flag 只能从
+    `postprocess.py concat` 直接给，走 `media_gen run` 的用户就无路可退。
+
+    反面同样要验：**不给 flag 时不许把默认值塞进命令**——否则旁线自己的默认
+    将来改了这里也感知不到（v4.9 的 workers 恒真默认值覆盖 plan 就是这毛病）。
+    """
+
+    def setUp(self):
+        self._td = tempfile.TemporaryDirectory()
+        self.d = Path(self._td.name)
+        for n in ("01", "02"):
+            (self.d / f"shot_{n}.json").write_text(
+                json.dumps({"shot_id": f"S{n}", "t2i_prompt": "x"}), encoding="utf-8")
+
+    def tearDown(self):
+        self._td.cleanup()
+
+    def _plan(self, **kw):
+        (self.d / "plan.json").write_text(json.dumps(kw), encoding="utf-8")
+
+    def _dry(self, *extra):
+        import subprocess as sp
+        return sp.run([sys.executable,
+                       str(Path(__file__).resolve().parents[1] / "scripts" / "pipeline.py"),
+                       str(self.d), "--dry-run", *extra],
+                      capture_output=True, text=True, timeout=180)
+
+    @staticmethod
+    def _concat_line(r):
+        hits = [l for l in r.stdout.splitlines()
+                if l.startswith("+ ") and "postprocess.py concat" in l]
+        return hits[0] if hits else ""
+
+    def test_drawtext_escape_valve_reaches_concat(self):
+        self._plan(mode="stills")
+        r = self._dry("--subtitle-render", "drawtext")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        line = self._concat_line(r)
+        self.assertTrue(line, "concat 命令应存在")
+        self.assertIn("--subtitle-render drawtext", line,
+                      "逃生阀必须真的传到 postprocess concat")
+
+    def test_default_not_forced_into_command(self):
+        """不给 flag 就不许出现——默认由旁线自己决定（防"门面覆盖默认"）。"""
+        self._plan(mode="stills")
+        r = self._dry()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn("--subtitle-render", self._concat_line(r),
+                         "未显式指定时不该往命令里塞默认值")
+
+    def test_media_gen_run_forwards_escape_valve(self):
+        """门面链路：`media_gen run` 也必须有这条路（否则只能直调 pipeline）。"""
+        import subprocess as sp
+        self._plan(mode="stills")
+        r = sp.run([sys.executable,
+                    str(Path(__file__).resolve().parents[1] / "scripts" / "media_gen.py"),
+                    "run", str(self.d), "--dry-run",
+                    "--subtitle-render", "drawtext"],
+                   capture_output=True, text=True, timeout=180)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("--subtitle-render drawtext", self._concat_line(r),
+                      "media_gen run 应把 --subtitle-render 透传到 concat")
+
+    def test_pipeline_rejects_unknown_channel(self):
+        """取值必须受约束（拼错时明确报错，而不是静默走默认）。"""
+        self._plan(mode="stills")
+        r = self._dry("--subtitle-render", "libass")
+        self.assertNotEqual(r.returncode, 0, "非法取值应被 argparse 拒绝")
+        self.assertIn("invalid choice", (r.stdout or "") + (r.stderr or ""))
+
+
 class TestExportNonUtf8Guard(unittest.TestCase):
     """v4.7.9：非 UTF-8 文件含私有标记块 → 必须拒绝导出。
 
@@ -406,6 +481,7 @@ class TestPipelineOrchestration(unittest.TestCase):
                           subtitles="", slogan="", slogan_position="left",
                                 watermark="", watermark_dry_run=False,
                                 sound_lines="", sound_voice="", sound_speed=1.0,
+                                subtitle_render="",
                                 sound_skip_tts=False, sound_auto_shift=False, sound_gap=0.3)
         # images 阶段 rc=0（mock 第 1 次调用）；videos 阶段 rc=4（mock 第 2 次调用）
         with _m.patch("pipeline.subprocess.run",
@@ -430,6 +506,7 @@ class TestPipelineOrchestration(unittest.TestCase):
                           subtitles="", slogan="", slogan_position="left",
                                 watermark="", watermark_dry_run=False,
                                 sound_lines="", sound_voice="", sound_speed=1.0,
+                                subtitle_render="",
                                 sound_skip_tts=False, sound_auto_shift=False, sound_gap=0.3)
         with _m.patch("pipeline.subprocess.run",
                       side_effect=[_m.Mock(returncode=0), _m.Mock(returncode=1)]):
@@ -472,6 +549,7 @@ class TestPipelineOrchestration(unittest.TestCase):
                                 slogan_position="left",
                                 watermark="", watermark_dry_run=False,
                                 sound_lines="", sound_voice="", sound_speed=1.0,
+                                subtitle_render="",
                                 sound_skip_tts=False, sound_auto_shift=False, sound_gap=0.3)
         with _m.patch("pipeline.subprocess.run", side_effect=[_m.Mock(returncode=0)]):
             with self.assertRaises(SystemExit) as cm:
@@ -496,6 +574,7 @@ class TestPipelineOrchestration(unittest.TestCase):
                                 slogan_position="left",
                                 watermark="", watermark_dry_run=False,
                                 sound_lines="", sound_voice="", sound_speed=1.0,
+                                subtitle_render="",
                                 sound_skip_tts=False, sound_auto_shift=False, sound_gap=0.3)
         # images rc=0 → videos rc=0（放行到底）
         with _m.patch("pipeline.subprocess.run",

@@ -249,6 +249,13 @@ def cmd_plan_check(args) -> None:
     if d.get("role_assign") and d["role_assign"] not in ("one-stop", "split"):
         print(f"[plan-check] [warn] role_assign={d['role_assign']!r} 不在 one-stop/split")
         issues += 1
+    # 记录字段 ≠ 生效开关（v4.11.0）。这两个键只被校验/回溯，不驱动任何行为——
+    # 显式提示，免得用户以为填了就自动分工/换档了。
+    rec_only = [k for k in ("role_assign", "tier_map") if d.get(k)]
+    if rec_only:
+        print(f"[plan-check] [hint] {'/'.join(rec_only)} 仅作记录（不驱动行为）。"
+              f"真正的开关：分工用 --provider-image/--provider-video 或 key 的 _ROLES；"
+              f"换档用 env MEDIA_CUSTOM_<n>_TIER")
     for numf in ("workers", "workers_image", "workers_video"):
         if numf in d and (not isinstance(d[numf], int) or d[numf] < 1):
             print(f"[plan-check] [warn] {numf}={d[numf]!r} 应为正整数")

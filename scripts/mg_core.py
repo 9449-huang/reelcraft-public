@@ -594,6 +594,16 @@ def die(msg: str, code: int = 1) -> None:
     print(f"[media_gen] ERROR: {msg}", file=sys.stderr)
     sys.exit(code)
 
+
+# ─── 退出码约定（单源，v4.11.0）──────────────────────────
+# 实测全库 sys.exit 分布：0 ×8 / 1 ×3 / 2 ×7 / 4 ×2——**没有 3**。
+# （早期审计提示词里"3=全 key 失败"是**待验假设**，代码中无落点，不要再引用。）
+# 需要别名时写 `DIE_ARG = mg_core.EXIT_USAGE`，别硬编码字面量。
+EXIT_OK = 0          # 成功
+EXIT_FAIL = 1        # 一般失败；报告族（qcseq / faces）的 WARN 也用它
+EXIT_USAGE = 2       # 参数 / 输入 / 配置错误
+EXIT_TIMEOUT = 4     # 视频轮询超时（task_id 已落盘，可 media_gen harvest 收割）
+
 _UNCERTAIN_CAUSES = None      # 延迟构造（http.client 要 import）
 
 

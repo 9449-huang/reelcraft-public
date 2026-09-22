@@ -31,9 +31,13 @@
 - 视频 per-key 节流（1 RPM/key）→ N key 并行吞吐 ×N
 - 一镜多图选优、xfade 交叉溶解 / 末帧链衔接、Ken Burns 兜底
 - 声音设计：分句 TTS → 精确字幕时间轴 → 旁白/BGM/环境音混音
+- **字幕逐词高亮（v4.15）**：ASS/libass 渲染 + 词级时间轴驱动的 `\k` 卡拉OK效果；`drawtext` 保留为回滚通道（`--subtitle-render drawtext`）
+- **音频侧门禁（v4.10）**：`audio-qc` 静音占比/采样削波/响度/长静音 + silero 神经 VAD 判语音
+- **跨镜人脸一致性（v4.10.1）**：`faces` YuNet 检测 + SFace 嵌入比对，判"是不是同一个人"
+- **词级时间轴（v4.12/v4.16）**：`word_axis` Whisper（英）+ sherpa paraformer（**中文逐字真声学时间戳**）双后端
 - 文案批量撒网（`copy.py`）+ 硬约束去空话
 - 后期统一规格（H.264 / yuv420p / ≥720p）+ 自检
-- 零第三方依赖（仅 Python 标准库 + ffmpeg）
+- **核心零第三方依赖**（主链路仅 Python 标准库 + ffmpeg）；可选增强见下方「安装」——未安装时相关命令给出指引并以 rc≠0 明确拒绝，绝不静默假装通过
 
 ## 目录
 
@@ -46,7 +50,13 @@ reelcraft/
 │   ├── mg_batch.py          # batch 跨池混编 + harvest 收割
 │   ├── mg_status.py         # status/plan-check/qc/last-frame
 │   ├── postprocess.py       # 拼接/统一规格/烧字幕/kenburns/自检
-│   ├── delogo_watermark.py  # 去固定角标水印（档案驱动）
+│   ├── delogo_watermark.py  # 去固定角标水印（delogo / removelogo mask 双模式）
+│   ├── pipeline.py          # 一键编排：images→videos→…→concat（audio-qc/faces/qcseq 门禁内置）
+│   ├── vo_build.py          # 旁白分句合成 + 精确字幕打轴（--words 词级轴）
+│   ├── audio_qc.py          # 音频侧门禁：静音/削波/响度 + VAD
+│   ├── face_consistency.py  # 跨镜人脸身份一致性（YuNet+SFace）
+│   ├── word_axis.py         # 词级时间轴（Whisper 英 / sherpa paraformer 中）
+│   ├── mg_caps.py           # 能力档案：声明/实测/探针
 │   ├── watermark_profiles.json # 水印档案（渠道→kind/框坐标，命中免测）
 │   ├── vo_build.py          # 旁白分句合成 + 精确字幕打轴
 │   ├── copy.py              # 文案批量出稿
@@ -56,6 +66,25 @@ reelcraft/
 ├── references/              # prompt 框架 / 口味卡 / 模型能力 / 反套话词表 / 规格参考 / 变更日志
 └── media_keys.env.example   # 密钥模板（复制改名填真实 key）
 ```
+
+## 安装（核心 vs 可选增强）
+
+核心链路（生图/视频/拼接/混音/去水印/防抖/质检）**零第三方依赖**，只需 Python 3.10+ 与 ffmpeg。
+
+可选增强（未安装时相关命令打指引并以 rc≠0 拒绝，不影响其余功能）：
+
+```bash
+pip install -r requirements.txt
+```
+
+| 能力 | 需要 | 用途 |
+|---|---|---|
+| 词级时间轴（中文逐字） | `sherpa-onnx` + paraformer-zh 模型（~232MB） | `word_axis`/`vo_build plan --words` 的**中文真声学时间戳** |
+| 词级时间轴（英文） | `onnxruntime` + `numpy` + `tokenizers` + whisper-base ONNX 模型（~79MB） | 英文语音词轴 |
+| 语音判定（神经 VAD） | `onnxruntime` + silero-vad ONNX（2MB） | `audio-qc`/`triage` 区分语音与音乐 |
+| 跨镜人脸一致性 | `opencv-python-headless` + YuNet/SFace ONNX | `faces` 判"是不是同一个人" |
+
+模型统一放 `~/.workbuddy/models/`（各命令缺件时的指引里有直链）。不装任何可选依赖，主流程照常可用。
 
 ## 快速开始
 

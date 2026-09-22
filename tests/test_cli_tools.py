@@ -1274,6 +1274,258 @@ class TestTtsSlotSingleSource(unittest.TestCase):
         self.assertEqual(at._scan_tts_slot({}), (0, "", ""))
 
 
+def _load_script(name):
+    """按文件路径加载 scripts/<name>.py（不碰 tests 里的同名导入）。"""
+    import importlib.util
+    import sys as _sys
+    sc = Path(__file__).resolve().parents[1] / "scripts"
+    if str(sc) not in _sys.path:
+        _sys.path.insert(0, str(sc))
+    spec = importlib.util.spec_from_file_location("rc_" + name, sc / f"{name}.py")
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return m
+
+
+class TestCopyBackoff(unittest.TestCase):
+    """v4.11.0：copy.py 的重试退避。
+
+    旧版 `time.sleep(8 * (i + 1))` 写在 for 循环体末尾——**最后一次尝试失败后也睡**，
+    三次全灭白等 24s（累计 48s）才抛错；且 8/16/24 是线性硬编码，与 mg_core.http_call
+    的指数退避不同族。改成"等待次数 = 尝试次数 − 1"的指数表。"""
+
+    def test_wait_count_is_tries_minus_one(self):
+        m = _load_script("copy")
+        self.assertEqual(len(m.backoff_delays(3)), 2, "最后一次失败后不该再等（终局）")
+        self.assertEqual(m.backoff_delays(1), [], "只有一次尝试 → 无等待")
+
+    def test_exponential_and_monotonic(self):
+        m = _load_script("copy")
+        d = m.backoff_delays(4, base=1.0)
+        self.assertEqual(d, [1.0, 2.0, 4.0], "指数退避 2**i")
+        self.assertEqual(d, sorted(d), "等待必须单调不减")
+
+    def test_total_shorter_than_old(self):
+        m = _load_script("copy")
+        self.assertLess(sum(m.backoff_delays(3)), 48.0,
+                        "旧版 8/16/24 共 48s；新版必须更短")
+
+    def test_zero_or_negative_tries_safe(self):
+        m = _load_script("copy")
+        self.assertEqual(m.backoff_delays(0), [])
+        self.assertEqual(m.backoff_delays(-1), [])
+
+    def test_loop_sleeps_tries_minus_one_times(self):
+        """**行为级**（不是只测那张表）：三次全失败 → sleep 恰好 2 次。
+
+        只断言 `backoff_delays()` 的返回值测不到"循环有没有用它"——旧版的
+        `sleep(8*(i+1))` 照样能配一张正确的表却仍多睡一次。"""
+        import contextlib
+        import io
+        from unittest import mock
+        m = _load_script("copy")
+        slept = []
+        with mock.patch.object(m.time, "sleep", side_effect=lambda s: slept.append(s)), \
+                mock.patch.object(m.urllib.request, "urlopen", side_effect=OSError("boom")), \
+                contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                m.chat("http://x/v1", "k", "mdl", "sys", "user", 0.7, tries=3)
+        self.assertEqual(slept, [8.0, 16.0],
+                         f"三次尝试只该等 2 次（8/16）；旧版会多睡 24s，实际 {slept}")
+
+
+class TestDelogoDie(unittest.TestCase):
+    """v4.11.0：delogo 的 die 原为 `sys.exit(msg)`——传**字符串**走 Python 隐式行为
+    （打印到 stderr + rc=1），且没有 code 参数、没有前缀，与另四份 `die` 不同形。
+    9 个调用点当前都只传一个参数所以没炸，但 `die(2)` 会变成"静默退出码 2"。"""
+
+    def test_default_exit_code_is_1(self):
+        m = _load_script("delogo_watermark")
+        with self.assertRaises(SystemExit) as cm:
+            m.die("boom")
+        self.assertEqual(cm.exception.code, 1, "必须显式 sys.exit(整数)")
+
+    def test_custom_exit_code(self):
+        m = _load_script("delogo_watermark")
+        with self.assertRaises(SystemExit) as cm:
+            m.die("boom", 2)
+        self.assertEqual(cm.exception.code, 2)
+
+    def test_message_goes_to_stderr_with_prefix(self):
+        import contextlib
+        import io
+        m = _load_script("delogo_watermark")
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            with self.assertRaises(SystemExit):
+                m.die("boom")
+        self.assertIn("[delogo] ERROR:", buf.getvalue(),
+                      "与其他脚本同形：带前缀打 stderr")
+
+
+class TestExitCodeSingleSource(unittest.TestCase):
+    """v4.11.0：退出码约定收单源。
+
+    实测全库 `sys.exit` 分布是 0×8 / 1×3 / 2×7 / 4×2 —— **没有 3**（早期审计提示词里
+    "3=全 key 失败"是待验假设，代码里无落点）。约定值收进 mg_core.EXIT_*，
+    两个新脚本原本各自硬编码 `DIE_ARG = 2`。"""
+
+    def test_convention_values(self):
+        import mg_core
+        self.assertEqual(mg_core.EXIT_OK, 0)
+        self.assertEqual(mg_core.EXIT_FAIL, 1)
+        self.assertEqual(mg_core.EXIT_USAGE, 2)
+        self.assertEqual(mg_core.EXIT_TIMEOUT, 4)
+        self.assertNotIn(3, (mg_core.EXIT_OK, mg_core.EXIT_FAIL,
+                             mg_core.EXIT_USAGE, mg_core.EXIT_TIMEOUT),
+                         "实测全库没有 sys.exit(3)，约定里不该凭空出现 3")
+
+    def test_scripts_alias_core_constant(self):
+        import mg_core
+        for name in ("audio_qc", "face_consistency"):
+            m = _load_script(name)
+            self.assertEqual(m.DIE_ARG, mg_core.EXIT_USAGE,
+                             f"{name}.DIE_ARG 应引用 mg_core.EXIT_USAGE（单源）")
+
+
+class TestExportDstResolution(unittest.TestCase):
+    """v4.11.0：export_public 的目标目录原为**硬编码本机工作区绝对路径**。
+    工作区一搬家，导出会静默写到幽灵目录（看起来"成功"，其实落在别处）。
+    改为 argv > $REELCRAFT_PUBLIC_DIR > 内置默认，并且必须打印解析结果。"""
+
+    def test_argv_wins(self):
+        m = _load_script("export_public")
+        self.assertEqual(m.resolve_dst(["prog", "D:/x/reelcraft_public"], {}),
+                         Path("D:/x/reelcraft_public"))
+
+    def test_env_second(self):
+        m = _load_script("export_public")
+        self.assertEqual(
+            m.resolve_dst(["prog"], {"REELCRAFT_PUBLIC_DIR": "E:/y/reelcraft_public"}),
+            Path("E:/y/reelcraft_public"))
+
+    def test_argv_beats_env(self):
+        m = _load_script("export_public")
+        self.assertEqual(
+            m.resolve_dst(["prog", "D:/a/reelcraft_public"],
+                          {"REELCRAFT_PUBLIC_DIR": "E:/b/reelcraft_public"}),
+            Path("D:/a/reelcraft_public"))
+
+    def test_blank_argv_falls_through_to_env(self):
+        m = _load_script("export_public")
+        self.assertEqual(
+            m.resolve_dst(["prog", "   "], {"REELCRAFT_PUBLIC_DIR": "E:/y/reelcraft_public"}),
+            Path("E:/y/reelcraft_public"))
+
+    def test_builtin_default_keeps_marker(self):
+        m = _load_script("export_public")
+        got = m.resolve_dst(["prog"], {})
+        self.assertIn("reelcraft_public", got.name,
+                      "内置默认仍须含 'reelcraft_public'（main 的防误删校验依赖它）")
+
+
+class TestPlanRecordOnlyFields(unittest.TestCase):
+    """v4.11.0：`role_assign` / `tier_map` 是**记录字段**（不驱动行为），
+    但此前没有任何地方说明——用户会以为填了就生效（"决策记录 ≠ 生效"）。
+    两者都有真正的开关替代：role_assign ↔ `--provider-image/--provider-video` 与 key 的
+    `_ROLES`；tier_map ↔ env `MEDIA_CUSTOM_n_TIER`。plan-check 现在显式提示。"""
+
+    def test_hint_names_the_real_switches(self):
+        import argparse
+        import contextlib
+        import io
+        import json
+        import tempfile
+        import mg_status
+        p = Path(tempfile.mkdtemp()) / "plan.json"
+        p.write_text(json.dumps({"mode": "stills", "role_assign": "one-stop",
+                                 "tier_map": {"k1": "high"}}), encoding="utf-8")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            with self.assertRaises(SystemExit) as cm:
+                mg_status.cmd_plan_check(argparse.Namespace(plan=str(p)))
+        out = buf.getvalue()
+        self.assertEqual(cm.exception.code, 0, out)
+        self.assertIn("仅作记录", out, f"应提示这两个字段仅作记录：{out}")
+        self.assertIn("MEDIA_CUSTOM", out, "tier_map 要指向真正的换档开关")
+
+    def test_no_hint_when_absent(self):
+        import argparse
+        import contextlib
+        import io
+        import json
+        import tempfile
+        import mg_status
+        p = Path(tempfile.mkdtemp()) / "plan.json"
+        p.write_text(json.dumps({"mode": "stills"}), encoding="utf-8")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            with self.assertRaises(SystemExit):
+                mg_status.cmd_plan_check(argparse.Namespace(plan=str(p)))
+        self.assertNotIn("仅作记录", buf.getvalue(), "没写这两个字段就别啰嗦")
+
+
+class TestDelogoMaskMode(unittest.TestCase):
+    """去水印 v2：`--mode mask` 用 removelogo（mask 驱动，对**固定位置角标**时序一致）。
+
+    delogo 是逐帧空间插值；removelogo 以一张 mask 图声明"这里永远有 logo"。
+    实测（2026-09-22）：同一素材两者抹完都是蓝底，效果相当；mask 方案的价值在长片/
+    高帧率下不逐帧抖动，且不依赖邻近像素质量。
+    """
+
+    def test_mask_filter_draws_white_box(self):
+        m = _load_script("delogo_watermark")
+        f = m.mask_filter(20, 30, 40, 50)
+        self.assertIn("drawbox", f)
+        for frag in ("x=20", "y=30", "w=40", "h=50", "color=white"):
+            self.assertIn(frag, f, f"mask 滤镜缺 {frag}")
+
+    def test_removelogo_filter_escapes_windows_path(self):
+        m = _load_script("delogo_watermark")
+        f = m.removelogo_filter("C:\\tmp\\logo.png")
+        self.assertTrue(f.startswith("removelogo=filename="), f)
+        self.assertNotIn("C:\\tmp", f, "反斜杠路径进 filter 必崩（rc=4294967274），必须转义")
+        self.assertIn("/tmp/logo.png", f)
+
+    def test_removelogo_filter_quotes_value(self):
+        """值套单引号 + 转义冒号（实测唯一稳的两种写法的交集）。"""
+        m = _load_script("delogo_watermark")
+        f = m.removelogo_filter("C:\\tmp\\logo.png")
+        self.assertIn("'C\\:/tmp/logo.png'", f)
+
+
+@unittest.skipUnless(not _slow, 'slow: SLOW=1 启用')
+class TestDelogoMaskEndToEnd(unittest.TestCase):
+    """真跑 ffmpeg：mask 模式必须**真把角标抹掉**（抽帧比像素，不只看 rc）。"""
+
+    def test_mask_mode_erases_corner_logo(self):
+        import subprocess as sp
+        from ffmpeg_probe import find_ffmpeg
+        from PIL import Image
+        ff = find_ffmpeg()
+        dw = Path(__file__).resolve().parents[1] / "scripts" / "delogo_watermark.py"
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            src = td / "v.mp4"
+            sp.run([ff, "-y", "-loglevel", "error", "-f", "lavfi",
+                    "-i", "color=c=blue:s=320x240:r=25:d=2",
+                    "-vf", "drawbox=x=20:y=20:w=60:h=60:color=red@1:t=fill",
+                    "-c:v", "libx264", "-pix_fmt", "yuv420p", str(src)], check=True)
+            out = td / "nowm.mp4"
+            r = sp.run([sys.executable, str(dw), str(src), "--mode", "mask",
+                        "--x", "20", "--y", "20", "--w", "60", "--h", "60",
+                        "--out", str(out)],
+                       capture_output=True, text=True, encoding="utf-8", timeout=300)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertTrue(out.exists() and out.stat().st_size > 0)
+            png = td / "f.png"
+            sp.run([ff, "-y", "-loglevel", "error", "-ss", "1", "-i", str(out),
+                    "-frames:v", "1", str(png)], check=True)
+            r0, g0, b0 = Image.open(png).convert("RGB").getpixel((50, 50))
+            self.assertLess(r0, 60, f"角标位置应已被抹成蓝底，实际 RGB=({r0},{g0},{b0})")
+            self.assertGreater(b0, 180)
+
+
 class TestOnlyWithTransition(unittest.TestCase):
     """批二：--only × 过渡镜兼容（hybrid 核心场景）。
 

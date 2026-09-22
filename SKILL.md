@@ -3,7 +3,7 @@ name: reelcraft
 description: 一句话需求 → 多 provider 生图/视频流水线（主力池可配 + 智谱/魔塔兜底，图批量选优 + 首帧图编辑 + 视频双链兜底）→ 声音设计（VO/TTS/字幕/BGM 混音）→ 规格统一后期 → 自检。Use when user asks to 做个视频/出片/AIGC广告/多 provider 兜底 or 给出平台/赛事规格要求生成达标视频；强调多 key 轮转与**多 key 并行**、熔断、一镜多图选优、xfade/末帧链衔接、抽帧 QC 闭环、断点续跑。When NOT to use: 静态海报用 ppt-master 或 image-master，单帧修图用 buddy-image-processing。
 ---
 
-# ReelCraft — 多 provider 视频流水线（v4.10.2）
+# ReelCraft — 多 provider 视频流水线（v4.18.0）
 
 ### 术语速查（新会话先扫这张表，再读正文）
 
@@ -34,6 +34,12 @@ description: 一句话需求 → 多 provider 生图/视频流水线（主力池
 | **qcgate / qcseq / qc** | 机器门禁（黑帧/规格）/ 跨镜**色调**一致性粗检（HSV 直方图）/ 抽首中尾 3 帧人眼验收 |
 | **audio-qc** | 音频侧门禁（v4.10）：静音占比 / 采样削波 / 平均响度 / 长静音段 + 语音判定。补 `qcgate` 只查**画面**的盲区——"旁白整段丢、音轨没接上"都是 rc=0 但成片坏掉。**v4.10.2 起 concat 前自动跑**，`--no-audio-qc` 关 |
 | **faces（人脸一致性）** | 跨镜**身份**一致性门禁（v4.10.1）：YuNet 检测 + SFace 128 维嵌入 + 余弦，判"**是不是同一个人**"。补 `qcseq` 只比**颜色**的错配——换了张脸但色调一致时，直方图看不出来。**v4.10.2 起 concat 前自动跑**（缺 cv2/模型则跳过并说明），`--no-faces` 关 |
+| **word-axis（词级时间轴）** | 把音频对到**逐词/逐字**时间（v4.12）：`python scripts/word_axis.py <音频> --lang zh --json` → `{text, words:[{w,at,dur}]}`。后端**双通道**（v4.16）：**中文 = sherpa paraformer-zh**（`sherpa-onnx-paraformer-zh-2023-09-14` int8 232MB，走 `pip install sherpa-onnx`，零 torch）——**逐字时间戳是真声学对齐**（不是插值），中文效果远好于 whisper；**英文/兜底 = ONNX Whisper**（79MB，锚点+能量吸附，⚠️ 不是 DTW）——需要更高精度得换带 QK 输出的导出（见脚本头注释）。缺依赖/模型 → 打安装指引 + rc=2（不假装通过）。**v4.13 起接进声音链**：`vo_build.py plan --words` 对每句录音跑词轴 → 稿里每句带 `words`（绝对时间）→ 字幕**按词边界切行**（标点保留，不再一坨） |
+| **speakers（说话人分离）** | 一段音频里**谁在什么时候说话**（v4.18）：`python scripts/speakers.py <音频> [--num-speakers N] --json` → `[{start,end,speaker}]`（speaker 按首次出现归零）。pyannote 切分（6MB）+ 3D-Speaker campplus 中文声纹（28MB）+ 聚类，纯本地 CPU；多角色漫剧把录好的对白对到角色的前提。缺模型 → 指引 + rc=2 |
+| **标点恢复** | `word_axis --punct`（v4.18）：sherpa ct-transformer 中英标点（0.03s 级），标点**挂回逐字词目**、时间戳不变；对不上原文则原样返回不编造。⚠️ 英文会得到中文式句号（模型偏中文） |
+| **dialogue（剧本/对白层）** | 剧本文本 → vo_lines.json（v4.20）：`python scripts/dialogue.py 剧本.txt --voices 角色表.json --out vo/vo_lines.json`。剧本体：`角色：台词` 每行一句、`#` 注释/分场、`[空镜说明]` 进 acts、行首 `[S01]` 标镜、`角色（激昂）：` 括号注记 = 该句 emotion（半角冒号也认）。角色表 JSON `{"阿明": "tongtong"}`；未映射角色 stderr 点名（不静默全默认——多角色全一个声音是事故）。产出直接喂 `vo_build plan --words --punct` → 合成成片。空剧本/坏角色表 die(2/3) |
+| **滤镜能力升级（v4.14）** | 去水印 v2（`--mode mask` 走 removelogo：mask 声明"这里永远是 logo"，固定角标不逐帧抖动）/ 防抖 `postprocess stabilize`（vidstab 两遍）/ 画质门禁 `qcgate --ref <参考>`（ssim 量化劣化）/ 可选核显编码 `concat --qsv`/ 旁白变速 `concat --voice-speed`（rubberband 变速不变调，**有字幕时拒绝**） |
+| **字幕渲染（ASS/libass，v4.15）** | 字幕默认走 **ASS**（`cues_to_ass` 出文档 → `ass=` 烧录），带词轴的字幕自动 **逐词高亮**（`\k`，接 v4.13 的词轴）；`--subtitle-render drawtext` 是回滚通道，`--no-karaoke` 关逐词。★ drawtext 对含裸 `%` 的文案会**整条静默不画**（rc 仍 0），现由 `expansion=none` 修好 |
 | **单变量重拍** | 画面不合格时一次只改一个变量（先改措辞→再调运动→再换首帧→最后换池） |
 | **断点续跑** | 每阶段幂等，有产物即跳过，中断后重跑同命令即可续 |
 | **Director's Read（导演读法）** | 拆镜前每镜先回答"为什么存在"，答不出的砍掉（`prompt-framework.md` 第 0 层） |
@@ -169,10 +175,14 @@ python scripts/media_gen.py status    # key 健康 + TTS 探测 + /models 能力
 - 话术必须大白话（完整选项见 `references/prompt-styles.md` 卡三"问档话术"）：**顶级 / 主流 / 开源中等 / 入门受限**，每档附熟悉例子；用户拿不准可点"帮我判断"，agent 才评估（探测+模型知识+必要时试跑）
 - 答案落 env `MEDIA_CUSTOM_n_TIER=ultra|high|mid|low`（**挂 key 不挂池**，同池 key 能力可能差几档），之后不再问
 - plan.json 可选加 `"tier_map": {"custom_key1": "high", "custom_key2": "low"}` 便于回溯
+  —— ⚠️ **记录字段，不驱动行为**（v4.11.0 明确）：真正换档靠 env `MEDIA_CUSTOM_n_TIER`
 
 **面向用户的话术原则（所有问项通用）**：①给用户看的选项一律大白话 + 熟悉例子；②**对用户只说"模型"**——"池/key/渠道"是内部概念，用户心智里只有"我接了几个模型"，术语（_ROLES/_TIER/CFG 这类）只写进 env/plan，不说给用户听；③并行度永远报真实清点数字（"你的家底最多 N 发"），不举可能误导的例子。
 
 确认后写入 `shots/plan.json`（`{"role_assign": "one-stop|split", "workers_image": N, "workers_video": N, "watermark": {"<池>": "clean|corner-delogo|fatal"}, "mode": "full|hybrid|stills", "hero_shots": [1,5,8], "video_pool_order": ["<主池>", "<备池>", "..."], "tier_map": {"<池>_key<N>": "ultra|high|mid|low"}}`），后续步骤照办，不再重复问。
+
+> **`role_assign` / `tier_map` 是记录字段（v4.11.0 明确）**：plan-check 会校验取值，并在它们出现时提示"仅作记录"。真正的开关是——分工用 `--provider-image`/`--provider-video` 或 key 的 `_ROLES`；换档用 env `MEDIA_CUSTOM_n_TIER`。
+
 单命令 `image/video` 的 `--provider` 留空时按 `MEDIA_PRIORITY` 自动选池；某池全部 key 失败自动跨池兜底。
 
 **视频超时询问协议**（video 命令退出码 4）：轮询超时会自动把 task_id 落盘（提交即扣，出片不浪费）并打印**实际可用**的备池菜单（从用户接入动态生成）。agent 拿到退出码 4 后**必须问用户三选**：①切下一池（按 plan.json 的 `video_pool_order` 顺序）②继续等（`video --wait-task <id>`，零扣分续等）③放弃该镜。决策记入 plan.json。被切走的任务**不取消**——之后任何时点跑 `media_gen.py harvest` 可收割已完成出片（自动下载到原定路径）。
@@ -385,7 +395,7 @@ python scripts/postprocess.py concat clips/ \
 3. **声音混音**（`--voice` / `--bgm` 任一给出才触发）：视频流 copy，只重编码音频，秒级完成
    - 环境音 `-10dB` 垫底 → 旁白 `0dB`（`--voice-delay` 起始延迟）→ BGM `-18dB`（`-stream_loop -1` 自动循环铺满）
    - `amix:normalize=0`：电平完全由 `--*-db` 决定，某路结束不会抬升其余音轨
-4. **烧字幕**（`--subtitles` JSON 列表 + `--slogan`）：多段 drawtext 链，淡入淡出由 alpha 表达式控制
+4. **烧字幕**（`--subtitles` JSON 列表 + `--slogan`，v4.15）：cue → ASS 文档（`ass_time`/`karaoke_text`/`cues_to_ass`）→ `ass=` 烧录；有词轴的 cue 自动加 `{\k}` 逐词高亮（`--no-karaoke` 关）。旧 drawtext 链保留为 `--subtitle-render drawtext`（回滚用，结构上无法逐词高亮）
 5. **自检** → 默认质量下限
 
 `--subtitles` JSON 格式（`{at}` 出现秒、`{dur}` 持续秒、`{dur:0}`=持续到片尾）：
@@ -405,8 +415,9 @@ python scripts/postprocess.py concat clips/ \
 
 **踩坑记录（勿重蹈）**：
 - 一旦显式写 `-map`，必须**同时映射视频和音频**，否则输出会变成纯音轨（画面整段丢失）
-- 中文字体路径在 filter 内必须加单引号：`fontfile='C\:/Windows/Fonts/simkai.ttf'`
-- drawtext 表达式内的逗号必须转义为 `\,`，否则被当作 filter 分隔符
+- **filter 内的本机路径一律走 `ff_path()`**（返回值**自带单引号**+转义冒号）：`fontfile=` / `ass=` / `removelogo` / `vidstab` / `ssim` 的 stats 文件共用；裸 `C:\...`、以及「有引号但不转义冒号」都会被 filter 解析器吃掉参数（实测 rc=4294967274 / 静默不渲染）
+- ASS 用**字体家族名**（默认 Microsoft YaHei）；自定义字体文件时只把**所在目录**当 `fontsdir` 传；ASS 的 `%` **不特殊**，别照抄 drawtext 的转义
+- （drawtext 旧通道）表达式内的逗号要转义为 `\,`；★ 含裸 `%` 的文案必须配 `expansion=none`，否则整条字幕静默不画
 - `volumedetect` 配 `-ss` 做分段电平测量不可靠（seek 误差），要精确就用 PCM 逐窗计算
 
 **兜底**：某镜视频生成失败 → kenburns 缓推顶替（命令见 Step 5 降级路径），规格与主链一致。
@@ -417,6 +428,9 @@ python scripts/postprocess.py concat clips/ \
 python scripts/delogo_watermark.py final.mp4 --provider <渠道>   # 按 watermark_profiles.json 实测框自动缩放
 python scripts/delogo_watermark.py in.mp4 --dry-run           # 只出红框标注 3x 自检图，确认框位不抹除
 python scripts/delogo_watermark.py in.mp4 --x 1133 --y 571 --w 54 --h 56   # 手动指定框
+python scripts/delogo_watermark.py in.mp4 --mode mask --x 1133 --y 571 --w 54 --h 56
+  # ↑ v4.14：走 removelogo（按框生成 mask 图）。固定角标**时序一致**，不逐帧抖动；
+  #   默认仍是 delogo（边缘插值）；--keep-mask 可留存 mask 图复用
 # 产出 *_nowm.mp4 + *_nowm_check.png（水印区 3x 自检图，务必目检有无残影/模糊斑）
 # 新渠道实测出框坐标后回写 scripts/watermark_profiles.json；动态/大面积水印档案记 fatal（换渠道或上 ProPainter）
 ```
@@ -447,7 +461,7 @@ VO 旁白稿（约 100-150 字，按幕分句）
 |---|---|---|
 | ① 写 VO 稿 | 对话模型按分镜主线写，每句对应具体镜号，存 `vo/vo_lines.json` | 旁白是治“画面散”的特效药：声音把镜头串成线 |
 | ② 分句合成 | `python scripts/vo_build.py vo/vo_lines.json --out vo/vo.m4a --total 55.94` | **按句** TTS，读回真实时长后 `adelay` 精确落位 |
-| ③ 字幕自动打轴 | 同上，脚本直接产出 `subtitles_final.json` | 与朗读 100% 对齐，不会出现“字幕和声音对不上” |
+| ③ 字幕自动打轴 | 同上，脚本直接产出 `subtitles_final.json` | 与朗读 100% 对齐；**v4.13 起**稿里带词轴时按**词边界**切成多条 cue（长句不再一坨） |
 | ④ 混音挂 BGM | `postprocess.py concat ... --voice vo/vo.m4a --bgm bgm.mp3` | 环境音默认 -10dB 垫底，不抢人声 |
 
 ### 文案怎么来：**AI 批量撒网 → 人工筛选改写**（不要自己硬写）
@@ -495,6 +509,23 @@ python scripts/vo_build.py plan vo/vo_lines.json --out vo/plan.json --gap 0.5 --
 脚本会做：越界检查（实际时长 > 到下一句的间隔则警告）→ 静音底铺满总长 → 各句精确落位 →
 输出 `subtitles_final.json` → 报告有声/留白占比（公益片留白 40-50% 较合适）。
 
+**字幕按词切行（v4.13，可选）**：`plan --words` 会给每句录音跑一遍词级时间轴
+（v4.16 起中文自动走 sherpa 逐字、英文走 whisper；可用 `--word-backend` 强制指定），
+词轴随稿写进 `vo_lines_at.json`；合成时字幕**按词边界**切成多条 cue——
+单条不超过约 20 汉字 / 6 秒（限宽按**显示宽度**算：CJK 计 2、拉丁计 1），尾片短于 0.3s 并回前一条。
+文本优先**按词定位从原文切片**，所以标点不丢；词与原文对不上（转写≠输入）时回退词拼接。
+缺模型/依赖会**明确报错**（rc=2 + 安装指引），不会静默退回句级。
+**v4.19 `--punct` 标点上词目**：`plan --punct`（隐含 `--words`）让 sherpa ct-transformer
+把标点挂回逐字词目（`乙。`），字幕自然带句读；仅 sherpa 后端支持——whisper 后端会明确报错
+rc=2，不静默给无标点轴（英文转写本就无标点，标点只对中文有增量）。
+**v4.15 起这些词轴真正上屏**：字幕渲染走 ASS，带词轴的 cue 自动加 `{\k}` 逐词高亮（`--no-karaoke` 关；渲染通道用 `--subtitle-render drawtext` 可回滚到无高亮的旧链路）。
+**v4.17 起切完再整形**（SubtitleEdit 三规则）：CPS 超标的行尾 cue **延长显示**进后方空隙（`--max-cps`，默认 20 宽度/秒≈10 汉字/秒，0 关）；相邻 cue 重叠时**缩前条让位**（`--cue-gap`，默认 0.08≈2 帧；缩无可缩如实计数，不静默删）。
+
+```bash
+python scripts/vo_build.py plan vo/vo_lines.json --out vo/plan.json --skip-tts --words --word-lang zh
+python scripts/vo_build.py vo/vo_lines_at.json --out vo/vo.m4a --total 55.94   # 字幕自动按词切
+```
+
 **TTS 未配置 key 时**脚本会明确报错并给出配置指引（不是静默失败）。渠道优先级（多 key 自动 failover，成功即停，**每把 key 连音色一起切**）：
 1. **硅基流动 CosyVoice2-0.5B**（中文情感强，`--emotion` 走文本引导）——默认主力
 2. **本地 Edge TTS 服务**（localhost:5050，免费；无情感，仅降级兜底）
@@ -533,6 +564,12 @@ python scripts/media_gen.py audio-qc clips/ --strict        # WARN 也算失败�
 
 ```bash
 # 单段机器门禁（PASS/WARN/FAIL + exit code，FAIL 时 --retry-failed 自动重跑）
+# 画质门禁（v4.14）：--ref 传**同规格**参考视频 → ssim 量化劣化（低于 --min-ssim 判 FAIL；
+#   取不到值只判 WARN，不当合格）。典型用法：成片 vs 上一版 / 重编码产物 vs 源
+python scripts/postprocess.py qcgate clips/clip_01.mp4 --ref clips/clip_01_v1.mp4 --min-ssim 0.95
+# 防抖（v4.14）：两遍 vidstab（detect→transform）；手持抖动 / 生成漂移都能压
+python scripts/postprocess.py stabilize clips/clip_01.mp4 --smoothing 10
+# 核显编码（v4.14）：--qsv 走 h264_qsv（本机实测可用）；不可用自动回退 libx264 并打印
 python scripts/postprocess.py qcgate clips/clip_05.mp4
 # 批量生成时就地过门禁（推荐，#4）：FAIL 的镜记为 FAIL，配合 --retry-failed 重跑
 python scripts/media_gen.py batch shots60/ --phase videos --workers 2 --qcgate
@@ -643,6 +680,38 @@ python scripts/media_gen.py run shots60/ --watermark <渠道> --watermark-dry-ru
 - state 文件 `~/.workbuddy/.media_state.json` 不含 key，只含冷却时间与统计（已加入 .gitignore）
 - ffmpeg 由 `scripts/ffmpeg_probe.py` 跨平台自动探测（环境变量 FFMPEG > PATH > imageio_ffmpeg > 托管路径），无需硬编码绝对路径
 - 密钥模板见仓库 `media_keys.env.example`，复制改名后填真实 key（切勿提交真实 key）
+
+## ComfyUI 算力机池（自托管 GPU：5070 / 4060 / 4090 …）
+
+**适用**：手上有台跑 ComfyUI 的机器（本机/局域网/Tailscale 都行），想用它的 GPU 出视频。
+**为什么不走通用池**：ComfyUI 不是 OpenAI 兼容接口（POST /prompt 提交工作流图 +
+GET /history 轮询 + /view 取产物），硬套 `/videos/generations` 必挂——所以它是**一等公民池**。
+
+```bash
+# ① 配 env（一次）：media_keys.env 加两行
+#   export MEDIA_COMFYUI_1_BASE="http://192.168.1.x:8188"   # 或 Tailscale 100.x.x.x
+#   export MEDIA_COMFYUI_1_KEY="local"                      # 占位，ComfyUI 不校验
+
+# ② 体检（必做）：看 GPU 型号 + 节点 + 权重清单
+python scripts/mg_comfyui.py http://192.168.1.x:8188
+
+# ③ 出片
+python scripts/media_gen.py video --provider comfyui \
+  --image shots/shot_04.png --prompt "slow water shimmer, macro" \
+  --video-size 1024x576 --num-frames 121 --steps 30 --cfg 3.5 --out clips/clip_04.mp4
+```
+
+**不绑模型**（关键设计）：同一模型在不同机器上装的是不同节点封装（Wan2.2 原生 /
+ComfyUI-WanVideoWrapper / LTX-Video / HunyuanVideo…），硬编码任何一套工作流换机即废。
+本池的做法是 `/object_info` 拿上游**真实**节点签名 → 按角色挑节点 →
+**按端口类型自动连线**（MODEL/CLIP/VAE/IMAGE/LATENT/CONDITIONING）。换模型零改码。
+
+- `--model wan2.2`：权重名关键字，从上游清单里挑（留空按 i2v/版本关键字自动挑）
+- `--workflow 图.json`：自动拼不出来时的兜底，支持 `{prompt}/{negative}/{width}/{height}/{frames}/{fps}/{image}` 占位符
+- `COMFYUI_DEBUG=1`：把拼出来的工作流图落到 `<out>.graph.json`，排错用
+- 产物是 webp/webm 时自动转 mp4（Pillow 抽帧兜底：webp 直解常因 Exif 失败）
+- ⚠️ 需**显式** `--provider comfyui`：重资产 GPU 机不参与自动兜底路由
+- ⚠️ LTX 用户注意：`--cfg` 必须 ≥ 2.0（cfg=1.0 实测出**静止**画面，字节级全等）
 
 ## 扩容指南（多 key / 新 provider 接入）
 

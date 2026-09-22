@@ -55,10 +55,352 @@ def find_font() -> str:
     return ""  # unreachable
 
 def _escape_drawtext(text: str) -> str:
-    """drawtext 文本转义：\\ → \\\\，' → \\'，% → \\%（%{...} 是 drawtext 表达式语法，
-    字幕含 \"100%\" 不转义会解析异常，#11）。顺序必须先 \\ 再 ' 最后 %。"""
-    return str(text).replace("\\", "\\\\").replace("'", "\\'").replace("%", "\\%")
+    """drawtext 文本转义：反斜杠翻倍；单引号前加反斜杠。
 
+    ★ **不再转义 % **（v4.15 实测推翻旧做法）：旧版按「#11 的 100% 解析异常」把百分号
+    写成「反斜杠+%」，但在 ffmpeg 7.1 上那与裸 % 、%% 一样触发 drawtext 的
+    `Stray % near '...'`，后果是**整条字幕一个字都不画、rc 仍为 0**（典型静默失败）。
+    正解是在滤镜里加 `expansion=none`（见 `_drawtext_filters`）让 % 当字面量。
+    """
+    return str(text).replace("\\", "\\\\").replace("'", "\\'")
+
+
+
+# ─── filter 路径转义 + 画质门禁 + 编码器选择（v4.14 ③ ffmpeg 能力升级）───
+ENC_CRF = 20                 # libx264 质量（与既有链一致）
+ENC_QSV_QUALITY = 28         # QSV global_quality（数值语义与 crf 不同，28 ≈ crf 20~23）
+_QSV_CACHE: bool | None = None
+
+
+def ff_path(p) -> str:
+    """本地路径 → 可安全放进 ffmpeg filter 参数的形式。
+
+    ★ 实测（2026-09-22，ffmpeg 7.1）：`removelogo=filename=C:\\Users\\...` 直接崩
+    （rc=4294967274，"No option name near 'Usersword4...'"）；**单引号包住但不转义冒号
+    同样崩**。可靠写法只有两种：转义冒号（`C\\:/path`，可再套单引号）或"相对名 + cwd"。
+    所以 filter 里的**任何文件名**（removelogo / vidstab / ssim stats_file / subtitles /
+    fontfile）都必须走这里。**返回值已含单引号**，直接写 `opt={ff_path(p)}`——再套一层引号会崩。
+    """
+    esc = str(p).replace("\\", "/").replace(":", "\\:")
+    return f"'{esc}'"
+
+
+# ─── 字幕渲染：ASS 生成（v4.15，替代 drawtext 为默认通道）──────────────
+# 为什么换：drawtext 每句一个滤镜、转义规则刁钻（\ ' %），且**结构上做不到逐词高亮**。
+# ASS 走 libass，一次加载全部字幕，带正式样式 + karaoke 高亮。
+# ★ 实测（2026-09-22，ffmpeg 7.1，PIL 数像素判定）：
+#   · `ass='C\:/path'`（ff_path 的输出）**真出像素**；裸路径 rc=4294967274（与 removelogo 同因）
+#   · 字体用**家族名**（Microsoft YaHei）即可，不必给 fontfile（libass 走 DirectWrite）；
+#     `fontsdir=` 也被接受，自定义字体仍可覆盖
+#   · `\k` 语义：**未唱 = SecondaryColour，已唱 = PrimaryColour**（帧序列实测 蓝→白单调）
+#     → 所以「K 样式」把 Primary 设成高亮色、Secondary 设成常态色，才能得到"唱到就点亮"
+ASS_PLAIN_STYLE = "S"            # 无词轴：常态色
+ASS_K_STYLE = "K"                # 有词轴：Primary=已唱高亮，Secondary=未唱常态
+ASS_DEFAULT_FONT = "Microsoft YaHei"
+ASS_HIGHLIGHT = "gold"           # 逐词高亮的"已唱"色
+
+_ASS_COLORS = {
+    "white": "&H00FFFFFF", "black": "&H00000000", "yellow": "&H0000FFFF",
+    "gold": "&H0000D7FF", "orange": "&H0000A5FF", "red": "&H000000FF",
+    "green": "&H0000FF00", "blue": "&H00FF0000", "cyan": "&H00FFFF00",
+    "gray": "&H00808080", "grey": "&H00808080",
+}
+_ASS_POS = {"bottom": (2, 80), "center": (5, 0), "left": (4, 0)}
+
+
+def ass_color(name, *, alpha: str = "00") -> str:
+    """颜色名 / `&H...` 串 → ASS `&HAABBGGRR`。认不出回退白（字幕不该因颜色名崩）。"""
+    s = str(name or "").strip()
+    if re.match(r"^&H[0-9A-Fa-f]{6,8}$", s):
+        return s if len(s) == 10 else "&H" + alpha + s[2:].rjust(6, "0")
+    return _ASS_COLORS.get(s.lower(), _ASS_COLORS["white"])
+
+
+def ass_time(t) -> str:
+    """秒 → ASS 时间戳 `H:MM:SS.cc`（厘秒、小时不补零）。非法/负值/NaN → 0:00:00.00。"""
+    try:
+        v = float(t)
+    except (TypeError, ValueError):
+        v = 0.0
+    if v != v or v < 0:                     # NaN / 负
+        v = 0.0
+    cs = int(round(v * 100))
+    h, rem = divmod(cs, 360000)
+    m, rem = divmod(rem, 6000)
+    sec, cc = divmod(rem, 100)
+    return f"{h}:{m:02d}:{sec:02d}.{cc:02d}"
+
+
+def ass_text(s) -> str:
+    """ASS 文本转义：`\\`→`\\\\`，`{`→`\\{`，`}`→`\\}`，换行→`\\N`。
+
+    ★ 与 drawtext 不同：`%` 在 ASS **不特殊**（照抄 _escape_drawtext 会多出反斜杠）。
+    """
+    t = str(s).replace("\\", "\\\\").replace("{", "\\{").replace("}", "\\}")
+    return t.replace("\r\n", "\\N").replace("\r", "\\N").replace("\n", "\\N")
+
+
+def karaoke_text(text, words, *, sep_cjk: bool = True) -> str:
+    """cue 文本 + 词轴 → 带 `{\\k厘秒}` 的 ASS 文本（逐词高亮）。
+
+    文本尽量取**原文**（保标点）：借 vo_build._map_words_to_text 把词映回原文区间
+    （函数内 import——postprocess 是底层模块，不该在顶层依赖 vo_build）。
+    对不上原文则回退词拼接，与 vo_build._cue_text 同一策略（原文优先，时间始终来自词轴）。
+    无可用词 → 原样返回（不带标签，与旧行为一致）。
+    """
+    ws = [w for w in (words or [])
+          if isinstance(w, dict) and str(w.get("w") or "").strip()]
+    if not ws:
+        return ass_text(text)
+    src = str(text or "")
+    is_cjk = None
+    spans = None
+    try:
+        from vo_build import _is_cjk_char, _map_words_to_text
+        is_cjk = _is_cjk_char
+        spans = _map_words_to_text(src, ws)
+    except Exception:
+        spans = None
+    segs: list = []                          # [(片段文本, 词)]
+    if spans:
+        prev = 0
+        for i, w in enumerate(ws):
+            sp = spans[i]
+            if not sp:                       # 纯标点词：不占段落（时间并入下一词）
+                continue
+            segs.append((src[prev:sp[1]], w))
+            prev = sp[1]
+        if segs and prev < len(src):         # 尾部残余（句点等）挂在最后一段
+            segs[-1] = (segs[-1][0] + src[prev:], segs[-1][1])
+    if not segs:                             # 回退：词拼接（CJK 之间不补空格）
+        for w in ws:
+            t = str(w.get("w") or "").strip()
+            pre = " "
+            if not segs or (sep_cjk and is_cjk is not None
+                            and (is_cjk(segs[-1][0][-1:]) or is_cjk(t[:1]))):
+                pre = ""
+            segs.append((pre + t, w))
+    out = []
+    for seg, w in segs:
+        try:
+            cs = max(1, int(round(float(w.get("dur") or 0.0) * 100)))
+        except (TypeError, ValueError):
+            cs = 1
+        out.append(f"{{\\k{cs}}}{ass_text(seg)}")
+    return "".join(out)
+
+
+def _ass_style_line(name: str, *, font: str, size: int, primary: str, secondary: str,
+                    back_color: str, border_style: int, outline: int, shadow: int,
+                    align: int = 2) -> str:
+    """ASS `Style:` 行（字段顺序固定，少一个就整份失效）。"""
+    return (f"Style: {name},{font},{size},{primary},{secondary},&H00000000,"
+            f"{back_color},0,0,0,0,100,100,0,0,{border_style},{outline},{shadow},"
+            f"{align},20,20,24,1")
+
+
+def cues_to_ass(cues, *, width, height, duration: float = 0.0, font: str = "",
+                style=None, karaoke: bool = True, base_size: int = 48,
+                base_color: str = "white") -> str:
+    """cue 列表 → 完整 ASS 文档（纯函数）。
+
+    cue = {at, dur, text, pos?, size?, fade?, words?}；`dur<=0` = 出现后持续到片尾
+    （--slogan 的语义）。有 `words` 且 karaoke=True → 走 K 样式逐词高亮。
+    样式是**全局**的、逐条差异用 override 标签（\\an/\\pos/\\fs/\\fad）——这是 ASS 的模型。
+    """
+    st = dict(style or {})
+    fam = font or ASS_DEFAULT_FONT
+    plain = ass_color(st.get("fontcolor") or base_color)
+    hi = ass_color(st.get("karaoke_color") or ASS_HIGHLIGHT)
+    box = bool(st.get("box"))
+    border_style = 3 if box else 1           # 3 = OpaqueBox（底框风格）
+    outline = int(st.get("outline", 8 if box else 2))
+    shadow = int(st.get("shadow", 0 if box else 1))
+    back = ass_color(st.get("back_colour") or "black", alpha="A0")
+    doc = [
+        "[Script Info]", "ScriptType: v4.00+",
+        f"PlayResX: {int(width)}", f"PlayResY: {int(height)}",
+        "WrapStyle: 2",                       # 2 = 不自动折行（断句已在 split_line_cues 做过）
+        "ScaledBorderAndShadow: yes", "",
+        "[V4+ Styles]",
+        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, "
+        "BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, "
+        "BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
+        _ass_style_line(ASS_PLAIN_STYLE, font=fam, size=int(base_size), primary=plain,
+                        secondary=plain, back_color=back, border_style=border_style,
+                        outline=outline, shadow=shadow),
+        _ass_style_line(ASS_K_STYLE, font=fam, size=int(base_size), primary=hi,
+                        secondary=plain, back_color=back, border_style=border_style,
+                        outline=outline, shadow=shadow), "",
+        "[Events]",
+        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
+    ]
+    W, H = int(width), int(height)
+    for s in cues or []:
+        at = float(s.get("at") or 0.0)
+        dur = float(s.get("dur") or 0.0)
+        end = at + dur if dur > 0 else max(at + 0.5, float(duration or 0.0))
+        if end <= at:
+            end = at + 0.5
+        words = s.get("words") or []
+        use_k = bool(karaoke and words)
+        align, mv = _ASS_POS.get(str(s.get("pos") or "bottom"), _ASS_POS["bottom"])
+        # 位置用 \pos 精确复刻旧 drawtext 的几何（\an2 底中 /\an5 正中 /\an4 左中）
+        if align == 2:
+            pos = f"{W // 2},{H - mv}"
+        elif align == 4:
+            pos = f"70,{H // 2}"
+        else:
+            pos = f"{W // 2},{H // 2}"
+        tags = f"\\an{align}\\pos({pos})"
+        try:
+            size = int(s.get("size") or base_size)
+        except (TypeError, ValueError):
+            size = int(base_size)
+        if size != int(base_size):
+            tags += f"\\fs{size}"
+        try:
+            fade = float(s.get("fade") or 0.0)
+        except (TypeError, ValueError):
+            fade = 0.0
+        if fade > 0:
+            ms = int(round(fade * 1000))
+            tags += f"\\fad({ms},{ms})"
+        body = karaoke_text(s.get("text", ""), words) if use_k else ass_text(s.get("text", ""))
+        doc.append(f"Dialogue: 0,{ass_time(at)},{ass_time(end)},"
+                   f"{ASS_K_STYLE if use_k else ASS_PLAIN_STYLE},,0,0,0,,{tags}{body}")
+    return "\n".join(doc) + "\n"
+
+
+def ass_filter(ass_path, fonts_dir: str = "") -> str:
+    """→ `ass=<ff_path>`（可选 `fontsdir`，同样走 ff_path——裸路径必崩）。"""
+    s = f"ass={ff_path(ass_path)}"
+    if fonts_dir:
+        s += f":fontsdir={ff_path(fonts_dir)}"
+    return s
+
+
+def ass_style_spec(preset: str) -> dict:
+    """预设名 → ASS 样式规格（读 subtitle_presets.json 的 `ass` 子字典）。
+
+    用**显式**的 ass 字典，而不是去解析 drawtext 的 box/borderw 参数串——那是"解析自己的
+    历史格式"，脆且易漂。预设不存在/无 ass 键 → 空字典（用默认样式）。
+    """
+    if not preset:
+        return {}
+    try:
+        item = (load_presets() or {}).get(preset) or {}
+    except Exception:
+        return {}
+    spec = item.get("ass")
+    return dict(spec) if isinstance(spec, dict) else {}
+
+
+_SSIM_ALL = re.compile(r"\bAll:\s*([0-9.]+)", re.I)
+
+
+def parse_ssim_stats(text: str):
+    """ssim stats/日志文本 → 末帧 All 值（float）；取不到返回 None。
+
+    为什么不用 stderr：ssim 的结果是 **info 级**日志，`-loglevel error` 会把它吞掉 ——
+    rc=0 却零信息（实测踩到）。`stats_file=` 才是可靠通道。
+    """
+    if not text:
+        return None
+    last = None
+    for line in text.splitlines():
+        for m in _SSIM_ALL.finditer(line):
+            try:
+                last = float(m.group(1))
+            except ValueError:
+                continue
+    if last is None and re.search(r"All:\s*1\.0+\s*\(inf\)", text, re.I):
+        return 1.0
+    return last
+
+
+def ssim_verdict(value, min_ssim: float = 0.95):
+    """(级别, 说明)。**取不到值 = WARN**（未知 ≠ 合格，同 duration_verdict 口径）。"""
+    if value is None:
+        return "WARN", f"SSIM 取不到（参考对比失败？）阈值 {min_ssim}"
+    if value + 1e-9 < min_ssim:
+        return "FAIL", f"SSIM {value:.4f} < 阈值 {min_ssim}（画质劣化）"
+    return "PASS", f"SSIM {value:.4f} ≥ {min_ssim}"
+
+
+def _ssim_between(a: str, b: str):
+    """两路视频/图片的 SSIM（末帧 All 值）；取不到返回 None。
+
+    ★ stats_file 的路径同样必须 ff_path 转义；数值只在 stats 文件里——
+      `-loglevel error` 会吞掉 stderr 版（rc=0 却零信息，实测踩到）。
+    """
+    import tempfile as _tf
+    with _tf.TemporaryDirectory(prefix="rc_ssim_") as td:
+        sf = Path(td) / "ssim.log"
+        r = subprocess.run(
+            [_ffmpeg(), "-y", "-loglevel", "error", "-i", a, "-i", b,
+             "-lavfi", f"ssim=stats_file={ff_path(sf)}", "-f", "null", "-"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace")
+        if r.returncode != 0:
+            print(f"[qcgate] ssim 对比失败 rc={r.returncode}: "
+                  f"{(r.stderr or '').strip()[-200:]}", file=sys.stderr)
+            return None
+        if not sf.exists():
+            return None
+        return parse_ssim_stats(sf.read_text(encoding="utf-8", errors="replace"))
+
+
+def resolve_encoder(use_qsv: bool, *, available: bool):
+    """(编码参数 list, 实际 encoder 名)。请求 QSV 但不可用 → 回退 libx264 **并如实标注**。
+
+    实测（2026-09-22）本机 h264_qsv 在 纯编码 / +drawtext / +subtitles 三种链路都能出片，
+    且字幕真烧上（抽帧底部亮像素 89，无字幕对照 0）。
+    """
+    if use_qsv and available:
+        return ["-c:v", "h264_qsv", "-global_quality", str(ENC_QSV_QUALITY)], "h264_qsv"
+    return ["-c:v", "libx264", "-preset", "medium", "-crf", str(ENC_CRF)], "libx264"
+
+
+def voice_speed_filter(speed: float) -> str:
+    """旁白变速过滤串（rubberband —— **变速不变调**）。1.0 → 空串（调用方不加）。"""
+    try:
+        v = float(speed)
+    except (TypeError, ValueError):
+        die(f"--voice-speed 需要数字，收到 {speed!r}", 2)
+    if abs(v - 1.0) < 1e-6:
+        return ""
+    if not (0.5 <= v <= 2.0):
+        die(f"--voice-speed {v} 超出安全范围 0.5~2.0（再夸张会明显失真）", 2)
+    return f"rubberband=tempo={v:g}"
+
+
+def qsv_available() -> bool:
+    """本机 h264_qsv 真能用？（encoder 列表 + 0.2s 冒烟编码；结果缓存）。
+
+    只在"列表里有"不够——驱动/权限问题会让它装得出来却跑不起来。
+    """
+    global _QSV_CACHE
+    if _QSV_CACHE is None:
+        ok = False
+        try:
+            r = subprocess.run([_ffmpeg(), "-hide_banner", "-encoders"],
+                               capture_output=True, text=True, encoding="utf-8",
+                               errors="replace", timeout=30)
+            if "h264_qsv" in (r.stdout or ""):
+                import tempfile as _tf
+                with _tf.TemporaryDirectory() as td:
+                    p = os.path.join(td, "q.mp4")
+                    args, _ = resolve_encoder(True, available=True)
+                    r2 = subprocess.run(
+                        [_ffmpeg(), "-y", "-loglevel", "error", "-f", "lavfi",
+                         "-i", "testsrc=size=160x120:rate=10:duration=0.2", *args, p],
+                        capture_output=True, timeout=60)
+                    ok = (r2.returncode == 0 and os.path.exists(p)
+                          and os.path.getsize(p) > 0)
+        except Exception:
+            ok = False
+        _QSV_CACHE = ok
+    return _QSV_CACHE
 
 
 # ─── 字幕：srt 导入 + 样式预设（v4.2） ─────────────────────
@@ -219,6 +561,17 @@ def audio_src(has_audio: bool, idx: int, dur: float) -> str:
 def cmd_concat(args) -> None:
     clips_dir = Path(args.clips)
     clips = _collect_clips(clips_dir)
+    # 编码器（v4.14）：--qsv 走核显；不可用则回退 libx264 并**如实打印**
+    use_qsv = bool(getattr(args, "qsv", False))
+    enc, enc_name = resolve_encoder(use_qsv, available=qsv_available())
+    if use_qsv and enc_name != "h264_qsv":
+        print("[postprocess] --qsv 请求了但本机不可用 → 已回退 libx264", file=sys.stderr)
+    # 旁白变速与字幕互斥：字幕轴是按**原速**旁白打的，变速后必然错位
+    sp_f = voice_speed_filter(getattr(args, "voice_speed", 1.0))
+    if sp_f and (getattr(args, "subtitles", "") or getattr(args, "slogan", "")):
+        die("--voice-speed 会让字幕轴失效（字幕按原速旁白打轴）——去掉字幕，或先变速再重新打轴", 2)
+    if sp_f:
+        print(f"[postprocess] 旁白变速 {sp_f}（rubberband 变速不变调）", file=sys.stderr)
     # 一次性探测每片（规格/时长/音轨）——避免同一文件被反复 ffprobe，也保证
     # 规格告警、xfade offset、音轨补齐用的是同一份数据
     _probes = [probe(str(c)) for c in clips]
@@ -346,7 +699,7 @@ def cmd_concat(args) -> None:
     norm_cmd = [
         _ffmpeg(), "-y", "-loglevel", "error", "-i", str(merged),
         "-vf", vf,
-        "-c:v", "libx264", "-preset", "medium", "-crf", "20",
+        *enc,
         "-pix_fmt", "yuv420p", "-movflags", "+faststart",
     ]
     if probe(str(merged)).get("audio"):
@@ -390,8 +743,9 @@ def cmd_concat(args) -> None:
             #    （v4.7.7 修 P0：实证 10s 画面 + 3s 旁白 → 4.02s 成片，rc=0）；
             # ② 多路：避免 amix 在某路结束时抬升其余音轨电平。
             pad = f",apad=whole_dur={_out_dur:.3f}" if _out_dur > 0 else ""
+            sp_c = f",{sp_f}" if sp_f else ""
             fc.append(f"[{voice_idx}:a]aresample=48000,adelay={d}|{d},"
-                      f"volume={args.voice_db}dB{pad}[vo]")
+                      f"volume={args.voice_db}dB{sp_c}{pad}[vo]")
             srcs.append("[vo]")
         if bgm_idx is not None:
             fc.append(f"[{bgm_idx}:a]aresample=48000,volume={args.bgm_db}dB[bm]")
@@ -444,61 +798,37 @@ def cmd_concat(args) -> None:
                      "pos": args.slogan_position, "size": 64,
                      "fade": args.slogan_fade})
 
+    # 字幕：默认走 ASS/libass（v4.15，支持逐词高亮），drawtext 保留为回滚通道
+    ass_subs = clips_dir / "_subs.ass"
     if subs:
         out_tmp = clips_dir / "_with_text.mp4"
-        font = find_font()
-        font_escaped = font.replace("\\", "/").replace(":", "\\:")
-        draws: list[str] = []
-        for i, s in enumerate(subs):
-            text = _escape_drawtext(str(s.get("text", "")))
-            at = float(s.get("at", 0))
-            dur = float(s.get("dur", 0))
-            fade = float(s.get("fade", 0.6))
-            size = int(s.get("size", 48))
-            pos = s.get("pos", "bottom")
-            fontcolor = s.get("fontcolor", "white")
-            box_extra = str(s.get("box", "") or "")   # 预设附加参数（底框/描边），空=无
-            if pos == "center":
-                xy = "x=(w-text_w)/2:y=(h-text_h)/2"
-            elif pos == "left":
-                xy = "x=70:y=(h-text_h)/2"
-            else:
-                xy = f"x=(w-text_w)/2:y=h-{80 + size}"
-            # 有底框/描边时阴影会让字发糊，二选一；无框才带默认阴影。
-            # 拼接时逐段补冒号，绝不输出空段，避免产生 "::" 双冒号（ffmpeg 报 Invalid argument）
-            extras = []
-            if box_extra:
-                extras.append(box_extra)
-            else:
-                extras.append("shadowcolor=black@0.7:shadowx=3:shadowy=3")
-            extra_str = ":" + ":".join(extras)
-            if dur > 0:
-                end = at + dur
-                if fade > 0:
-                    # 淡入 + 淡出（表达式内逗号必须转义为 \, ）
-                    alpha = (f"if(lt(t\\,{at:.2f})\\,0\\,"
-                             f"if(lt(t\\,{at + fade:.2f})\\,((t-{at:.2f})/{fade:.2f})\\,"
-                             f"if(lt(t\\,{end:.2f})\\,1\\,"
-                             f"if(lt(t\\,{end + fade:.2f})\\,(({end:.2f}-t)/{fade:.2f})\\,0))))")
-                else:
-                    alpha = f"between(t\\,{at:.2f}\\,{end:.2f})"
-            else:
-                # 无 dur = 出现后持续到片尾（落版）
-                if fade > 0:
-                    alpha = (f"if(lt(t\\,{at:.2f})\\,0\\,"
-                             f"if(lt(t\\,{at + fade:.2f})\\,((t-{at:.2f})/{fade:.2f})\\,1))")
-                else:
-                    alpha = f"gte(t\\,{at:.2f})"
-            draws.append(
-                f"drawtext=text='{text}':fontfile='{font_escaped}':"
-                f"fontcolor={fontcolor}:fontsize={size}:{xy}{extra_str}:alpha='{alpha}'"
-            )
+        if str(getattr(args, "subtitle_render", "") or "ass") == "drawtext":
+            vf = ",".join(_drawtext_filters(subs, find_font()))
+        else:
+            info = probe(str(norm))
+            w = int(info.get("width") or 0) or 1280
+            h = int(info.get("height") or 0) or 720
+            ass_subs.write_text(cues_to_ass(
+                subs, width=w, height=h,
+                duration=float(info.get("duration") or 0.0),
+                font=getattr(args, "subtitle_font", "") or ASS_DEFAULT_FONT,
+                style=ass_style_spec(preset),
+                base_size=int(subs[0].get("size", 48) or 48),
+                base_color=subs[0].get("fontcolor") or "white",
+                karaoke=not getattr(args, "no_karaoke", False)), encoding="utf-8")
+            # 自定义字体文件（_FFMPEG_FONT）时把所在目录交给 libass；默认不传——
+            # ASS 用**家族名**解析字体，不需要 find_font()（少一个 die 点）
+            env_font = os.environ.get("_FFMPEG_FONT", "")
+            vf = ass_filter(ass_subs,
+                            fonts_dir=str(Path(env_font).parent) if env_font else "")
+            n_k = sum(1 for s in subs if s.get("words"))
+            k_note = f"（{n_k} 条逐词高亮）" if n_k else ""
+            print(f"[postprocess] 字幕走 ASS/libass：{len(subs)} 条{k_note}", file=sys.stderr)
         txt_cmd = [_ffmpeg(), "-y", "-loglevel", "error", "-i", str(norm),
-                   "-vf", ",".join(draws),
-                   "-c:v", "libx264", "-preset", "medium", "-crf", "20",
-                   "-pix_fmt", "yuv420p", "-movflags", "+faststart"]
-        # 注意：一旦显式 -map，就必须把视频流也写上，否则会输出纯音轨
-        txt_cmd += ["-map", "0:v"]
+                   "-vf", vf, *enc,
+                   "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+                   # 注意：一旦显式 -map，就必须把视频流也写上，否则会输出纯音轨
+                   "-map", "0:v"]
         if probe(str(norm)).get("audio"):
             txt_cmd += ["-map", "0:a", "-c:a", "aac", "-b:a", "192k"]
         txt_cmd += [str(out_tmp)]
@@ -511,7 +841,7 @@ def cmd_concat(args) -> None:
     os.replace(norm, final)
     # 清理中间文件（listfile 仅直切分支存在；out_tmp 仅字幕分支存在）
     out_tmp = clips_dir / "_with_text.mp4"
-    for p in (merged, listfile, out_tmp):
+    for p in (merged, listfile, out_tmp, ass_subs):
         try:
             if p is not None and p.exists() and p.resolve() != final.resolve():
                 p.unlink()
@@ -519,6 +849,62 @@ def cmd_concat(args) -> None:
             pass
     print(f"[postprocess] -> {final}")
     print(json.dumps(probe(str(final)), indent=2))
+
+def _drawtext_filters(subs: list, font: str) -> list:
+    """旧的 drawtext 通道：cue 列表 → 一组 drawtext 滤镜串（`--subtitle-render drawtext`）。
+
+    v4.15 起默认不再走这里——drawtext **结构上做不到逐词高亮**，且转义规则刁钻（\\ ' %）。
+    保留它是为了回滚与极端兼容场景；位置/淡入淡出的表达式逻辑原样不动。
+    """
+    font_arg = ff_path(font)          # 单源：已含引号，直接嵌进 filter
+    draws: list[str] = []
+    for _i, s in enumerate(subs):
+        text = _escape_drawtext(str(s.get("text", "")))
+        at = float(s.get("at", 0))
+        dur = float(s.get("dur", 0))
+        fade = float(s.get("fade", 0.6))
+        size = int(s.get("size", 48))
+        pos = s.get("pos", "bottom")
+        fontcolor = s.get("fontcolor", "white")
+        box_extra = str(s.get("box", "") or "")   # 预设附加参数（底框/描边），空=无
+        if pos == "center":
+            xy = "x=(w-text_w)/2:y=(h-text_h)/2"
+        elif pos == "left":
+            xy = "x=70:y=(h-text_h)/2"
+        else:
+            xy = f"x=(w-text_w)/2:y=h-{80 + size}"
+        # 有底框/描边时阴影会让字发糊，二选一；无框才带默认阴影。
+        # 拼接时逐段补冒号，绝不输出空段，避免产生 "::" 双冒号（ffmpeg 报 Invalid argument）
+        extras = []
+        if box_extra:
+            extras.append(box_extra)
+        else:
+            extras.append("shadowcolor=black@0.7:shadowx=3:shadowy=3")
+        extra_str = ":" + ":".join(extras)
+        if dur > 0:
+            end = at + dur
+            if fade > 0:
+                # 淡入 + 淡出（表达式内逗号必须转义为 \, ）
+                alpha = (f"if(lt(t\\,{at:.2f})\\,0\\,"
+                         f"if(lt(t\\,{at + fade:.2f})\\,((t-{at:.2f})/{fade:.2f})\\,"
+                         f"if(lt(t\\,{end:.2f})\\,1\\,"
+                         f"if(lt(t\\,{end + fade:.2f})\\,(({end:.2f}-t)/{fade:.2f})\\,0))))")
+            else:
+                alpha = f"between(t\\,{at:.2f}\\,{end:.2f})"
+        else:
+            # 无 dur = 出现后持续到片尾（落版）
+            if fade > 0:
+                alpha = (f"if(lt(t\\,{at:.2f})\\,0\\,"
+                         f"if(lt(t\\,{at + fade:.2f})\\,((t-{at:.2f})/{fade:.2f})\\,1))")
+            else:
+                alpha = f"gte(t\\,{at:.2f})"
+        draws.append(
+            f"drawtext=text='{text}':fontfile={font_arg}:"
+            f"fontcolor={fontcolor}:fontsize={size}:{xy}{extra_str}"
+            f":expansion=none:alpha='{alpha}'"   # expansion=none：% 当字面量，否则含 % 的字幕整条消失
+        )
+    return draws
+
 
 # ─── 自检 ─────────────────────────────────────────────────
 def cmd_check(args) -> None:
@@ -628,6 +1014,16 @@ def cmd_qcgate(args) -> None:
             if st["motion"] < args.motion_th and len(frames) >= 3:
                 add("WARN", f"近乎完全静帧（相邻帧均值差 {st['motion']:.3f}<{args.motion_th}）——"
                             f"i2v 可能未生效或纯静帧源；stills/kenburns 档可忽略")
+
+    # ③ 参考对比（--ref，v4.14）：ssim 量化"劣化到什么程度"（图与视频皆可）
+    if getattr(args, "ref", ""):
+        ref = Path(args.ref)
+        if not ref.exists():
+            add("FAIL", f"--ref 参考不存在: {ref}")
+        else:
+            _sv = _ssim_between(str(path), str(ref))
+            _lv, _msg = ssim_verdict(_sv, float(getattr(args, "min_ssim", 0.95)))
+            add(_lv, f"对比参考 {ref.name}：{_msg}")
 
     levels = {v[0] for v in verdict}
     if "FAIL" in levels:
@@ -789,6 +1185,43 @@ def cmd_extract(args) -> None:
     print(f"[postprocess] last frame -> {out}")
 
 # ─── Ken Burns 兜底：静帧 → 缓慢推近视频 ──────────────────
+def cmd_stabilize(args) -> None:
+    """vidstab 两遍防抖（v4.14）：第一遍分析运动 → 第二遍按分析结果变换。
+
+    两遍是 vidstab 的设计（不是可选优化）：detect 写 transforms 文件，transform 读它。
+    实测（2026-09-22，ffmpeg 7.1）：`input=` 路径必须走 ff_path 转义，否则 filter
+    解析器直接崩（rc=4294967274）；另外 `unsharp` **不是**本滤镜的选项（别凭记忆写参数）。
+    """
+    src = Path(args.input)
+    if not src.exists():
+        die(f"输入不存在: {src}", 2)
+    info = probe(str(src))
+    if not info.get("duration"):
+        die("探测不到时长（文件损坏或无视频流）", 2)
+    out = Path(args.out) if args.out else src.with_name(src.stem + "_stab.mp4")
+    os.makedirs(os.path.dirname(str(out)) or ".", exist_ok=True)
+    import tempfile as _tf
+    enc, enc_name = resolve_encoder(getattr(args, "qsv", False),
+                                   available=qsv_available())
+    print(f"[stabilize] {src.name} → {out.name}（smoothing={args.smoothing} "
+          f"shakiness={args.shakiness} 编码器={enc_name}）")
+    r2 = -1
+    with _tf.TemporaryDirectory(prefix="rc_stab_") as td:
+        trf = Path(td) / "transforms.trf"
+        r1 = run([_ffmpeg(), "-y", "-loglevel", "error", "-i", str(src),
+                  "-vf", f"vidstabdetect=result={ff_path(trf)}:shakiness={args.shakiness}",
+                  "-f", "null", "-"])
+        if r1 != 0 or not trf.exists():
+            die(f"vidstabdetect 失败 rc={r1}（滤镜不可用或输入异常）", 3)
+        r2 = run([_ffmpeg(), "-y", "-loglevel", "error", "-i", str(src),
+                  "-vf", f"vidstabtransform=input={ff_path(trf)}:zoom=0:"
+                         f"smoothing={args.smoothing}",
+                  *enc, "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(out)])
+    if r2 != 0 or not out.exists() or out.stat().st_size == 0:
+        die(f"vidstabtransform 失败 rc={r2}", 3)
+    print(f"[stabilize] -> {out}  ({probe(str(out)).get('duration', 0):.2f}s)")
+
+
 def cmd_kenburns(args) -> None:
     """视频生成失败时的兜底：关键帧 → N 秒缓慢推近片段（与主链同规格）。
     注意 zoompan 表达式内的逗号必须写成 \\, 否则会与 filter 参数分隔符冲突。"""
@@ -940,6 +1373,14 @@ def main() -> None:
     c.add_argument("--subtitle-preset", default="",
                    help="字幕样式预设（v4.2）：news 新闻底框 / movie 电影底幕 / variety 综艺描边，"
                         "见 scripts/subtitle_presets.json；条目自带字段优先于预设")
+    c.add_argument("--subtitle-render", default="ass", choices=["ass", "drawtext"],
+                   help="字幕渲染通道：ass=libass（v4.15 默认，支持逐词高亮）/ "
+                        "drawtext=旧通道（回滚用；结构上无法逐词高亮）")
+    c.add_argument("--subtitle-font", default="",
+                   help="ASS 字体**家族名**（默认 Microsoft YaHei）；自定义字体文件走 "
+                        "_FFMPEG_FONT 环境变量（其所在目录会作为 fontsdir 传给 libass）")
+    c.add_argument("--no-karaoke", action="store_true",
+                   help="关掉逐词高亮（有词轴的 cue 也按普通字幕渲染）")
     c.add_argument("--slogan", default="", help="可选烧字幕 slogan（等价于追加一条末段字幕）")
     c.add_argument("--slogan-position", default="left", choices=["left", "bottom"],
                    help="left=左侧负空间垂直居中（中式落版默认）；bottom=底部居中")
@@ -948,6 +1389,10 @@ def main() -> None:
                    help="落版出现时刻（秒）；默认 -1 = 距结尾 4 秒自动淡入")
     c.add_argument("--xfade", default="0",
                    help="转场秒数：单值（0.5=全部）或逗号列表逐转场指定（如 0.5,0.5,1.0，len=镜数-1）；0=直切")
+    c.add_argument("--qsv", action="store_true",
+                    help="用核显 h264_qsv 编最终成片（本机实测可用；不可用自动回退 libx264）")
+    c.add_argument("--voice-speed", type=float, default=1.0,
+                    help="旁白整体变速（rubberband，变速不变调）；**有字幕时禁用**（字幕轴会失效）")
     c.add_argument("--freeze-last", type=float, default=0.0,
                    help="末帧定格秒数（tpad clone，落版余韵用，建议 4-6）")
 
@@ -958,6 +1403,10 @@ def main() -> None:
     ck.add_argument("--min-fps", type=float, default=24.0, help="最低帧率（默认 24）")
 
     qg = sub.add_parser("qcgate", help="单段 QC 硬门禁：规格+黑帧/过曝/静帧机器判定（#4）")
+    qg.add_argument("--ref", default="",
+                    help="参考视频/图：额外做 ssim 对比（判画质劣化，如 kenburns 输出 vs 源图）")
+    qg.add_argument("--min-ssim", type=float, default=0.95,
+                    help="ssim 下限（默认 0.95；低于此判 FAIL）")
     qg.add_argument("path")
     qg.add_argument("--min-res", default="1280x720")
     qg.add_argument("--max-duration", type=float, default=120.0)
@@ -978,6 +1427,13 @@ def main() -> None:
     e.add_argument("video")
     e.add_argument("out")
 
+    st = sub.add_parser("stabilize", help="两遍防抖 vidstab：detect→transform（手持抖动/生成漂移）")
+    st.add_argument("input")
+    st.add_argument("--out", default="")
+    st.add_argument("--smoothing", type=int, default=10,
+                    help="平滑帧数（越大越稳，但可能裁切更多）")
+    st.add_argument("--shakiness", type=int, default=5, help="抖动强度 1-10")
+    st.add_argument("--qsv", action="store_true", help="核显编码（不可用自动回退）")
     kb = sub.add_parser("kenburns")
     kb.add_argument("image")
     kb.add_argument("out")
@@ -1020,6 +1476,8 @@ def main() -> None:
         cmd_pick(args)
     elif args.cmd == "extract":
         cmd_extract(args)
+    elif args.cmd == "stabilize":
+        cmd_stabilize(args)
     elif args.cmd == "kenburns":
         cmd_kenburns(args)
     elif args.cmd == "kenburns-all":

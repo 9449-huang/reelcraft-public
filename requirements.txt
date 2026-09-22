@@ -1,0 +1,14 @@
+# ReelCraft 可选增强依赖 —— 全部可选项；核心链路零第三方依赖，不装也能用。
+# 各能力缺件时的行为：相关命令打安装指引并以 rc!=0 拒绝（绝不静默假装通过）。
+# 模型文件放 ~/.workbuddy/models/（各命令指引里有直链）。
+
+# ── 词级时间轴（中文逐字声学时间戳；word_axis / vo_build plan --words）──
+sherpa-onnx>=1.13.8          # ~2MB 轮子，onnxruntime 系，无 torch
+
+# ── 词级时间轴（英文 Whisper）+ 神经 VAD（audio-qc / triage）──
+onnxruntime                  # CPU 推理
+numpy
+tokenizers                   # whisper tokenizer（无 torch 依赖）
+
+# ── 跨镜人脸一致性（faces：YuNet 检测 + SFace 比对）──
+opencv-python-headless

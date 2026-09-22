@@ -33,6 +33,7 @@ import sys
 import tempfile
 from pathlib import Path
 
+import mg_core
 from mg_core import PRODUCT_EXTS, _ffmpeg
 from postprocess import probe
 
@@ -43,7 +44,7 @@ SFACE_MODEL = "face_recognition_sface_2021dec.onnx"
 SFACE_THRESHOLD = 0.363      # SFace 官方 LFW 标定阈值（fp32 模型）
 MIN_SCORE = 0.6              # YuNet 置信度下限
 MIN_SIDE = 48                # 人脸框**短边**下限（像素）——背景小脸的主要过滤手段
-DIE_ARG = 2
+DIE_ARG = mg_core.EXIT_USAGE   # 退出码单源（v4.11.0）
 # 图片后缀：这些**直接交给 cv2**，不过 ffmpeg（实测 ffmpeg 对图片配 -ss 会 rc=0 却不产出文件）
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}
 

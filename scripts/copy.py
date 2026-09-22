@@ -72,12 +72,22 @@ def clean_text(text: str) -> str:
     return "\n".join(lines)
 
 
+def backoff_delays(tries: int, base: float = 8.0, factor: float = 2.0) -> list:
+    """重试等待表（秒）：**等待次数 = 尝试次数 − 1**——最后一次是终局，等了也白等。
+
+    旧版是循环体末尾的 `time.sleep(8 * (i + 1))`：三次全灭会白等 24s
+    （8/16/24 合计 48s），且线性硬编码，与 mg_core.http_call 的指数退避不同族。
+    """
+    return [base * (factor ** i) for i in range(max(0, int(tries) - 1))]
+
+
 def chat(base: str, key: str, model: str, system: str, user: str,
          temperature: float, tries: int = 3) -> str:
     body = {"model": model,
             "messages": [{"role": "system", "content": system},
                          {"role": "user", "content": user}],
             "temperature": temperature, "max_tokens": 2000}
+    delays = backoff_delays(tries)
     for i in range(tries):
         try:
             req = urllib.request.Request(
@@ -89,7 +99,8 @@ def chat(base: str, key: str, model: str, system: str, user: str,
             return r["choices"][0]["message"]["content"]
         except Exception as e:                      # 429/5xx 退避
             print(f"  (重试 {i+1}/{tries}: {str(e)[:60]})", file=sys.stderr)
-            time.sleep(8 * (i + 1))
+            if i < len(delays):                     # 最后一次不等
+                time.sleep(delays[i])
     raise SystemExit("[copy] 调用失败，见上方错误")
 
 

@@ -28,8 +28,32 @@ BASE_BOX = None  # (x, y, w, h) @ BASE_W x BASE_H
 PROFILES = Path(__file__).resolve().parent / "watermark_profiles.json"
 
 
-def die(msg: str) -> None:
-    sys.exit(msg)
+def die(msg: str, code: int = 1) -> None:
+    """与其他脚本同形（v4.11.0）：显式整数退出码 + 前缀打 stderr。
+
+    原实现是 `sys.exit(msg)`——传字符串走 Python 隐式行为（打印 + rc=1），
+    看着能用，但 `die(2)` 会静默变成"退出码 2 且什么都不打印"，且无前缀难 grep。
+    """
+    print(f"[delogo] ERROR: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def mask_filter(x: int, y: int, w: int, h: int) -> str:
+    """生成 removelogo 用的 mask 图（黑底 + 白框）的 ffmpeg 滤镜串（纯函数可单测）。
+
+    removelogo 的语义是"mask 上非黑处为 logo"——白色实心块即声明该矩形永远是角标。
+    """
+    return f"drawbox=x={x}:y={y}:w={w}:h={h}:color=white@1:t=fill"
+
+
+def removelogo_filter(mask_path) -> str:
+    """`removelogo` 滤镜串（v4.14 去水印 v2）。
+
+    ★ 路径必须**转义冒号 + 套单引号**：实测（2026-09-22，ffmpeg 7.1）裸 Windows 路径
+    与"只套引号但不转义冒号"两种写法都会让 filter 解析器直接崩（rc=4294967274）。
+    """
+    esc = str(mask_path).replace("\\", "/").replace(":", r"\:")
+    return f"removelogo=filename='{esc}'"
 
 
 def load_profile(provider: str) -> dict:
@@ -105,6 +129,10 @@ def main() -> None:
     ap.add_argument("--w", type=int, help="水印框宽")
     ap.add_argument("--h", type=int, help="水印框高")
     ap.add_argument("--crf", type=int, default=18, help="重编码质量（默认 18，近无损）")
+    ap.add_argument("--mode", choices=["delogo", "mask"], default="delogo",
+                    help="delogo=边缘插值（默认，兼容旧行为）；mask=removelogo，按框生成 "
+                         "mask 图声明\"这里永远是 logo\"（固定角标时序一致，不逐帧抖动）")
+    ap.add_argument("--keep-mask", default="", help="mask 模式：把生成的 mask 图另存到该路径")
     a = ap.parse_args()
 
     ff = find_ffmpeg()
@@ -156,14 +184,34 @@ def main() -> None:
         return
 
     out = Path(a.out) if a.out else src.with_name(src.stem + "_nowm.mp4")
-    print(f"[delogo] {src.name}: {W}x{H} 框=({x},{y},{w},{h}) 框源={src_label} -> {out.name}")
-    subprocess.run(
-        [ff, "-y", "-v", "error", "-i", str(src),
-         "-vf", f"delogo=x={x}:y={y}:w={w}:h={h}",
-         "-c:v", "libx264", "-crf", str(a.crf), "-preset", "slow",
-         "-pix_fmt", "yuv420p", "-c:a", "copy", "-movflags", "+faststart",
-         str(out)],
-        check=True)
+    print(f"[delogo] {src.name}: {W}x{H} 框=({x},{y},{w},{h}) 框源={src_label} "
+          f"模式={a.mode} -> {out.name}")
+
+    def _run_ff(args: list) -> None:
+        """跑 ffmpeg 并显式报错（原实现用 check=True 抛裸异常）。"""
+        r = subprocess.run(args, capture_output=True, text=True, encoding="utf-8",
+                           errors="replace")
+        if r.returncode != 0:
+            last = (r.stderr or "").strip().splitlines()
+            die(f"ffmpeg 失败 rc={r.returncode}: {(last[-1][:200] if last else '')}")
+
+    enc_tail = ["-c:v", "libx264", "-crf", str(a.crf), "-preset", "slow",
+                "-pix_fmt", "yuv420p", "-c:a", "copy", "-movflags", "+faststart"]
+
+    if a.mode == "mask":
+        import tempfile
+        with tempfile.TemporaryDirectory(prefix="rc_mask_") as _td:
+            mask_png = Path(a.keep_mask) if a.keep_mask else Path(_td) / "logo_mask.png"
+            _run_ff([ff, "-y", "-v", "error", "-f", "lavfi",
+                     "-i", f"color=c=black:s={W}x{H}", "-vf", mask_filter(x, y, w, h),
+                     "-frames:v", "1", str(mask_png)])
+            _run_ff([ff, "-y", "-v", "error", "-i", str(src),
+                     "-vf", removelogo_filter(mask_png), *enc_tail, str(out)])
+            if a.keep_mask:
+                print(f"[mask] 已留存 mask 图 {mask_png}")
+    else:
+        _run_ff([ff, "-y", "-v", "error", "-i", str(src),
+                 "-vf", f"delogo=x={x}:y={y}:w={w}:h={h}", *enc_tail, str(out)])
 
     check = out.with_name(out.stem + "_check.png")
     subprocess.run(

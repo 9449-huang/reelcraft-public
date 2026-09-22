@@ -17,6 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 import media_gen as mg  # noqa: E402,F401
 import mg_core  # noqa: E402,F401
 import mg_batch  # noqa: E402,F401
+import postprocess as pp  # noqa: E402,F401
 
 # 慢测试门控：真跑 ffmpeg/子进程的类默认跳过；SLOW=1 全跑（提交前必须 SLOW=1 过一遍）
 _slow = not os.environ.get("SLOW")
@@ -24,17 +25,30 @@ _slow = not os.environ.get("SLOW")
 
 
 class TestEscapeDrawtext(unittest.TestCase):
-    """#11 drawtext 转义：% 进 filter 前必须 \\% 转义。"""
+    """drawtext 转义：反斜杠/单引号要转，**百分号不许转**（v4.15 实测推翻旧做法）。
 
-    def test_percent_escaped(self):
-        import importlib
-        pp = importlib.import_module("postprocess")
-        self.assertEqual(pp._escape_drawtext("100% 进度"), "100\\% 进度")
+    旧版按「#11 的 100% 解析异常」把 % 写成「反斜杠+%」；实测 ffmpeg 7.1 上那与裸 %
+    一样触发 `Stray % near '...'` → **整条字幕一个字都不画而 rc=0**。正解是滤镜加
+    `expansion=none`（见 TestDrawtextExpansionOption）。
+    """
+
+    def test_percent_not_escaped(self):
+        self.assertEqual(pp._escape_drawtext("100% 进度"), "100% 进度",
+                         "转义 % 会让整条字幕静默消失，必须原样透传")
 
     def test_quote_and_backslash_kept(self):
-        import importlib
-        pp = importlib.import_module("postprocess")
         self.assertEqual(pp._escape_drawtext("a'b\\c"), "a\\'b\\\\c")
+
+
+class TestDrawtextExpansionOption(unittest.TestCase):
+    """逃生阀的可用性：含 % 的字幕必须能画出来 → 滤镜串里要有 expansion=none。"""
+
+    def test_expansion_none_present(self):
+        f = pp._drawtext_filters([{"at": 0, "dur": 1, "text": "涨了100%"}], "C:/f.ttf")
+        self.assertEqual(len(f), 1)
+        self.assertIn("expansion=none", f[0],
+                      "没有 expansion=none，含 % 的字幕会被 drawtext 静默丢掉")
+        self.assertIn("涨了100%", f[0], "% 不许被转义")
 
 
 class TestCollectClips(unittest.TestCase):
@@ -230,6 +244,155 @@ class TestQcTimes(unittest.TestCase):
         self.assertEqual(pp.qc_times(None, 6), [0.0])
 
 
+class TestFfPath(unittest.TestCase):
+    """filter 内的文件路径必须转义：反斜杠→正斜杠、冒号→``\\:``。
+
+    实测（2026-09-22，ffmpeg 7.1）：`removelogo=filename=C:\\Users\\...` 直接崩
+    （rc=4294967274，"No option name near 'Usersword4...'"）；**单引号 + 不转义冒号也崩**。
+    可用的只有：转义冒号（可再套单引号）或"相对名 + cwd"。这是本项目 filter 转义的又一坑。
+    """
+
+    def test_windows_path_escaped(self):
+        self.assertEqual(pp.ff_path("C:\\Users\\a b\\logo.png"),
+                         "'C\\:/Users/a b/logo.png'")
+
+    def test_posix_path_untouched(self):
+        self.assertEqual(pp.ff_path("/tmp/logo.png"), "'/tmp/logo.png'")
+
+    def test_relative_name_untouched(self):
+        self.assertEqual(pp.ff_path("logo.png"), "'logo.png'")
+
+
+class TestParseSsimStats(unittest.TestCase):
+    """ssim 数值只在 stats_file（或 info 级日志）里——`-loglevel error` 会把它吞掉，
+    于是 rc=0 却拿不到任何画质信息。"""
+
+    def test_parses_all_column(self):
+        line = "n:75 Y:0.995482 U:0.979023 V:0.980751 All:0.990284 (20.125101)"
+        self.assertAlmostEqual(pp.parse_ssim_stats(line), 0.990284, places=6)
+
+    def test_inf_means_identical(self):
+        line = "n:75 Y:1.000000 U:1.000000 V:1.000000 All:1.000000 (inf)"
+        self.assertAlmostEqual(pp.parse_ssim_stats(line), 1.0, places=6)
+
+    def test_multiline_takes_last_frame(self):
+        self.assertAlmostEqual(
+            pp.parse_ssim_stats("n:1 All:0.5 (12.0)\nn:2 All:0.990284 (20.1)"),
+            0.990284, places=6)
+
+    def test_garbage_returns_none(self):
+        self.assertIsNone(pp.parse_ssim_stats(""))
+        self.assertIsNone(pp.parse_ssim_stats("no numbers here"))
+
+
+class TestSsimVerdict(unittest.TestCase):
+    def test_pass_above_threshold(self):
+        lv, _ = pp.ssim_verdict(0.98, 0.95)
+        self.assertEqual(lv, "PASS")
+
+    def test_fail_below_threshold(self):
+        lv, msg = pp.ssim_verdict(0.80, 0.95)
+        self.assertEqual(lv, "FAIL")
+        self.assertIn("0.80", msg)
+
+    def test_none_is_unknown_not_pass(self):
+        """取不到值 ≠ 合格（与 duration_verdict 同口径）。"""
+        lv, _ = pp.ssim_verdict(None, 0.95)
+        self.assertEqual(lv, "WARN")
+
+
+class TestEncoderResolve(unittest.TestCase):
+    """QSV 可选加速：请求了但不可用 → 回退 libx264 并**如实标注**（不假装用了 QSV）。
+
+    实测（2026-09-22）：本机 h264_qsv 在 纯编码 / +drawtext / +subtitles 三种链路都能
+    出片，且字幕**真烧上了**（内容级验证：底部亮像素 89，无字幕对照 0）。
+    """
+
+    def test_default_is_libx264(self):
+        args, name = pp.resolve_encoder(False, available=True)
+        self.assertIn("libx264", args)
+        self.assertEqual(name, "libx264")
+
+    def test_qsv_when_available(self):
+        args, name = pp.resolve_encoder(True, available=True)
+        self.assertIn("h264_qsv", args)
+        self.assertNotIn("libx264", args)
+        self.assertEqual(name, "h264_qsv")
+
+    def test_qsv_unavailable_falls_back(self):
+        args, name = pp.resolve_encoder(True, available=False)
+        self.assertIn("libx264", args)
+        self.assertEqual(name, "libx264")
+
+
+class TestVoiceSpeedFilter(unittest.TestCase):
+    """旁白比成片长时用 rubberband 压缩（**变速不变调**）；1.0 → 不加滤镜（零影响）。"""
+
+    def test_default_no_filter(self):
+        self.assertEqual(pp.voice_speed_filter(1.0), "")
+
+    def test_tempo_filter(self):
+        self.assertEqual(pp.voice_speed_filter(1.25), "rubberband=tempo=1.25")
+
+    def test_out_of_range_dies(self):
+        for bad in (0.4, 3.0):
+            with self.assertRaises(SystemExit):
+                pp.voice_speed_filter(bad)
+
+
+@unittest.skipUnless(not _slow, 'slow: SLOW=1 启用')
+class TestFfmpegUpgradesEndToEnd(unittest.TestCase):
+    """真跑 ffmpeg：ssim 门禁 + stabilize（内容级，不只看 rc）。"""
+
+    def _mk(self, td, name, vf=None, dur=2, size="320x240"):
+        from ffmpeg_probe import find_ffmpeg
+        ff = find_ffmpeg()
+        out = Path(td) / name
+        cmd = [ff, "-y", "-loglevel", "error", "-f", "lavfi",
+               "-i", f"testsrc=size={size}:rate=25:duration={dur}"]
+        if vf:
+            cmd += ["-vf", vf]
+        cmd += ["-c:v", "libx264", "-pix_fmt", "yuv420p", str(out)]
+        import subprocess as sp
+        sp.run(cmd, check=True)
+        return out
+
+    def test_qcgate_ref_ssim_pass_and_fail(self):
+        import subprocess as sp
+        pp_py = Path(__file__).resolve().parents[1] / "scripts" / "postprocess.py"
+        with tempfile.TemporaryDirectory() as td:
+            ok = self._mk(td, "ok.mp4")
+            deg = self._mk(td, "deg.mp4", vf="scale=160:120,scale=320:240")
+            r1 = sp.run([sys.executable, str(pp_py), "qcgate", str(ok),
+                         "--ref", str(ok), "--min-ssim", "0.95",
+                         "--min-res", "320x240", "--min-fps", "20"],
+                        capture_output=True, text=True, encoding="utf-8", timeout=180)
+            self.assertEqual(r1.returncode, 0, r1.stdout + r1.stderr)
+            self.assertIn("SSIM", r1.stdout.upper())
+            r2 = sp.run([sys.executable, str(pp_py), "qcgate", str(deg),
+                         "--ref", str(ok), "--min-ssim", "0.999",
+                         "--min-res", "320x240", "--min-fps", "20"],
+                        capture_output=True, text=True, encoding="utf-8", timeout=180)
+            self.assertEqual(r2.returncode, 2, "低于阈值必须 FAIL（rc=2）")
+            self.assertIn("SSIM", r2.stdout.upper())
+
+    def test_stabilize_produces_same_length(self):
+        import subprocess as sp
+        pp_py = Path(__file__).resolve().parents[1] / "scripts" / "postprocess.py"
+        with tempfile.TemporaryDirectory() as td:
+            shaky = self._mk(td, "shaky.mp4",
+                             vf="crop=300:220:10+20*sin(n/3):10+20*cos(n/4)")
+            out = Path(td) / "stab.mp4"
+            r = sp.run([sys.executable, str(pp_py), "stabilize", str(shaky),
+                        "--out", str(out)],
+                       capture_output=True, text=True, encoding="utf-8", timeout=300)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertTrue(out.exists() and out.stat().st_size > 0)
+            d0 = pp.probe(str(shaky))["duration"]
+            d1 = pp.probe(str(out))["duration"]
+            self.assertAlmostEqual(d0, d1, delta=0.2, msg="防抖不该改变时长")
+
+
 class TestQcseqErrorStops(unittest.TestCase):
     """P2-2 修复：qcseq exit 2（真错误）必须中断 pipeline，只有 exit 1（WARN）放行。"""
 
@@ -251,6 +414,7 @@ class TestQcseqErrorStops(unittest.TestCase):
                                 slogan_position="left", watermark="", watermark_dry_run=False,
                                 sound_lines="", sound_voice="", sound_speed=1.0,
                                 sound_skip_tts=False, sound_auto_shift=False, sound_gap=0.3,
+                                subtitle_render="",
                                 no_audio_qc=False, audio_qc_strict=False, no_faces=False)
 
         def fake_run(cmd, dry, log):
@@ -282,6 +446,7 @@ class TestQcseqErrorStops(unittest.TestCase):
                                 slogan_position="left", watermark="", watermark_dry_run=False,
                                 sound_lines="", sound_voice="", sound_speed=1.0,
                                 sound_skip_tts=False, sound_auto_shift=False, sound_gap=0.3,
+                                subtitle_render="",
                                 no_audio_qc=False, audio_qc_strict=False, no_faces=False)
 
         def fake_run(cmd, dry, log):
@@ -630,6 +795,245 @@ class TestUnifiedCli(unittest.TestCase):
         self.assertIn("[audit]", r.stdout)
 
 
+class TestAssTime(unittest.TestCase):
+    """ASS 时间戳：H:MM:SS.cc（厘秒，小时不补零）。"""
+
+    def test_zero(self):
+        self.assertEqual(pp.ass_time(0), "0:00:00.00")
+
+    def test_fraction_centiseconds(self):
+        self.assertEqual(pp.ass_time(1.234), "0:00:01.23")
+        self.assertEqual(pp.ass_time(1.239), "0:00:01.24", "四舍五入到厘秒")
+
+    def test_over_hour(self):
+        self.assertEqual(pp.ass_time(3661.5), "1:01:01.50")
+
+    def test_negative_and_nan_safe(self):
+        self.assertEqual(pp.ass_time(-5), "0:00:00.00", "负值钳到 0，不产生 -0:00:00.00")
+        self.assertEqual(pp.ass_time(None), "0:00:00.00")
+        self.assertEqual(pp.ass_time(float("nan")), "0:00:00.00")
+
+
+class TestAssText(unittest.TestCase):
+    """ASS 文本转义：\\ 与 { } 是 ASS 语法字符，换行要写成 \\N；% 不特殊（与 drawtext 不同）。"""
+
+    def test_backslash_and_braces(self):
+        self.assertEqual(pp.ass_text("a{b}c"), "a\\{b\\}c")
+
+    def test_backslash_doubled(self):
+        self.assertEqual(pp.ass_text("a\\b"), "a\\\\b")
+
+    def test_newline_becomes_hard_break(self):
+        self.assertEqual(pp.ass_text("上\n下"), "上\\N下")
+
+    def test_percent_untouched(self):
+        self.assertEqual(pp.ass_text("涨了100%"), "涨了100%",
+                         "drawtext 要转义 %，ASS 不要——照抄旧转义会多出反斜杠")
+
+
+class TestKaraokeText(unittest.TestCase):
+    """词轴 + 文本 → 带 {\\k} 的 ASS 文本（逐词高亮）。
+
+    \\k 时长单位是**厘秒**；实测（2026-09-22）已唱段用 PrimaryColour、未唱用 SecondaryColour。
+    文本尽量取**原文**（保标点）；词对不上原文时回退词拼接（时间仍准）。
+    """
+
+    def _w(self, text, step=0.5):
+        # 把 text 的每个非空白字符当作一个词（CJK 场景）
+        return [{"w": c, "at": i * step, "dur": step} for i, c in enumerate(text)]
+
+    def test_centiseconds_per_word(self):
+        out = pp.karaoke_text("甲乙", self._w("甲乙", 0.5))
+        self.assertEqual(out, "{\\k50}甲{\\k50}乙")
+
+    def test_min_one_centisecond(self):
+        out = pp.karaoke_text("甲", [{"w": "甲", "at": 0, "dur": 0.001}])
+        self.assertEqual(out, "{\\k1}甲", "0 厘秒的 \\k 等于没有高亮，钳到 1")
+
+    def test_punctuation_kept_from_original(self):
+        """原文有标点、词轴无标点 → 切片后标点必须还在（v4.13 的承诺不能在渲染层丢掉）。"""
+        import re as _re
+        text = "And so, my friend."
+        words = [{"w": w, "at": i * 0.4, "dur": 0.4}
+                 for i, w in enumerate(["And", "so", "my", "friend"])]
+        out = pp.karaoke_text(text, words)
+        plain = _re.sub(r"\{\\k\d+\}", "", out)
+        self.assertEqual(plain, text, "剥掉 \\k 标签后必须与原文逐字一致（标点不丢）")
+        self.assertEqual(len(_re.findall(r"\{\\k\d+\}", out)), 4, "四个词各一个 \\k")
+
+    def test_fallback_when_words_mismatch(self):
+        """词与原文完全对不上 → 回退词拼接，但每个词仍有 \\k（时间不丢）。"""
+        out = pp.karaoke_text("完全不同的原文",
+                                 [{"w": "xyz", "at": 0, "dur": 0.5}])
+        self.assertIn("{\\k50}", out)
+        self.assertIn("xyz", out)
+
+    def test_empty_words_returns_plain_text(self):
+        self.assertEqual(pp.karaoke_text("没有词轴", []), "没有词轴")
+        self.assertEqual(pp.karaoke_text("没有词轴", None), "没有词轴")
+
+    def test_latin_words_get_space_cjk_does_not(self):
+        out = pp.karaoke_text("你好", self._w("你好", 0.4))
+        self.assertEqual(out, "{\\k40}你{\\k40}好", "CJK 之间不补空格")
+
+
+class TestCuesToAss(unittest.TestCase):
+    """cue 列表 → 完整 ASS 文档（纯函数）。"""
+
+    def _doc(self, **kw):
+        cues = kw.pop("cues", None) or [
+            {"at": 1.0, "dur": 2.0, "text": "第一句", "pos": "bottom", "size": 44, "fade": 0.3},
+            {"at": 4.0, "dur": 1.0, "text": "第二句", "pos": "center", "size": 56, "fade": 0.0},
+        ]
+        return pp.cues_to_ass(cues, width=640, height=360, duration=10.0, **kw)
+
+    def test_header_and_playres(self):
+        d = self._doc()
+        self.assertIn("[Script Info]", d)
+        self.assertIn("[V4+ Styles]", d)
+        self.assertIn("[Events]", d)
+        self.assertIn("PlayResX: 640", d)
+        self.assertIn("PlayResY: 360", d)
+
+    def test_one_dialogue_per_cue_with_span(self):
+        d = self._doc()
+        dl = [l for l in d.splitlines() if l.startswith("Dialogue:")]
+        self.assertEqual(len(dl), 2)
+        self.assertIn("0:00:01.00,0:00:03.00", dl[0], "at=1 dur=2 → 1.00~3.00")
+
+    def test_position_maps_to_alignment(self):
+        d = self._doc()
+        dl = [l for l in d.splitlines() if l.startswith("Dialogue:")]
+        self.assertIn("\\an2", dl[0], "bottom → 底部居中")
+        self.assertIn("\\an5", dl[1], "center → 正中")
+
+    def test_left_position_alignment(self):
+        d = self._doc(cues=[{"at": 0, "dur": 1, "text": "落版", "pos": "left"}])
+        self.assertIn("\\an4", d)
+
+    def test_fade_becomes_fad_milliseconds(self):
+        d = self._doc()
+        dl = [l for l in d.splitlines() if l.startswith("Dialogue:")]
+        self.assertIn("\\fad(300,300)", dl[0])
+        self.assertNotIn("\\fad", dl[1], "fade=0 不该有 \\fad")
+
+    def test_zero_dur_runs_to_end(self):
+        """slogan 的 dur=0 = 出现后持续到片尾。"""
+        d = self._doc(cues=[{"at": 8.0, "dur": 0, "text": "落版"}])
+        dl = next(l for l in d.splitlines() if l.startswith("Dialogue:"))
+        self.assertIn("0:00:08.00,0:00:10.00", dl)
+
+    def test_karaoke_cue_uses_k_style_and_tags(self):
+        d = self._doc(cues=[
+            {"at": 0.0, "dur": 1.0, "text": "甲乙",
+             "words": [{"w": "甲", "at": 0.0, "dur": 0.5},
+                       {"w": "乙", "at": 0.5, "dur": 0.5}]},
+            {"at": 2.0, "dur": 1.0, "text": "无词轴"},
+        ])
+        dl = [l for l in d.splitlines() if l.startswith("Dialogue:")]
+        self.assertIn(",K,", dl[0], "有词轴 → 卡拉OK样式")
+        self.assertIn("\\k50", dl[0])
+        self.assertIn(",S,", dl[1], "无词轴 → 普通样式")
+
+    def test_no_karaoke_flag_disables_tags(self):
+        d = self._doc(karaoke=False, cues=[
+            {"at": 0, "dur": 1, "text": "甲乙",
+             "words": [{"w": "甲", "at": 0, "dur": 0.5}]}])
+        self.assertNotIn("\\k", d)
+
+    def test_styles_declared_with_karaoke_highlight(self):
+        """K 样式：Primary=高亮（已唱）、Secondary=常态（未唱）——顺序不能反。"""
+        d = self._doc()
+        kline = next(l for l in d.splitlines() if l.startswith("Style: K,"))
+        sline = next(l for l in d.splitlines() if l.startswith("Style: S,"))
+        kf = kline.split(",")
+        sf = sline.split(",")
+        self.assertEqual(kf[4], sf[4], "未唱色 = 普通字幕色（第 4 字段 SecondaryColour）")
+        self.assertNotEqual(kf[3], kf[4], "K 的已唱色必须与未唱色不同，否则看不出高亮")
+        self.assertEqual(sf[3], sf[4], "S 样式 Primary/Secondary 相同（无高亮）")
+
+    def test_text_escaped(self):
+        d = self._doc(cues=[{"at": 0, "dur": 1, "text": "100%{x}"}])
+        self.assertIn("100%\\{x\\}", d, "花括号转义、百分号原样（ASS 与 drawtext 的差别）")
+
+    def test_empty_cues_still_valid_document(self):
+        d = pp.cues_to_ass([], width=320, height=240)
+        self.assertIn("[Events]", d)
+        self.assertEqual([l for l in d.splitlines() if l.startswith("Dialogue:")], [])
+
+
+class TestAssFilter(unittest.TestCase):
+    """ASS 滤镜串：路径必须走 ff_path（自带单引号），再套一层会崩。"""
+
+    def test_path_goes_through_ff_path(self):
+        s = pp.ass_filter("C:/a b/out.ass")
+        self.assertTrue(s.startswith("ass="))
+        self.assertIn("'C\\:/a b/out.ass'", s, "须带单引号且转义冒号")
+
+    def test_fontsdir_appended(self):
+        s = pp.ass_filter("C:/a/out.ass", fonts_dir="C:/Windows/Fonts")
+        self.assertIn(":fontsdir='C\\:/Windows/Fonts'", s)
+
+    def test_no_fontsdir_by_default(self):
+        self.assertNotIn("fontsdir", pp.ass_filter("C:/a/out.ass"))
+
+
+class TestAssStyleSpec(unittest.TestCase):
+    """预设 → ASS 样式规格（纯函数，读 subtitle_presets.json 的 ass 子字典）。"""
+
+    def test_known_presets_have_ass_style(self):
+        for name in ("news", "movie", "variety"):
+            spec = pp.ass_style_spec(name)
+            self.assertIsInstance(spec, dict)
+        self.assertTrue(pp.ass_style_spec("news").get("box"), "news 是底框风格")
+
+    def test_unknown_preset_is_empty_not_crash(self):
+        self.assertEqual(pp.ass_style_spec(""), {})
+        self.assertEqual(pp.ass_style_spec("nope"), {})
+
+
+class TestSubtitleRenderDefault(unittest.TestCase):
+    """字幕默认通道必须是 **ass**（libass）。
+
+    这不是风格问题：drawtext 结构上无法逐词高亮（v4.13 词轴到不了屏幕），
+    且对含裸 ``%`` 的文本会**整条静默不画**（v4.15 实测：原样 / ``\\%`` / ``%%`` 全 0 像素、
+    rc 仍为 0）。默认值一旦回退，等于把这两条能力从默认路径上摘掉。
+    """
+
+    def _flag(self, name):
+        import ast as _ast
+        src = (Path(__file__).resolve().parents[1] / "scripts" / "postprocess.py"
+               ).read_text(encoding="utf-8")
+        for node in _ast.walk(_ast.parse(src)):
+            if (isinstance(node, _ast.Call) and isinstance(node.func, _ast.Attribute)
+                    and node.func.attr == "add_argument" and node.args
+                    and isinstance(node.args[0], _ast.Constant)
+                    and node.args[0].value == name):
+                out = {}
+                for kw in node.keywords:
+                    if isinstance(kw.value, _ast.Constant):
+                        out[kw.arg] = kw.value.value
+                    elif isinstance(kw.value, (_ast.List, _ast.Tuple)):
+                        out[kw.arg] = [e.value for e in kw.value.elts]
+                return out
+        return {}
+
+    def test_default_is_ass(self):
+        f = self._flag("--subtitle-render")
+        self.assertEqual(f.get("default"), "ass",
+                         "字幕默认通道应为 ass/libass（drawtext 做不到逐词高亮）")
+
+    def test_drawtext_kept_as_escape(self):
+        self.assertIn("drawtext", self._flag("--subtitle-render").get("choices") or [],
+                      "必须保留 drawtext 回滚通道（ASS 出问题时的逃生阀）")
+
+    def test_karaoke_on_by_default(self):
+        f = self._flag("--no-karaoke")
+        self.assertEqual(f.get("action"), "store_true",
+                         "逐词高亮默认开启，用 --no-karaoke 显式关闭")
+        self.assertNotIn("default", f, "store_true 的默认即 False，不该再写 default")
+
+
 class TestSrtParse(unittest.TestCase):
     """srt 导入：parse_srt 纯函数——标准 srt 文本 → 内部 [{at,dur,text}] 时间轴。
 
@@ -804,6 +1208,130 @@ class TestMixedAudioConcatEndToEnd(unittest.TestCase):
             self.assertEqual(r.returncode, 0, (r.stderr or "")[-300:])
             self.assertTrue(pp.probe(str(out)).get("audio"),
                             "单路旁白被静默丢弃（run 缩进/amix 分支回归）")
+
+
+@unittest.skipUnless(not _slow, "slow: SLOW=1 启用")
+class TestAssBurnEndToEnd(unittest.TestCase):
+    """ASS 字幕端到端：黑底片 → cues(中文) → concat 真跑 → 抽帧数亮像素。
+
+    防两层假绿：cues_to_ass 单测过但 concat 没接上；接上了但 filter 串路径没转义
+    （rc=0 而一个字都没画——批九前置实测过这种静默失败）。
+    """
+
+    def _clip(self, td, sec=4):
+        import subprocess as sp
+        import ffmpeg_probe as fpx
+        ff = fpx.find_ffmpeg()
+        (td / "clips").mkdir(parents=True, exist_ok=True)
+        # 纯黑底：亮像素只可能来自字幕，颜色统计才干净
+        sp.run([ff, "-y", "-loglevel", "error", "-f", "lavfi",
+                "-i", f"color=c=black:s=320x240:rate=24:d={sec}",
+                "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                str(td / "clips" / "clip_01.mp4")], check=True, timeout=120)
+        return ff
+
+    def _run_concat(self, td, extra):
+        import subprocess as sp
+        return sp.run([sys.executable,
+                       str(Path(pp.__file__).parent.parent / "scripts" / "postprocess.py"),
+                       "concat", str(td / "clips"), "--out", str(td / "out.mp4")] + extra,
+                      capture_output=True, text=True, encoding="utf-8", errors="replace",
+                      timeout=180, env={**os.environ, "PYTHONUTF8": "1"})
+
+    @staticmethod
+    def _counts(png):
+        from PIL import Image
+        with Image.open(png) as im:
+            px = list(im.convert("RGB").getdata())
+        bright = sum(1 for p in px if max(p) > 150)
+        gold = sum(1 for p in px if p[0] > 180 and p[1] > 130 and p[2] < 90)
+        white = sum(1 for p in px if p[0] > 200 and p[1] > 200 and p[2] > 200)
+        return bright, gold, white
+
+    def test_ass_renders_chinese(self):
+        """中文 + 标点必须真烧上（内容级，不是 rc=0 就算过）。"""
+        import subprocess as sp
+        with tempfile.TemporaryDirectory() as tds:
+            td = Path(tds)
+            ff = self._clip(td)
+            (td / "subs.json").write_text(json.dumps([
+                {"at": 0.2, "dur": 3.4, "text": "中文字幕渲染，验证标点。",
+                 "pos": "bottom", "size": 40, "fade": 0.0}], ensure_ascii=False),
+                encoding="utf-8")
+            r = self._run_concat(td, ["--subtitles", str(td / "subs.json")])
+            self.assertEqual(r.returncode, 0, r.stderr[-400:])
+            fr = td / "f.png"
+            sp.run([ff, "-y", "-loglevel", "error", "-ss", "1.5", "-i", str(td / "out.mp4"),
+                    "-frames:v", "1", str(fr)], check=True, timeout=60)
+            bright, _g, white = self._counts(fr)
+            self.assertGreater(bright, 100, "1.5s 处应有字幕像素——ASS 没烧进去")
+            self.assertGreater(white, 50, "默认白字")
+            self.assertFalse((td / "clips" / "_subs.ass").exists(),
+                             "中间件 _subs.ass 应被清理")
+
+    def test_karaoke_highlight_advances(self):
+        """逐词高亮：随时间推进，已唱（高亮色）像素增加、未唱（白）减少。"""
+        import subprocess as sp
+        words = [{"w": c, "at": 0.2 + i * 0.8, "dur": 0.8}
+                 for i, c in enumerate("甲乙丙丁")]
+        with tempfile.TemporaryDirectory() as tds:
+            td = Path(tds)
+            ff = self._clip(td, sec=4)
+            (td / "subs.json").write_text(json.dumps([
+                {"at": 0.1, "dur": 3.6, "text": "甲乙丙丁", "words": words,
+                 "pos": "center", "size": 90, "fade": 0.0}], ensure_ascii=False),
+                encoding="utf-8")
+            r = self._run_concat(td, ["--subtitles", str(td / "subs.json")])
+            self.assertEqual(r.returncode, 0, r.stderr[-400:])
+            early, late = td / "e.png", td / "l.png"
+            for t, dst in ((0.4, early), (3.4, late)):
+                sp.run([ff, "-y", "-loglevel", "error", "-ss", str(t), "-i", str(td / "out.mp4"),
+                        "-frames:v", "1", str(dst)], check=True, timeout=60)
+            _b1, gold_e, white_e = self._counts(early)
+            _b2, gold_l, white_l = self._counts(late)
+            self.assertGreater(gold_l, gold_e,
+                               f"已唱高亮像素应随时间增加（早 {gold_e} → 晚 {gold_l}）")
+            self.assertLess(white_l, white_e,
+                            f"未唱白字应随时间减少（早 {white_e} → 晚 {white_l}）")
+
+    def test_no_karaoke_flag_keeps_plain(self):
+        import subprocess as sp
+        with tempfile.TemporaryDirectory() as tds:
+            td = Path(tds)
+            ff = self._clip(td, sec=3)
+            (td / "subs.json").write_text(json.dumps([
+                {"at": 0.1, "dur": 2.4, "text": "甲乙丙丁",
+                 "words": [{"w": c, "at": 0.1 + i * 0.6, "dur": 0.6}
+                           for i, c in enumerate("甲乙丙丁")],
+                 "pos": "center", "size": 90, "fade": 0.0}], ensure_ascii=False),
+                encoding="utf-8")
+            r = self._run_concat(td, ["--subtitles", str(td / "subs.json"), "--no-karaoke"])
+            self.assertEqual(r.returncode, 0, r.stderr[-400:])
+            fr = td / "f.png"
+            sp.run([ff, "-y", "-loglevel", "error", "-ss", "2.0", "-i", str(td / "out.mp4"),
+                    "-frames:v", "1", str(fr)], check=True, timeout=60)
+            _b, gold, white = self._counts(fr)
+            self.assertGreater(white, 50, "--no-karaoke 时应是普通白字")
+            self.assertLess(gold, white, "关掉高亮后不该以高亮色为主")
+
+    def test_drawtext_escape_hatch_still_works(self):
+        """逃生阀：--subtitle-render drawtext 保持旧行为（回滚用）。"""
+        import subprocess as sp
+        with tempfile.TemporaryDirectory() as tds:
+            td = Path(tds)
+            ff = self._clip(td, sec=3)
+            (td / "subs.json").write_text(json.dumps([
+                {"at": 0.1, "dur": 2.4, "text": "旧通道100%可用",
+                 "pos": "bottom", "size": 40, "fade": 0.0}], ensure_ascii=False),
+                encoding="utf-8")
+            r = self._run_concat(td, ["--subtitles", str(td / "subs.json"),
+                                      "--subtitle-render", "drawtext"])
+            self.assertEqual(r.returncode, 0, r.stderr[-400:])
+            fr = td / "f.png"
+            sp.run([ff, "-y", "-loglevel", "error", "-ss", "1.2", "-i", str(td / "out.mp4"),
+                    "-frames:v", "1", str(fr)], check=True, timeout=60)
+            bright, _g, _w = self._counts(fr)
+            self.assertGreater(bright, 100, "drawtext 通道应仍能烧字幕")
 
 
 @unittest.skipUnless(not _slow, "slow: SLOW=1 启用")

@@ -423,6 +423,10 @@ def cmd(args) -> None:
             cmd += ["--bgm", args.bgm, "--bgm-db", str(args.bgm_db)]
         if subs_final:
             cmd += ["--subtitles", subs_final]
+        if args.subtitle_render:
+            # 只在显式指定时透传：留空让 postprocess 用**它自己的**默认（ass），
+            # 免得门面把一个写死的默认值钉住（v4.9 workers 恒真默认值覆盖 plan 的教训）
+            cmd += ["--subtitle-render", args.subtitle_render]
         if args.slogan:
             cmd += ["--slogan", args.slogan,
                     "--slogan-position", args.slogan_position]
@@ -556,7 +560,8 @@ _TRASH_NAME = ".trash"
 # 可再生中间产物：删了可由 shots JSON + plan 重新生成（--yes 后移入 .trash）
 _CLEAN_DIRS = ("frames", "clips", "qc_frames", "caps_smoke")
 _CLEAN_FILES = ("style_grid.png", "pipeline_run.json",
-                "_norm.mp4", "_mixed.mp4", "_with_text.mp4")   # v4.7.5：concat/字幕中间件纳入治理面
+                "_norm.mp4", "_mixed.mp4", "_with_text.mp4",
+                "_subs.ass")   # v4.15：ASS 字幕中间件（concat 成功会自删，失败时残留）
 _CLEAN_GLOBS = ("*.tmp",)
 # 绝不动：shots/*.json（源）、plan.json、vo_lines.json（旁白脚本）、batch_run.json
 # （账单+断点续跑依据）、final*.mp4（成片）、.trash 本身
@@ -717,6 +722,9 @@ def main() -> None:
     ap.add_argument("--subtitles", default="", help="字幕 JSON（默认用 sound 阶段产物）")
     ap.add_argument("--slogan", default="")
     ap.add_argument("--slogan-position", default="left", choices=["left", "bottom"])
+    ap.add_argument("--subtitle-render", default="", choices=["", "ass", "drawtext"],
+                    help="字幕渲染通道（留空=ass/libass，支持逐词高亮）；"
+                         "drawtext=旧通道（v4.15 前的行为，回滚用；做不到逐词高亮）")
     # 声音设计（vo_build）
     ap.add_argument("--sound-lines", default="", help="vo_lines.json 路径（默认 <shots>/vo_lines.json）")
     ap.add_argument("--sound-voice", default="", help="旁白音色（留空用 TTS 默认）")

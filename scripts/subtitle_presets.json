@@ -1,12 +1,14 @@
 {
   "_readme": "字幕样式预设档案：postprocess.py concat --subtitle-preset <名> 自动读取。条目级字段优先于预设（只有字幕条目缺的样式字段才用预设填）。新增风格=加一个键，零改码。",
+  "_ass_readme": "`ass` 子字典是 v4.15 ASS 渲染通道的样式（缺省=描边2/阴影1/无底框）。为什么不解析上面的 box/borderw：那是 drawtext 的历史参数串，解析它等于把渲染器差异扛进代码。box=true → BorderStyle=3（不透明底框）；outline/shadow 单位为像素；karaoke_color 是逐词高亮的“已唱”色（默认 gold）。",
   "news": {
     "pos": "bottom",
     "size": 44,
     "fade": 0.3,
     "fontcolor": "white",
     "box": "box=1:boxcolor=black@0.55:boxborderw=14",
-    "note": "新闻条风格：底框+快切换，信息字幕首选"
+    "note": "新闻条风格：底框+快切换，信息字幕首选",
+    "ass": {"box": true, "outline": 8, "shadow": 0}
   },
   "movie": {
     "pos": "bottom",
@@ -14,7 +16,8 @@
     "fade": 0.8,
     "fontcolor": "white",
     "box": "",
-    "note": "电影底幕风格：无框+慢淡入淡出，叙事片旁白字幕"
+    "note": "电影底幕风格：无框+慢淡入淡出，叙事片旁白字幕",
+    "ass": {"outline": 2, "shadow": 1}
   },
   "variety": {
     "pos": "center",
@@ -22,6 +25,7 @@
     "fade": 0.5,
     "fontcolor": "yellow",
     "box": "borderw=4:bordercolor=black",
-    "note": "综艺描边风格：黄字黑边居中，强调卡点/标题句"
+    "note": "综艺描边风格：黄字黑边居中，强调卡点/标题句",
+    "ass": {"outline": 3, "shadow": 1, "karaoke_color": "orange"}
   }
 }

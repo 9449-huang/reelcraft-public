@@ -31,6 +31,212 @@ from pathlib import Path
 from mg_core import PRODUCT_EXTS, _ffmpeg   # 产物白名单 + ffmpeg 路径双单源（v4.7.9/v4.8.0）
 MEDIA_GEN = str(Path(__file__).resolve().parent / "media_gen.py")
 
+# ─── 字幕切行（v4.13 词级接线）──────────────────────────────
+# 有词轴时按**词边界**断行；无词轴时整句一条（旧行为）。
+# 宽度按东亚排版惯例计：CJK 全角算 2、其余算 1——只数字符会让中英字幕总有一边过长。
+MAX_CUE_WIDTH = 40           # 单条字幕最大显示宽度（CJK 计 2 → 约 20 汉字）
+MAX_CUE_DUR = 6.0            # 单条字幕最长秒数
+MIN_CUE_DUR = 0.30           # 单条字幕最短秒数（更短会被 drawtext 一闪而过）
+MAX_CUE_CPS = 20.0           # 单条字幕最大阅读速度（显示宽度/秒；CJK 计 2 → 约 10 汉字/秒）
+MIN_CUE_GAP = 0.08           # 相邻 cue 最小间隔秒（≈2 帧 @25fps，SubtitleEdit 惯例）
+
+_CJK_RE = re.compile(r"[\u3400-\u9fff\uf900-\ufaff\u3040-\u30ff\uac00-\ud7af]")
+
+
+def _is_cjk_char(ch: str) -> bool:
+    return bool(ch) and bool(_CJK_RE.match(ch))
+
+
+def _display_width(text: str) -> int:
+    """字幕显示宽度：CJK 全角计 2、其余计 1。"""
+    return sum(2 if _is_cjk_char(c) else 1 for c in text)
+
+
+def _words_text(ws: list) -> str:
+    """词列表 → 字幕文本。CJK 直接相连；拉丁/数字之间补空格（否则 Andsomy）。"""
+    out = ""
+    for w in ws:
+        t = str(w.get("w") or "").strip()
+        if not t:
+            continue
+        if out and not _is_cjk_char(out[-1]) and not _is_cjk_char(t[0]):
+            out += " "
+        out += t
+    return out
+
+
+def _abs_words(words, dur: float) -> tuple:
+    """句内词轴 → 规范化词轴 + 越界计数（越界词夹回 [0, dur]，**且必须被计数**）。
+
+    whisper 的锚点插值可能吐出略超句长的末词；静默夹掉会让"词跑到句外"无人知晓。
+    """
+    out: list = []
+    clamped = 0
+    for w in words or []:
+        if not isinstance(w, dict) or not str(w.get("w") or "").strip():
+            continue
+        try:
+            at = float(w.get("at") or 0.0)
+            d = float(w.get("dur") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if at < 0.0 or at > dur:
+            at = max(0.0, min(at, dur))
+            clamped += 1
+        d = max(0.02, min(d, dur - at)) if dur > 0 else max(0.02, d)
+        out.append({"w": str(w["w"]).strip(), "at": round(at, 3), "dur": round(d, 3)})
+    return out, clamped
+
+
+_PUNCT_RE = re.compile(r"[\s，。！？、,.!?;:；：\"'“”‘’()（）\-—…]+")
+
+
+def _map_words_to_text(text: str, words: list) -> list | None:
+    """把词顺序映射回原文的字符区间（保标点）。有一个词对不上就返回 None。
+
+    词轴来自**录音转写**、line.text 来自**用户输入**：转写会丢标点，甚至用词不同。
+    能顺序对上时用它从原文取字幕文本（标点回来）；对不上则回退词拼接（时间仍准）。
+    """
+    if not text:
+        return None
+    hay, hay_low = text, text.casefold()
+    pos = 0
+    spans: list = []
+    for w in words:
+        needle = _PUNCT_RE.sub("", str(w.get("w") or ""))
+        if not needle:
+            spans.append(None)
+            continue
+        idx = hay.find(needle, pos)
+        if idx < 0:
+            idx = hay_low.find(needle.casefold(), pos)
+        if idx < 0:
+            return None
+        spans.append((idx, idx + len(needle)))
+        pos = idx + len(needle)
+    return spans
+
+
+def _cue_text(text: str, spans, groups: list, gi: int, gw: list) -> str:
+    """cue 文本：能定位到原文就用原文切段（含标点），否则用词拼接。"""
+    if spans:
+        valid = [j for j in groups[gi] if spans[j]]
+        if valid:
+            start = spans[valid[0]][0]
+            end = len(text)
+            for k in range(gi + 1, len(groups)):
+                nxt = [j for j in groups[k] if spans[j]]
+                if nxt:
+                    end = spans[nxt[0]][0]        # 到下一片首词的起点——中间的标点归本片
+                    break
+            out = text[start:end].strip()
+            if out:
+                return out
+    return _words_text(gw)
+
+
+def split_line_cues(line: dict, *, max_width: int = MAX_CUE_WIDTH,
+                    max_dur: float = MAX_CUE_DUR,
+                    min_dur: float = MIN_CUE_DUR) -> list:
+    """一行（句）→ 若干条字幕 cue（纯函数可单测）。
+
+    **有词轴**：只在词边界断行，单条不超过 max_width / max_dur；尾片短于 min_dur
+    则并回前一条（避免一闪而过）。文本优先取**原文切片**（标点不丢），对不上原文时
+    回退词拼接。每条 cue 带自己的 `words`（绝对时间）供逐词高亮。
+    **无词轴**：整句一条，字段与旧版逐字一致（向后兼容）。
+    """
+    base = float(line.get("at") or 0.0)
+    span = max(0.0, float(line.get("dur") or 0.0))
+    text = str(line.get("text") or "")
+    words = [w for w in (line.get("words") or [])
+             if isinstance(w, dict) and str(w.get("w") or "").strip()]
+    if not words:
+        return [{"at": round(base, 3), "dur": round(span, 3), "text": text}]
+
+    groups: list = []                      # 存词索引，便于回查原文位置
+    cur: list = []
+    for i in range(len(words)):
+        cand = cur + [i]
+        st = float(words[cand[0]].get("at") or 0.0)
+        en = (float(words[cand[-1]].get("at") or 0.0)
+              + float(words[cand[-1]].get("dur") or 0.0))
+        too_wide = _display_width(_words_text([words[j] for j in cand])) > max_width
+        too_long = max_dur > 0 and (en - st) > max_dur
+        if cur and (too_wide or too_long):
+            groups.append(cur)
+            cur = [i]
+        else:
+            cur = cand
+    if cur:
+        groups.append(cur)
+
+    if min_dur > 0 and len(groups) >= 2:
+        tail = [words[j] for j in groups[-1]]
+        tail_dur = (float(tail[-1].get("at") or 0.0)
+                    + float(tail[-1].get("dur") or 0.0)
+                    - float(tail[0].get("at") or 0.0))
+        if tail_dur < min_dur:
+            groups[-2].extend(groups.pop())
+
+    spans = _map_words_to_text(text, words)
+    cues: list = []
+    for gi, g in enumerate(groups):
+        gw = [words[j] for j in g]
+        at = float(gw[0].get("at") or 0.0)
+        end = float(gw[-1].get("at") or 0.0) + float(gw[-1].get("dur") or 0.0)
+        cues.append({"at": round(at, 3),
+                     "dur": round(max(end - at, MIN_CUE_DUR), 3),
+                     "text": _cue_text(text, spans, groups, gi, gw),
+                     "words": [{"w": str(x.get("w") or "").strip(),
+                                "at": round(float(x.get("at") or 0.0), 3),
+                                "dur": round(float(x.get("dur") or 0.0), 3)} for x in gw]})
+    return cues
+
+
+def fix_cue_timing(cues: list, *, max_cps: float = MAX_CUE_CPS,
+                   min_gap: float = MIN_CUE_GAP) -> tuple:
+    """字幕时长整形（纯函数；SubtitleEdit 的 CPS/最小间隔规则，2026-09 实测定稿）。
+
+    - **CPS 超标 → 延长**：说话速度改不了，拆行也不降 CPS（总时长不变）；能做的是
+      把行尾 cue 的显示时间**延长到后面空隙里**（至 next_at-min_gap，至多 width/max_cps）。
+    - **重叠 → 收缩**：MIN_CUE_DUR 钳制可能让短 cue 侵入下一条（下条锚定语音不能推）
+      → 缩短前条；若缩无可缩（间隙为负）则**保持原样并计数**——不静默删、不假装修好。
+    - words 一律不动（时间戳是真实语音）；输入顺序不限（内部先按 at 排）。
+    返回 (排序后的 cues, {extended, shrunk, unfixable})。
+    """
+    rows = sorted(cues, key=lambda c: (float(c.get("at") or 0.0),
+                                       float(c.get("at") or 0.0) + float(c.get("dur") or 0.0)))
+    stats = {"extended": 0, "shrunk": 0, "unfixable": 0}
+    for i, c in enumerate(rows):
+        at = float(c.get("at") or 0.0)
+        dur = float(c.get("dur") or 0.0)
+        if dur <= 0:
+            continue
+        end = at + dur
+        limit = None
+        if i + 1 < len(rows):
+            nxt = float(rows[i + 1].get("at") or 0.0)
+            limit = nxt - min_gap
+        width = _display_width(str(c.get("text") or ""))
+        # ① CPS 超标且有后方空隙 → 延长
+        if max_cps > 0 and width > 0 and (limit is None or limit > end):
+            want = width / max_cps
+            cap = limit if limit is not None else at + want
+            new_dur = min(want, cap) - at
+            if new_dur > dur + 1e-9:
+                c["dur"] = round(new_dur, 3)
+                stats["extended"] += 1
+                end = at + c["dur"]
+        # ② 与后条重叠 → 收缩（下条锚定语音不能推）
+        if limit is not None and end > limit + 1e-9:
+            room = limit - at
+            if room >= 0.05:                       # 缩了至少还看得见
+                c["dur"] = round(room, 3)
+                stats["shrunk"] += 1
+            else:
+                stats["unfixable"] += 1            # 修不动：如实计数，不假装
+    return rows, stats
+
 
 def die(msg: str, code: int = 1) -> None:
     print(f"[vo_build] ERROR: {msg}", file=sys.stderr)
@@ -123,17 +329,30 @@ def fit_report(vo_data: dict, clip_durs: dict, gap: float = 0.3,
 def plan_axis(items: list, gap: float = 0.5, pad: float = 0.8) -> dict:
     """声音链反向：句子按序自动排轴（at = 上一句 at+dur+gap），按 shot 聚合出
     每镜需求时长（末句 at+dur − 首句 at + pad）。无 shot 的句子照常排轴但不进镜聚合。
-    items: [{"id","text","dur"(TTS 真实秒),"shot"?}]
-    返回 {"lines":[...每句带 at...], "shots":{sid:{"need","n_lines","first_at","last_end"}},
-          "total": 末句收尾+pad}"""
+    items: [{"id","text","dur"(TTS 真实秒),"shot"?,"words"?}]
+      · words（可选）= 词级时间轴，**相对句首**（word_axis 的输出），
+        排轴时转成成片绝对时间后挂在 line 上；越界词夹回句内并计入 word_stats
+    返回 {"lines":[...每句带 at，有词轴则带 words...],
+          "shots":{sid:{"need","n_lines","first_at","last_end"}},
+          "total": 末句收尾+pad, "word_stats":{"lines","words","clamped"}}"""
     lines = []
     at = 0.0
+    stats = {"lines": 0, "words": 0, "clamped": 0}
     for it in items:
         dur = float(it.get("dur", 0))
         rec = {"id": it.get("id", "?"), "text": it.get("text", ""),
                "at": round(at, 2), "dur": round(dur, 2)}
         if it.get("shot"):
             rec["shot"] = it["shot"]
+        ws, n_clamped = _abs_words(it.get("words"), dur)
+        if ws:
+            shift = rec["at"]                   # 句内相对时间 → 成片绝对时间
+            for w in ws:
+                w["at"] = round(shift + w["at"], 3)
+            rec["words"] = ws
+            stats["lines"] += 1
+            stats["words"] += len(ws)
+            stats["clamped"] += n_clamped
         lines.append(rec)
         at += dur + gap
     spans: dict = {}
@@ -152,7 +371,7 @@ def plan_axis(items: list, gap: float = 0.5, pad: float = 0.8) -> dict:
                  "first_at": spans[s][0], "last_end": round(spans[s][1], 2)}
              for s in spans}
     total = round((lines[-1]["at"] + lines[-1]["dur"] + pad) if lines else pad, 2)
-    return {"lines": lines, "shots": shots, "total": total}
+    return {"lines": lines, "shots": shots, "total": total, "word_stats": stats}
 
 
 def bgm_filter_chain(total: float, duck_db: int = -14) -> str:
@@ -194,7 +413,17 @@ def _existing_recording(lines_dir: Path, lid: str) -> Path | None:
 def cmd_plan(args) -> None:
     """#6 声音链反向：VO 先行 → TTS/录音取真实时长 → 自动排轴 → 反推每镜该多长。
     与 fit 互为镜像：fit 是"镜定时长 → 对账 VO"，plan 是"VO 定时长 → 生成镜时长计划"。
-    plan 输出的 vo_lines_at.json 可直接喂正向 vo_build（--out 合成成片）。"""
+    plan 输出的 vo_lines_at.json 可直接喂正向 vo_build（--out 合成成片）。
+
+    --words（v4.13/v4.16）：对每句录音跑**词级时间轴**（word_axis；中文自动走
+    sherpa paraformer 逐字、whisper 兜底英文），
+    词 at 相对句首；排轴时转成成片绝对时间写进 vo_lines_at.json → 字幕按词边界切行。
+    显式要词轴而运行时不具备（缺模型/依赖）→ die(2) 且给安装指引，**绝不静默降级**。
+
+    --punct（v4.19）：标点恢复——隐含 --words（标点要挂回逐字词目，无词轴就没有挂点）。
+    只有 sherpa 后端支持；whisper 后端会**静默忽略** punctuate 参数，因此
+    rep["punct"] 为空时必须 die(2)——"要了标点却没拿到"是最典型的静默失败。
+    """
     src = Path(args.lines)
     if not src.exists():
         die(f"找不到 {src}")
@@ -225,15 +454,57 @@ def cmd_plan(args) -> None:
         items.append({"id": lid, "text": ln["text"], "dur": d, "shot": ln.get("shot", "")})
         print(f"  {lid} {d:.2f}s  {ln['text']}")
 
-    # ② 排轴 + 反推每镜需求
+    # ② 词级时间轴（可选增强）：词 at 相对句首，交给 plan_axis 转绝对时间
+    want_punct = bool(getattr(args, "punct", False))  # --punct 隐含 --words：标点挂回词目
+    if getattr(args, "words", False) or want_punct:
+        import word_axis                    # 可选依赖 → 函数内 import（有 AST 守卫）
+        wmd = getattr(args, "word_models_dir", "") or None
+        wlang = getattr(args, "word_lang", "")
+        n_words = 0
+        for it in items:
+            rec = _existing_recording(lines_dir, it["id"])
+            if rec is None:
+                continue                    # 上面已 die，这里只做防御
+            kw = {"models_dir": wmd,
+                  "backend": getattr(args, "word_backend", "") or "auto"}
+            if wlang:
+                kw["language"] = wlang
+            if want_punct:
+                kw["punctuate"] = True
+            try:
+                rep = word_axis.transcribe(rec, **kw)
+            except RuntimeError as e:
+                die(str(e), 2)              # 显式要词轴却跑不了 → 明说，绝不降级
+            if rep.get("error"):
+                # auto 但两个后端都不可用 → transcribe 不抛、只带回 error，
+                # 这里必须把安装指引递出去（否则只剩"一句词轴都没拿到"，排查抓瞎）
+                die(f"词轴后端不可用：{rep['error']}", 2)
+            if want_punct and not rep.get("punct"):
+                # whisper 路径**静默忽略** punctuate（无标点能力）——必须在这里
+                # 拦下，否则“要了标点却拿到无标点词轴”无人知晓（静默失败主形态）。
+                die(f"--punct 未生效：后端 {rep.get('backend') or '?'} 不支持标点恢复"
+                    "（只有 sherpa 后端支持，ct-transformer）。中文请 --word-backend sherpa"
+                    "并确认 ~/.workbuddy/models/sherpa-punct/model.onnx 已就位", 2)
+            ws = list(rep.get("words") or [])
+            if ws:
+                it["words"] = ws
+                n_words += len(ws)
+            pn = "，标点✓" if rep.get("punct") else ""
+            print(f"  {it['id']} 词轴 {len(ws)} 词（{rep.get('backend') or '无'}{pn}）")
+        if not n_words:
+            die("--words 但一句词轴都没拿到（转写为空？录音是纯音乐/静音？）", 2)
+
+    # ③ 排轴 + 反推每镜需求
     res = plan_axis(items, gap=args.gap, pad=args.pad)
 
-    # ③ 落盘：带 at 的 vo_lines（喂正向 vo_build）+ 计划表（喂 kenburns/出片）
+    # ④ 落盘：带 at 的 vo_lines（喂正向 vo_build）+ 计划表（喂 kenburns/出片）
     at_path = out.parent / "vo_lines_at.json"
     at_path.write_text(json.dumps(
         {"acts": data.get("acts", []),
          "lines": [{"id": r["id"], "text": r["text"], "at": r["at"],
-                    "shot": r.get("shot", "")} for r in res["lines"]]},
+                    "shot": r.get("shot", ""),
+                    **({"words": r["words"]} if r.get("words") else {})}
+                   for r in res["lines"]]},
         ensure_ascii=False, indent=2), encoding="utf-8")
     out.write_text(json.dumps(res, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -246,6 +517,11 @@ def cmd_plan(args) -> None:
     dur_csv = ",".join(
         f"{b['need']:.2f}" for _, b in sorted(res["shots"].items()))
     print(f"\n[plan] 成片参考总长 {res['total']:.2f}s（末句收尾 + pad）")
+    ws_stat = res.get("word_stats") or {}
+    if ws_stat.get("lines"):
+        extra = f"；越界夹回 {ws_stat['clamped']} 个" if ws_stat.get("clamped") else ""
+        print(f"[plan] 词级时间轴：{ws_stat['lines']} 句 / {ws_stat['words']} 词{extra}"
+              f"（字幕将按词边界切行）")
     print(f"[plan] 全缓推可这样跑（按镜序）：")
     print(f"  python postprocess.py kenburns-all shots/ --outdir clips/ --duration \"{dur_csv}\"")
     print(f"[plan] -> {at_path.name}（喂 vo_build 合成成片）+ {out.name}（计划表）")
@@ -303,6 +579,19 @@ def main() -> None:
         ap.add_argument("--skip-tts", action="store_true", help="不合成，用已有录音")
         ap.add_argument("--voice", default="", help="音色名")
         ap.add_argument("--speed", type=float, default=1.0, help="语速倍率")
+        ap.add_argument("--words", action="store_true",
+                        help="对每句录音跑词级时间轴（v4.16：中文走 sherpa paraformer "
+                             "逐字 ~/.workbuddy/models/sherpa-paraformer-zh；whisper 兜底英文）"
+                             "→ 字幕按词边界切行 + ASS 逐词高亮；缺模型/依赖会明确报错")
+        ap.add_argument("--punct", action="store_true",
+                        help="标点恢复（v4.19：sherpa ct-transformer 把标点挂回逐字词目，"
+                             "隐含 --words；仅 sherpa 后端支持——whisper 后端会明确报错，"
+                             "不静默给无标点轴）")
+        ap.add_argument("--word-lang", default="", help="词轴语言（en/zh…；留空用默认）")
+        ap.add_argument("--word-backend", default="", choices=["", "auto", "whisper", "sherpa"],
+                        help="词轴后端（留空=auto：中文优先 sherpa 逐字、whisper 兜底英文）")
+        ap.add_argument("--word-models-dir", default="",
+                        help="词轴模型目录（默认 ~/.workbuddy/models）")
         cmd_plan(ap.parse_args(sys.argv[2:]))
         return
     ap = argparse.ArgumentParser()
@@ -317,6 +606,11 @@ def main() -> None:
     ap.add_argument("--auto-shift", action="store_true",
                     help="某句超长时自动顺延后续句子（gap 用 --gap）")
     ap.add_argument("--gap", type=float, default=0.3, help="句间最小间隔秒（auto-shift 用）")
+    ap.add_argument("--max-cps", type=float, default=MAX_CUE_CPS,
+                    help="单条字幕最大阅读速度（显示宽度/秒；CJK 计 2 → 20≈10 汉字/秒；"
+                         "0=关闭。超标时把 cue 延长进后方空隙，SubtitleEdit 规则）")
+    ap.add_argument("--cue-gap", type=float, default=MIN_CUE_GAP,
+                    help="相邻字幕 cue 最小间隔秒（默认 0.08≈2 帧；重叠时缩前条让位）")
     ap.add_argument("--subs-out", default="", help="字幕输出路径（默认与 --out 同级 subtitles_final.json）")
     ap.add_argument("--bgm", default="", help="BGM 音频文件（循环补齐到成片长，VO 出现自动闪避压低）")
     ap.add_argument("--bgm-duck", type=int, default=-14,
@@ -433,18 +727,31 @@ def main() -> None:
         die(f"拼接失败 rc={rc}", 5)
     print(f"[vo_build] -> {out}  ({probe(out):.2f}s)")
 
-    # ④ 输出精确字幕轴
+    # ④ 输出精确字幕轴（v4.13：句子带词轴时按**词边界**切成多条 cue）
     subs = []
     for a in acts:
         subs.append({"at": a["at"], "dur": a.get("dur", 2.6),
                      "text": a["text"], "pos": a.get("pos", "center"),
                      "size": a.get("size", 54), "fade": a.get("fade", 0.8)})
+    n_cut = 0
+    line_cues: list = []
     for ln in lines:
-        subs.append({"at": round(ln["at"], 2), "dur": round(ln["_dur"], 2),
-                     "text": ln["text"], "pos": "bottom", "size": 44, "fade": 0.35})
+        cues = split_line_cues({"at": round(ln["at"], 2), "dur": round(ln["_dur"], 2),
+                                "text": ln["text"], "words": ln.get("words") or []})
+        n_cut += max(0, len(cues) - 1)
+        line_cues.extend(cues)
+    line_cues, timing_stats = fix_cue_timing(
+        line_cues, max_cps=float(args.max_cps), min_gap=float(args.cue_gap))
+    for c in line_cues:
+        c.update({"pos": "bottom", "size": 44, "fade": 0.35})
+        subs.append(c)
     subs_path = Path(args.subs_out) if args.subs_out else out.parent / "subtitles_final.json"
     subs_path.write_text(json.dumps(subs, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(f"[vo_build] -> {subs_path}  ({len(subs)} 条，与朗读精确对齐)")
+    cut_note = f"，其中 {n_cut} 处按词切行" if n_cut else ""
+    tm_note = (f"；CPS 延长 {timing_stats['extended']} / 收缩 {timing_stats['shrunk']}"
+               f" / 修不动 {timing_stats['unfixable']}"
+               if any(timing_stats.values()) else "")
+    print(f"[vo_build] -> {subs_path}  ({len(subs)} 条，与朗读精确对齐{cut_note}{tm_note})")
 
     # ⑤ 摘要
     voiced = sum(ln["_dur"] for ln in lines)

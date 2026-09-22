@@ -28,6 +28,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+import mg_core
 from mg_core import _ffmpeg
 from postprocess import probe
 
@@ -35,7 +36,7 @@ MODELS_DIR = Path.home() / ".workbuddy" / "models"
 SILERO_MODEL = "silero_vad.onnx"
 SAMPLE_RATE = 16000
 SILERO_WIN = 512              # silero v5 在 16kHz 下的窗长（样本数）
-DIE_ARG = 2                   # 参数/输入错误
+DIE_ARG = mg_core.EXIT_USAGE   # 参数/输入错误；退出码单源（v4.11.0）
 
 # 判定阈值（集中一处，便于按素材调）
 SILENCE_WARN_RATIO = 0.5      # 静音占比 ≥50% → WARN

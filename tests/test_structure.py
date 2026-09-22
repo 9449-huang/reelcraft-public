@@ -58,16 +58,38 @@ _MANIFEST = {
         'resolve_watermark', 'resolve_workers',
     ],
     'postprocess.py': [
-        '_bhattacharyya', '_collect_clips', '_escape_drawtext', '_frame_stats',
-        '_hsv_features', '_webp_frames', 'apply_preset', 'audio_plan', 'audio_src',
-        'cmd_check', 'cmd_concat', 'cmd_extract', 'cmd_kenburns', 'cmd_kenburns_all',
-        'cmd_pick', 'cmd_qcgate', 'cmd_qcseq', 'cmd_stylegrid', 'cmd_webp2mp4',
-        'compare_frames', 'die', 'duration_verdict', 'find_font', 'load_presets', 'main',
-        'parse_srt', 'probe', 'qc_times', 'qcseq_decide', 'run', 'score_images',
+        '_ass_style_line', '_bhattacharyya', '_collect_clips', '_drawtext_filters',
+        '_escape_drawtext', '_frame_stats', '_hsv_features', '_ssim_between',
+        '_webp_frames', 'apply_preset', 'ass_color', 'ass_filter',
+        'ass_style_spec', 'ass_text', 'ass_time', 'audio_plan',
+        'audio_src', 'cmd_check', 'cmd_concat', 'cmd_extract',
+        'cmd_kenburns', 'cmd_kenburns_all', 'cmd_pick', 'cmd_qcgate',
+        'cmd_qcseq', 'cmd_stabilize', 'cmd_stylegrid', 'cmd_webp2mp4',
+        'compare_frames', 'cues_to_ass', 'die', 'duration_verdict',
+        'ff_path', 'find_font', 'karaoke_text', 'load_presets',
+        'main', 'parse_srt', 'parse_ssim_stats', 'probe',
+        'qc_times', 'qcseq_decide', 'qsv_available', 'resolve_encoder',
+        'run', 'score_images', 'ssim_verdict', 'voice_speed_filter',
     ],
     'vo_build.py': [
-        '_existing_recording', 'bgm_assembly', 'bgm_filter_chain', 'cmd_fit',
-        'cmd_plan', 'die', 'fit_report', 'main', 'plan_axis', 'probe', 'tts_line',
+        '_abs_words', '_cue_text', '_display_width', '_existing_recording',
+        '_is_cjk_char', '_map_words_to_text', '_words_text', 'bgm_assembly',
+        'bgm_filter_chain', 'cmd_fit', 'cmd_plan', 'die',
+        'fit_report', 'fix_cue_timing', 'main', 'plan_axis',
+        'probe', 'split_line_cues', 'tts_line',
+    ],
+    'speakers.py': [
+        'cmd', 'diarize', 'install_hint', 'main',
+        'renumber_speakers', 'speakers_backend',
+    ],
+    'dialogue.py': [
+        '_compile_res', '_strip_emotion', 'assign_voices', 'cmd', 'die',
+        'main', 'parse_dialogue', 'to_vo_lines',
+    ],
+    'mg_comfyui.py': [
+        '_choices_of', '_force_text', '_weights_of', 'build_workflow', 'discover',
+        'fetch_video', 'load_workflow', 'pick_choice', 'pick_node', 'run_video',
+        'submit', 'to_mp4', 'upload_image', 'wait_outputs',
     ],
     'mg_status.py': [
         '_probe_models', 'cmd_last_frame', 'cmd_plan_check', 'cmd_qc', 'cmd_status',
@@ -89,11 +111,12 @@ _MANIFEST = {
         'cmd', 'main',
     ],
     'copy.py': [
-        'clean_text', 'chat', 'main',
+        'backoff_delays', 'chat', 'clean_text', 'main',
     ],
     'delogo_watermark.py': [
-        'die', 'load_profile', 'parse_size', 'clamp_box',
-        'probe_size', 'scale_box', 'main',
+        'clamp_box', 'die', 'load_profile', 'main',
+        'mask_filter', 'parse_size', 'probe_size', 'removelogo_filter',
+        'scale_box',
     ],
     'envcheck.py': [
         '_result', 'scan_key_env', 'check_key_env', 'check_runtime',
@@ -101,7 +124,7 @@ _MANIFEST = {
         'run_checks', 'summarize', 'main',
     ],
     'export_public.py': [
-        'remove_block', 'non_utf8_marker_error', 'main',
+        'main', 'non_utf8_marker_error', 'remove_block', 'resolve_dst',
     ],
     'face_consistency.py': [
         'cosine', 'filter_faces', 'pick_primary', 'pairwise_similarity',
@@ -124,6 +147,16 @@ _MANIFEST = {
     'prompt_lint.py': [
         'default_lexicon', 'parse_lexicon_md', '_wc', 'lint_prompt',
         '_significant_tokens', 'lint_shot', 'cmd', 'main',
+    ],
+    'word_axis.py': [
+        '_expand_token', '_is_cjk', '_lang_id', '_models_path',
+        '_sessions', '_sherpa_dir', '_sherpa_recognizer', 'available_backend',
+        'cmd', 'decode_pcm', 'frame_rms', 'greedy_decode',
+        'group_words', 'install_hint', 'interpolate_times', 'is_timestamp',
+        'log_mel', 'main', 'mel_filters', 'merge_punct_into_words',
+        'punct_backend', 'punctuate', 'refine_words', 'sherpa_backend',
+        'snap_boundaries', 'timestamp_seconds', 'tokens_to_words', 'transcribe',
+        'transcribe_sherpa', 'whisper_backend',
     ],
 }
 
@@ -412,7 +445,7 @@ class TestOptionalDepsNotTopLevel(unittest.TestCase):
     """
 
     BANNED = {"onnxruntime", "numpy", "torch", "cv2", "scipy", "soundfile",
-              "librosa", "transformers", "diffusers"}
+              "librosa", "transformers", "diffusers", "sherpa_onnx"}
 
     @staticmethod
     def _top_level_imports(path: Path):
@@ -452,6 +485,19 @@ class TestOptionalDepsNotTopLevel(unittest.TestCase):
                     hit.append(fn.name)
         self.assertTrue(
             hit, "audio_qc 里找不到 InferenceSession 调用 → silero 后端是空壳（假概率）")
+
+    def test_sherpa_path_is_really_implemented(self):
+        """反空壳：word_axis 必须真在**函数体内**调用 sherpa 的模型工厂，
+        否则 `sherpa_backend()` 声称支持中文逐字却永远跑不起来。"""
+        tree = ast.parse((SCRIPTS / "word_axis.py").read_text(encoding="utf-8"))
+        hit = []
+        for fn in [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)]:
+            for sub_node in ast.walk(fn):
+                if (isinstance(sub_node, ast.Call) and isinstance(sub_node.func, ast.Attribute)
+                        and sub_node.func.attr == "from_paraformer"):
+                    hit.append(fn.name)
+        self.assertTrue(
+            hit, "word_axis 里找不到 OfflineRecognizer.from_paraformer 调用 → sherpa 后端是空壳")
 
 
 class TestShrunkEncoderCoverage(unittest.TestCase):
